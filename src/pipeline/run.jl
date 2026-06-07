@@ -1,0 +1,45 @@
+# One-call entry point: run the whole pipeline from four TOML config paths. Used by the
+# `drivers/main.jl` command and convenient for library use.
+
+"""
+    image_from_toml(image, instrument, data, fitting;
+                    outpath="Runs/run", restart=false) -> String
+
+Parse the four config TOMLs (image, instrument, data, fitting), build the corresponding
+Comrade objects, copy the configs next to the run for provenance, and run
+[`comrade_imager`](@ref). Returns the output base path.
+
+Whether sampling runs on Reactant NUTS is part of the fitting strategy (`use_reactant` /
+`sampler = "reactant"` in the fitting TOML), since that choice also governs the optimizer
+path — it is not a per-invocation override. `restart`, by contrast, is a one-off run action
+(resume from a previously serialized optimum at `outpath`) and is passed at call time.
+"""
+function image_from_toml(
+        image::AbstractString, instrument::AbstractString, data::AbstractString,
+        fitting::AbstractString; outpath::AbstractString = "Runs/run", restart::Bool = false
+    )
+    @info "Reading configs"
+    skycfg = TOML.parsefile(image)
+    intcfg = TOML.parsefile(instrument)
+    datacfg = TOML.parsefile(data)
+    fitcfg = TOML.parsefile(fitting)
+
+    strategy = build_fitting_config(fitcfg)
+    (skym, imgdata) = build_sky_config(skycfg)
+    intm = build_instrument_config(intcfg)
+    dcoh = build_data_config(datacfg)
+
+    outdir = dirname(outpath)
+    mkpath(isempty(outdir) ? "." : outdir)
+    # Copy the configs next to the run for provenance.
+    for (f, suffix) in ((image, "image.toml"), (instrument, "instrument.toml"),
+            (data, "data.toml"), (fitting, "fitting.toml"))
+        try
+            cp(f, outpath * "_" * suffix; force = true)
+        catch err
+            @warn "Could not copy config $f" err
+        end
+    end
+
+    return comrade_imager(outpath, skym, intm, dcoh; strategy, imgdata, restart)
+end

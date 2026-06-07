@@ -1,0 +1,21 @@
+# Tiny fitting strategy for smoke tests: single full-data optimization round, a handful of
+# iterations, and a token AdvancedHMC chain.
+
+[optimizer]
+method = "Adam"
+maxiters = 10
+ntrials = 1
+g_tol = 0.1
+
+[tempering]
+noise_schedule = [0.0]
+
+[sampler]
+kind = "ahmc"
+nsample = 6
+nadapt = 2
+step_size = 0.01
+
+[run]
+use_reactant = false
+benchmark = false

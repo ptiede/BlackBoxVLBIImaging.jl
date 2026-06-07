@@ -1,0 +1,13 @@
+[deps]
+BlackBoxVLBIImaging = "5bd28f6b-d16a-4ecc-8550-9c719f2b7021"
+Comonicon = "863f3e99-da2a-4334-8734-de3dacbe5542"
+Comrade = "99d987ce-9a1e-4df8-bc0b-1ea019aa547b"
+Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+VLBIImagePriors = "b1ba175b-8447-452c-b961-7db2d6f7a029"
+
+[sources]
+BlackBoxVLBIImaging = {path = ".."}
+Comrade = {path = "/home/ptiede/.julia/dev/Comrade"}
+VLBIImagePriors = {path = "/home/ptiede/.julia/dev/VLBIImagePriors"}

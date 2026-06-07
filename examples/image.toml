@@ -1,0 +1,28 @@
+# Image / sky-model configuration.
+
+[grid]
+fovx = 200.0     # field of view, μas
+fovy = 200.0
+nx = 64          # pixel counts (auto-snapped to FFT-friendly sizes per random-field base)
+ny = 64
+pa = 0.0         # grid position angle, degrees
+x0 = 0.0         # phase-center offset, μas
+y0 = 0.0
+
+[model]
+polrep = "PolExp"   # PolExp | Poincare | TotalIntensity
+order = 2           # >1 NonCenteredMRF(GMRF); 1 GMRF; <0 MarkovRF(|order|); 0 Matern
+addgauss = false    # add an over-resolved Gaussian component
+creg = false        # centroid regularization (adds ImgNormalData; fixes center off)
+beamsize = 20.0     # μas, sets the random-field correlation scale
+
+[mean]
+type = "Bkgd"       # GaussBkgd | Bkgd | Gauss | Ring | TBlob | JetGauss
+fwhm = 50.0         # μas (used by Bkgd / JetGauss seed Gaussian)
+
+[flux]
+ftot = [0.1, 2.5]   # one value = fixed flux; two values = Uniform(lo, hi) prior
+
+# Optional prior overrides keyed by sky-prior parameter name:
+# [overrides]
+# σa = { dist = "Exponential", args = [0.5] }

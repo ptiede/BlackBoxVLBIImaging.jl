@@ -1,0 +1,83 @@
+# Generic instrument model reproducing the old `build_instrument_mixed` (mixed-basis data,
+# no field-rotation calibration). The gain "ratio" scheme + simple leakage. Per-parameter
+# priors give a segmentation, a distribution, an optional phase reference, and optional
+# per-site overrides. Note: unicode parameter names (μ, σ) must be QUOTED TOML keys.
+
+[gain]
+scheme = "gain"          # lg1, gp1, lgratμ, lgratσ, lgrat, gprat, gpratμ
+
+[leakage]
+scheme = "leakage_simple"   # d1re, d1im, d2re, d2im
+
+field_rotation = false      # false -> g*d*r (jnofr); true -> adjoint(r)*g*d*r
+
+# --- gain amplitudes -------------------------------------------------------------------
+[priors.lg1]
+seg = "integ"
+dist = { dist = "Normal", args = [0.0, 0.4] }
+  [priors.lg1.overrides.LM]
+  seg = "integ"
+  dist = { dist = "Normal", args = [0.0, 2.0] }
+  [priors.lg1.overrides.SM]
+  seg = "integ"
+  dist = { dist = "Normal", args = [0.0, 0.5] }
+
+[priors.lgrat]
+seg = "integ"
+dist = { dist = "Normal", args = [0.0, 1.0] }
+
+[priors."lgratμ"]
+seg = "track"
+dist = { dist = "Normal", args = [0.0, 0.2] }
+
+[priors."lgratσ"]
+seg = "track"
+dist = { dist = "Exponential", args = [0.2] }
+
+# --- gain phases (phase = true, referenced) --------------------------------------------
+[priors.gp1]
+seg = "integ"
+phase = true
+dist = { dist = "DiagonalVonMises", args = [0.0, 3.141592653589793] }   # κ = inv(width^2)
+refant = { kind = "SEFD", val = 0.0 }
+
+[priors.gprat]
+seg = "integ"
+phase = true
+dist = { dist = "DiagonalVonMises", args = [0.0, 0.1] }
+  [priors.gprat.overrides.SM]
+  seg = "integ"
+  dist = { dist = "DiagonalVonMises", args = [0.0, 0.5] }
+
+[priors."gpratμ"]
+seg = "track"
+dist = { dist = "DiagonalVonMises", args = [0.0, 3.141592653589793] }
+
+# --- leakage (d-terms) -----------------------------------------------------------------
+[priors.d1re]
+seg = "track"
+dist = { dist = "Normal", args = [0.0, 0.2] }
+  [priors.d1re.overrides.AA]
+  seg = "track"
+  dist = { dist = "Normal", args = [0.0, 0.01] }
+
+[priors.d1im]
+seg = "track"
+dist = { dist = "Normal", args = [0.0, 0.2] }
+  [priors.d1im.overrides.AA]
+  seg = "track"
+  dist = { dist = "Normal", args = [0.0, 0.01] }
+
+[priors.d2re]
+seg = "track"
+dist = { dist = "Normal", args = [0.0, 0.2] }
+  [priors.d2re.overrides.AA]
+  seg = "track"
+  dist = { dist = "Normal", args = [0.0, 0.01] }
+
+[priors.d2im]
+seg = "track"
+dist = { dist = "Normal", args = [0.0, 0.2] }
+  [priors.d2im.overrides.AA]
+  seg = "track"
+  dist = { dist = "Normal", args = [0.0, 0.01] }
