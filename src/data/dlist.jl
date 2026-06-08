@@ -17,7 +17,7 @@ function read_dlist(fname, arrayname)
     dt = minimum(diff(ts))
     start = ts .- dt / 2
     stop = ts .+ dt / 2
-    sc = Table((; start, stop))
+    sc = StructArray((; start, stop))
     ac = Comrade.EHTArrayConfiguration(bw, tarr, sc, mjd, ra, dec, source, :UTC, baseline)
     T = Comrade.EHTCoherencyDatum{eltype(real(coh[1])), eltype(ac.datatable), eltype(coh), eltype(noise)}
     return Comrade.EHTObservationTable{T}(coh, noise, ac)

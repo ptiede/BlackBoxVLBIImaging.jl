@@ -85,7 +85,7 @@ function best_image(post, ntrials = 20, maxiters = 10_000, rng = Random.default_
     return sols_v[inds], lm_v[inds]
 end
 
-function _optimize_tempered(out, skym, intm, data, imgdata, strategy, opt, rng)
+function _optimize_tempered(imgbase, skym, intm, data, imgdata, strategy, opt, rng)
     xprev = nothing
     nstage = length(strategy.noise_schedule)
     for (i, frac) in enumerate(strategy.noise_schedule)
@@ -99,9 +99,9 @@ function _optimize_tempered(out, skym, intm, data, imgdata, strategy, opt, rng)
             @info "Optimization stage $i/$nstage on Reactant (added noise = $frac)"
             xprev, _ = reactant_opt(
                 post_i, opt; initial_params = xprev, maxiters = strategy.maxiters,
-                ntrials = strategy.ntrials, rng = rng
+                ntrials = strategy.ntrials, verify = strategy.verify_reactant, rng = rng
             )
-            plot_residuals_png(out * "_residuals_step$(i)_map.png", post_i, xprev)
+            plot_residuals_png(imgbase * "_residuals_step$(i)_map.png", post_i, xprev)
             continue
         end
         post_i = VLBIPosterior(skym, intm, dat_i...; imgdata)
@@ -114,7 +114,7 @@ function _optimize_tempered(out, skym, intm, data, imgdata, strategy, opt, rng)
             @info "Optimization stage $i/$nstage: refine (added noise = $frac)"
             xprev, _ = comrade_opt(post_i, opt; initial_params = xprev, maxiters = mi, g_tol = strategy.g_tol)
         end
-        plot_residuals_png(out * "_residuals_step$(i)_map.png", post_i, xprev)
+        plot_residuals_png(imgbase * "_residuals_step$(i)_map.png", post_i, xprev)
     end
     return xprev
 end
@@ -136,7 +136,7 @@ function _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart)
     return trace, (strategy.nadapt + 1):10:strategy.nsample
 end
 
-function _sample_reactant(out, skym, intm, data, imgdata, xopt, strategy, restart, gimg)
+function _sample_reactant(out, skym, intm, data, imgdata, xopt, strategy, restart, gimg, imgbase)
     @info "Building Reactant device posterior for sampling"
     post_cpu = VLBIPosterior(skym, intm, data...; imgdata, admode = nothing)
     rpost = Comrade.prepare_device(post_cpu, Comrade.ComradeBase.ReactantEx())
@@ -149,20 +149,33 @@ function _sample_reactant(out, skym, intm, data, imgdata, xopt, strategy, restar
     # `sample_checkpoint` sets the sampling DiskStore stride (= batch / checkpoint frequency,
     # independent of the optimization checkpoint stride); falls back to `chunk_size` when off.
     stride = strategy.sample_checkpoint > 0 ? strategy.sample_checkpoint : strategy.chunk_size
-    disk = if strategy.sample_checkpoint > 0
-        # Per-batch checkpoint: render the latest draw (info.params) and save FITS+PNG+resid.
+    if strategy.sample_checkpoint > 0
+        # Post-warmup per-batch checkpoint: render the latest draw and save FITS+PNG+resid.
         cb = function (info)
             params = Comrade.Adapt.adapt(Array, info.params)
-            save_checkpoint(post_cpu, params, gimg, out, "sample_round$(info.round)")
+            save_checkpoint(post_cpu, params, gimg, imgbase, "sample_round$(info.round)")
             ndiv = count(info.numerical_error)
             @info "sampling batch $(info.round)/$(info.nrounds): n_divergences=$ndiv (checkpoint saved)"
             return (; info.round, n_divergences = ndiv)
         end
-        DiskStore(; name = mkpath(out), stride = stride, callback = cb)
+        # Warmup runs as a separate phase that bypasses the DiskStore, so it needs its own
+        # callback to also render checkpoints during the adaptation rounds. The warmup `info`
+        # carries `phase`/`round`/`params` (no `numerical_error`); `params` is already host-side.
+        wcb = function (info)
+            params = Comrade.Adapt.adapt(Array, info.params)
+            save_checkpoint(post_cpu, params, gimg, imgbase, "warmup_$(info.phase)_round$(info.round)")
+            @info "warmup round $(info.round)/$(info.nrounds) phase=$(info.phase) step_size=$(info.step_size) (checkpoint saved)"
+            return (; info.round, info.phase, info.step_size)
+        end
+        disk = DiskStore(; name = mkpath(out), stride = stride, callback = cb)
+        trace = sample(
+            rpost, smplr, strategy.nsample;
+            saveto = disk, initial_params = xopt, restart = restart, warmup_callback = wcb
+        )
     else
-        DiskStore(mkpath(out), stride)
+        disk = DiskStore(mkpath(out), stride)
+        trace = sample(rpost, smplr, strategy.nsample; saveto = disk, initial_params = xopt, restart = restart)
     end
-    trace = sample(rpost, smplr, strategy.nsample; saveto = disk, initial_params = xopt, restart = restart)
     return trace.out, 1:10:strategy.nsample
 end
 
@@ -187,10 +200,23 @@ function comrade_imager(
     mkpath(dirname(outbase))
     outimg = mkpath(joinpath(dirname(outbase), "images"))
     out = outbase
+    # Rendered sky images + residual PNGs go under images/, caltables under caltables/; the
+    # .jls and MCMC DiskStore stay at the run root. These are per-file prefixes inside each.
+    imgbase = joinpath(outimg, basename(outbase))
+    caltabbase = joinpath(dirname(outbase), "caltables", basename(outbase))
 
     # CPU / Enzyme posterior used for optimization, residuals and serialization.
     post = VLBIPosterior(skym, intm, data...; imgdata)
     tpost = asflat(post)
+
+    # On the Reactant path, verify the device posterior reproduces the CPU/Enzyme
+    # log-density AND gradient before fitting — a broken device model silently yields garbage
+    # fits (e.g. blown-up leakage). `post` here carries the Enzyme AD mode needed for the
+    # CPU reference. Errors on mismatch.
+    if strategy.use_reactant && strategy.verify_reactant
+        @info "Verifying Reactant device posterior against the CPU/Enzyme reference"
+        check_reactant_consistency(post, Comrade.prepare_device(post, Comrade.ComradeBase.ReactantEx()); rng = rng)
+    end
 
     if strategy.benchmark
         _run_benchmarks(post, strategy)
@@ -208,21 +234,21 @@ function comrade_imager(
         startx = deserialize(strategy.start)
         @info "Starting from $(strategy.start); logdensity = $(logdensityof(post, startx))"
         xopt = startx
-        save_optimal(out, post, xopt, gimg; label = "start")
-        plot_residuals_png(out * "_residuals_map.png", post, xopt)
-        write_caltables(out, xopt)
+        save_optimal(imgbase, post, xopt, gimg; label = "start")
+        plot_residuals_png(imgbase * "_residuals_map.png", post, xopt)
+        write_caltables(caltabbase, xopt)
         serialize(out * "_optimum_allres.jls", Dict(:xopt => xopt, :post => post))
     else
-        xopt = _optimize_tempered(out, skym, intm, data, imgdata, strategy, opt, rng)
-        save_optimal(out, post, xopt, gimg; label = "optimal")
-        plot_residuals_png(out * "_residuals_final_map.png", post, xopt)
-        write_caltables(out, xopt)
+        xopt = _optimize_tempered(imgbase, skym, intm, data, imgdata, strategy, opt, rng)
+        save_optimal(imgbase, post, xopt, gimg; label = "optimal")
+        plot_residuals_png(imgbase * "_residuals_final_map.png", post, xopt)
+        write_caltables(caltabbase, xopt)
         serialize(out * "_optimum_allres.jls", Dict(:xopt => xopt, :post => post))
     end
 
     # ---- sampling --------------------------------------------------------------------
     if strategy.use_reactant
-        trace, range = _sample_reactant(out, skym, intm, data, imgdata, xopt, strategy, restart, gimg)
+        trace, range = _sample_reactant(out, skym, intm, data, imgdata, xopt, strategy, restart, gimg, imgbase)
     else
         trace, range = _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart)
     end
@@ -232,7 +258,7 @@ function comrade_imager(
 
     nres = min(10, nchain)
     if nres > 0
-        plot_chain_residuals_png(out * "_residuals.png", post, sample(chain, nres))
+        plot_chain_residuals_png(imgbase * "_residuals.png", post, sample(chain, nres))
     end
 
     @info "Saving posterior images"

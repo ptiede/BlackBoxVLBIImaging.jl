@@ -34,6 +34,10 @@ Base.@kwdef struct FittingStrategy
     # run
     use_reactant::Bool = false
     benchmark::Bool = true
+    # On the Reactant path, check the device log-density+gradient against the CPU/Enzyme
+    # reference at a prior draw before optimizing, and error on mismatch (catches broken
+    # device models that silently produce garbage fits).
+    verify_reactant::Bool = false
     start::Union{Nothing, String} = nothing
     # Reactant sampling checkpointing (FITS + PNG + residuals): render every
     # `sample_checkpoint` samples (this is also the sampling DiskStore stride). 0 disables it.
@@ -89,6 +93,7 @@ function build_fitting_config(cfg::AbstractDict)
         base_window = Int(get(samp, "base_window", 25)),
         use_reactant = use_reactant,
         benchmark = Bool(get(run, "benchmark", true)),
+        verify_reactant = Bool(get(run, "verify_reactant", false)),
         start = start,
         # `checkpoint` is accepted as an alias for `sample_checkpoint`.
         sample_checkpoint = Int(get(run, "sample_checkpoint", get(run, "checkpoint", 0))),

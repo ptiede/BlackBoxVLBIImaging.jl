@@ -39,6 +39,7 @@ Write one CSV (and PNG via the plotting hook) calibration table per instrument q
 """
 function write_caltables(out, xopt)
     hasproperty(xopt, :instrument) || return nothing
+    mkpath(dirname(out))
     for (ki, vi) in pairs(xopt.instrument)
         gtp = Comrade.caltable(vi)
         CSV.write(out * "_ctable_$(ki).csv", gtp)

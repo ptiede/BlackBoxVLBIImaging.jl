@@ -28,7 +28,6 @@ using VLBIFiles
 using DataFrames
 using CSV
 using StructArrays
-using TypedTables
 using Accessors: @set
 using ConstructionBase
 using BenchmarkTools
