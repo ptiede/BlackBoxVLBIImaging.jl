@@ -43,7 +43,7 @@ include("sky/imagingmodel.jl")
 include("sky/meanmodels.jl")
 include("sky/skyprior.jl")
 
-# --- instrument closures (needed by the scheme registry) -------------------------------
+# --- instrument parameterizations (needed by the scheme registry) ----------------------
 include("instrument/parameterizations.jl")
 
 # --- data layer ------------------------------------------------------------------------

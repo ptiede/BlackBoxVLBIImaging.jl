@@ -74,7 +74,7 @@ function apply_flagtable(dvis, cfg)
     end
     for (a, b) in cfg.uvranges
         n0 = length(dvis)
-        dvis = flag(x -> a <= uvdist(x.baseline) <= b, dvis)
+        dvis = flag(x -> a <= uvdist(x) <= b, dvis)
         @info "  flag uvrange=[$a, $b] dropped $(n0 - length(dvis)) datums"
     end
     return dvis

@@ -19,13 +19,35 @@ function _select_optimizer(strategy::FittingStrategy)
     end
 end
 
-function _run_benchmarks(tpost, ndim)
+function _run_benchmarks(post, strategy)
+    if strategy.use_reactant
+        return _run_reactant_benchmarks(post)
+    end
+    tpost = asflat(post)
+    x0 = randn(dimension(tpost))
     @info "Forward pass benchmark"
-    x0 = randn(ndim)
     show(IOContext(stdout), MIME("text/plain"), @benchmark logdensityof($tpost, $x0))
     println()
     @info "Reverse pass benchmark"
     show(IOContext(stdout), MIME("text/plain"), @benchmark Comrade.LogDensityProblems.logdensity_and_gradient($tpost, $x0))
+    println()
+    return nothing
+end
+
+# Benchmark the device forward pass and the Enzyme value+gradient used by `reactant_opt`.
+# The compiled programs execute synchronously and return concrete arrays, so `@benchmark`
+# of the call measures full device execution (compilation happens once, up front).
+function _run_reactant_benchmarks(post)
+    dpost = Comrade.prepare_device(post, Comrade.ComradeBase.ReactantEx())
+    tpost = asflat(dpost)
+    xr = Reactant.to_rarray(Comrade.inverse(tpost, prior_sample(Random.default_rng(), dpost)))
+    fwd = Reactant.@compile sync = true logdensityof(tpost, xr)
+    vg = Reactant.@compile sync = true _reactant_value_and_grad(tpost, xr)
+    @info "Forward pass benchmark (Reactant)"
+    show(IOContext(stdout), MIME("text/plain"), @benchmark $fwd($tpost, $xr))
+    println()
+    @info "Reverse pass benchmark (Reactant)"
+    show(IOContext(stdout), MIME("text/plain"), @benchmark $vg($tpost, $xr))
     println()
     return nothing
 end
@@ -76,8 +98,8 @@ function _optimize_tempered(out, skym, intm, data, imgdata, strategy, opt, rng)
             post_i = VLBIPosterior(skym, intm, dat_i...; imgdata, admode = nothing)
             @info "Optimization stage $i/$nstage on Reactant (added noise = $frac)"
             xprev, _ = reactant_opt(
-                post_i, opt; initial_params = xprev, maxiters = strategy.maxiters, rng = rng,
-                checkpoint = strategy.checkpoint, outbase = out * "_optstage$(i)"
+                post_i, opt; initial_params = xprev, maxiters = strategy.maxiters,
+                ntrials = strategy.ntrials, rng = rng
             )
             plot_residuals_png(out * "_residuals_step$(i)_map.png", post_i, xprev)
             continue
@@ -123,10 +145,11 @@ function _sample_reactant(out, skym, intm, data, imgdata, xopt, strategy, restar
         max_tree_depth = strategy.max_tree_depth, init_buffer = strategy.init_buffer,
         term_buffer = strategy.term_buffer, base_window = strategy.base_window
     )
-    # With a DiskStore, the store's own `callback` drives every batch (the `sample_callback`
-    # kwarg is ignored), and the batch size is the store `stride` — so we use `chunk_size` as
-    # the stride to control both disk dumps and checkpoint frequency.
-    disk = if strategy.checkpoint > 0
+
+    # `sample_checkpoint` sets the sampling DiskStore stride (= batch / checkpoint frequency,
+    # independent of the optimization checkpoint stride); falls back to `chunk_size` when off.
+    stride = strategy.sample_checkpoint > 0 ? strategy.sample_checkpoint : strategy.chunk_size
+    disk = if strategy.sample_checkpoint > 0
         # Per-batch checkpoint: render the latest draw (info.params) and save FITS+PNG+resid.
         cb = function (info)
             params = Comrade.Adapt.adapt(Array, info.params)
@@ -135,9 +158,9 @@ function _sample_reactant(out, skym, intm, data, imgdata, xopt, strategy, restar
             @info "sampling batch $(info.round)/$(info.nrounds): n_divergences=$ndiv (checkpoint saved)"
             return (; info.round, n_divergences = ndiv)
         end
-        DiskStore(; name = mkpath(out), stride = strategy.chunk_size, callback = cb)
+        DiskStore(; name = mkpath(out), stride = stride, callback = cb)
     else
-        DiskStore(mkpath(out), strategy.chunk_size)
+        DiskStore(mkpath(out), stride)
     end
     trace = sample(rpost, smplr, strategy.nsample; saveto = disk, initial_params = xopt, restart = restart)
     return trace.out, 1:10:strategy.nsample
@@ -168,10 +191,9 @@ function comrade_imager(
     # CPU / Enzyme posterior used for optimization, residuals and serialization.
     post = VLBIPosterior(skym, intm, data...; imgdata)
     tpost = asflat(post)
-    ndim = dimension(tpost)
 
-    if strategy.benchmark && !strategy.use_reactant
-        _run_benchmarks(tpost, ndim)
+    if strategy.benchmark
+        _run_benchmarks(post, strategy)
     end
 
     g = post.skymodel.grid.imgdomain

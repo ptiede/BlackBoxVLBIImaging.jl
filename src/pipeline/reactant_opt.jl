@@ -15,62 +15,82 @@ function _reactant_value_and_grad(tpost, x)
     return last(derivs), val
 end
 
-# One optimization step: gradient of the log-posterior, then an Optimisers update on the
-# negated gradient (Optimisers minimizes; the log-posterior is to be maximized).
-function _reactant_opt_step(opt_state, tpost, x)
+# One optimization step: gradient of the log-posterior, then an *in-place* Optimisers update
+# on the negated gradient (Optimisers minimizes; the log-posterior is maximized). Updating in
+# place (`update!`) mutates `opt_state`/`x` and reuses their device buffers — the allocating
+# `update` would hand back fresh device arrays every step, which Julia's GC can't see and the
+# device runs out of memory. Returns the (host-readable) loss; `opt_state`/`x` are mutated.
+function _reactant_opt_step!(opt_state, tpost, x)
     grad, val = _reactant_value_and_grad(tpost, x)
-    new_state, new_x = Optimisers.update(opt_state, x, -1 .* grad)
-    return new_state, new_x, -val
+    Optimisers.update!(opt_state, x, -1 .* grad)
+    return -val
 end
 
 """
     reactant_opt(post::VLBIPosterior, optimiser; initial_params=nothing, maxiters=10_000,
-                 log_stride=250, checkpoint=0, outbase="", gimg=nothing,
-                 rng=Random.default_rng()) -> (xopt, sol)
+                 ntrials=1, log_stride=250, rng=Random.default_rng()) -> (xopt, sol)
 
 Optimize `post` on the Reactant device with an Optimisers.jl `optimiser` (e.g.
-`Optimisers.Adam(η)`). Mirrors `comrade_opt`: pass `initial_params` (a NamedTuple in the
-original parameter space) to warm-start, otherwise a prior sample is used. Returns the
-optimum `xopt` as a host NamedTuple and `sol = (; objective = -logdensity)`.
+`Optimisers.Adam(η)`). Mirrors `comrade_opt`/`best_image`: with no `initial_params`, runs
+`ntrials` random-restart optimizations (from independent prior draws) and keeps the one with
+the best objective — this is what avoids the bad local minima that a single start falls
+into. A supplied `initial_params` (e.g. a later tempering stage) is a single warm start.
+Returns the optimum `xopt` as a host NamedTuple and `sol = (; objective = -logdensity)`.
 
 The posterior is moved to the device internally via `prepare_device`; the per-step program
-(value + Enzyme gradient + update) is compiled once and reused for all `maxiters` steps.
-
-If `checkpoint > 0` and `outbase` is non-empty, every `checkpoint` iterations the current
-image is written (FITS + PNG + residuals) via [`save_checkpoint`](@ref); `gimg` is the
-render grid (defaults to the sky grid refined 2×).
+(value + Enzyme gradient + update) is compiled once and reused for every trial (the shapes
+are identical, so restarts are essentially free). Convergence is reported via `@info` every
+`log_stride` iterations; no per-iteration image checkpoints are written (rendering them on
+the host each step is far slower than the device step itself).
 """
 function reactant_opt(
-        post::VLBIPosterior, optimiser; initial_params = nothing,
-        maxiters = 10_000, log_stride = 250, checkpoint = 0, outbase = "",
-        gimg = nothing, rng = Random.default_rng()
+        post::VLBIPosterior, optimiser; initial_params = nothing, maxiters = 10_000,
+        ntrials = 1, log_stride = 250, gc_stride = 100, rng = Random.default_rng()
     )
     dpost = Comrade.prepare_device(post, Comrade.ComradeBase.ReactantEx())
     tpost = asflat(dpost)
 
-    x0 = isnothing(initial_params) ? prior_sample(rng, dpost) : initial_params
-    xr = Reactant.to_rarray(Comrade.inverse(tpost, x0))
+    # Multi-start only from random prior draws; a supplied initial_params is one warm start.
+    nstarts = isnothing(initial_params) ? max(ntrials, 1) : 1
+    _start() = isnothing(initial_params) ? prior_sample(rng, dpost) : initial_params
 
+    # Allocate the parameter buffer once and reuse it across trials. The step is compiled once
+    # and `_reactant_opt_step!` mutates `opt_state`/`xr` in place every iteration (no per-step
+    # allocation); between trials we overwrite `xr` in place (copyto!) and re-init the (small)
+    # optimizer state fresh, since Adam carries no momentum across restarts.
+    xr = Reactant.to_rarray(Comrade.inverse(tpost, _start()))
     opt_state = Reactant.@jit Optimisers.setup(optimiser, xr)
-    step_jit = Reactant.@compile sync = true _reactant_opt_step(opt_state, tpost, xr)
+    step_jit = Reactant.@compile _reactant_opt_step!(opt_state, tpost, xr)
 
-    docheck = checkpoint > 0 && !isempty(outbase)
-    cgrid = isnothing(gimg) ? refinespatial(post.skymodel.grid.imgdomain, 2) : gimg
-
-    xcur = xr
-    state = opt_state
-    loss = nothing
-    for i in 1:maxiters
-        state, xcur, loss = step_jit(state, tpost, xcur)
-        if i == 1 || i % log_stride == 0 || i == maxiters
-            @info "reactant_opt iter $i: -logdensity = $(Reactant.@allowscalar Float64(loss))"
+    best_params = nothing
+    best_loss = Inf
+    for t in 1:nstarts
+        if t > 1
+            # Reuse the parameter buffer: overwrite xr with a fresh start in place, and start
+            # the optimizer state from scratch for this restart.
+            copyto!(xr, Comrade.inverse(tpost, _start()))
+            opt_state = Reactant.@jit Optimisers.setup(optimiser, xr)
         end
-        if docheck && (i % checkpoint == 0 || i == maxiters)
-            params = Comrade.Adapt.adapt(Array, Reactant.@jit Comrade.transform(tpost, xcur))
-            save_checkpoint(post, params, cgrid, outbase, "opt_iter$(i)")
+        loss = nothing
+        for i in 1:maxiters
+            loss = step_jit(opt_state, tpost, xr)
+            if i == 1 || i % log_stride == 0 || i == maxiters
+                @info "reactant_opt trial $t/$nstarts iter $i: -logdensity = $(Reactant.@allowscalar Float64(loss))"
+            end
+            i % gc_stride == 0 && GC.gc()
         end
+        l = Reactant.@allowscalar Float64(loss)
+        @info "reactant_opt trial $t/$nstarts final -logdensity = $l"
+        # Materialize the winner to the host so the device buffer can be reused next trial.
+        if l < best_loss
+            best_loss = l
+            best_params = Comrade.Adapt.adapt(Array, Reactant.@jit Comrade.transform(tpost, xr))
+        end
+        GC.gc()
     end
+    # Fall back to the last point if every trial returned a non-finite objective.
+    isnothing(best_params) &&
+        (best_params = Comrade.Adapt.adapt(Array, Reactant.@jit Comrade.transform(tpost, xr)))
 
-    xopt = Comrade.Adapt.adapt(Array, Reactant.@jit Comrade.transform(tpost, xcur))
-    return xopt, (; objective = Reactant.@allowscalar Float64(loss))
+    return best_params, (; objective = best_loss)
 end

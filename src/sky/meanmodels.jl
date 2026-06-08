@@ -34,7 +34,7 @@ function make_mean(mimg::MimgPlusBkg, grid, θ)
 end
 
 function genmeanprior(::MimgPlusBkg)
-    return Dict(:fb => VLBITruncated(Exponential(0.1); upper = 1.0))
+    return Dict(:fb => VLBITruncated(VLBIExponential(0.1); upper = 1.0))
 end
 
 # --- Gaussian mean ---------------------------------------------------------------------

@@ -35,9 +35,11 @@ Base.@kwdef struct FittingStrategy
     use_reactant::Bool = false
     benchmark::Bool = true
     start::Union{Nothing, String} = nothing
-    # Reactant checkpointing: every `checkpoint` optimization iters (and after every sampling
-    # chunk) save the current image (FITS + PNG) and residuals. 0 disables it.
-    checkpoint::Int = 0
+    # Reactant sampling checkpointing (FITS + PNG + residuals): render every
+    # `sample_checkpoint` samples (this is also the sampling DiskStore stride). 0 disables it.
+    # Optimization is deliberately NOT checkpointed — rendering on the host each step is far
+    # slower than the device step.
+    sample_checkpoint::Int = 0
 end
 
 """
@@ -88,6 +90,7 @@ function build_fitting_config(cfg::AbstractDict)
         use_reactant = use_reactant,
         benchmark = Bool(get(run, "benchmark", true)),
         start = start,
-        checkpoint = Int(get(run, "checkpoint", 0)),
+        # `checkpoint` is accepted as an alias for `sample_checkpoint`.
+        sample_checkpoint = Int(get(run, "sample_checkpoint", get(run, "checkpoint", 0))),
     )
 end

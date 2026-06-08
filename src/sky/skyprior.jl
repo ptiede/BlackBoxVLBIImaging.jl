@@ -151,7 +151,7 @@ end
 
 function genimgprior(::Type{<:PolExp}, base::SRF{<:MarkovRF{N}}, grid, beamsize, order) where {N}
     cprior = VLBIImagePriors.std_dist(base.plan)
-    ρs = ntuple(Returns(Uniform(0.1, max(size(grid)...))), N)
+    ρs = ntuple(Returns(VLBIUniform(0.1, max(size(grid)...))), N)
     default = Dict(
         :a => cprior,
         :b => cprior,

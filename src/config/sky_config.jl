@@ -66,7 +66,9 @@ function _parse_ftot(ftot)
         return fs[1]
     elseif length(fs) == 2
         @info "Fitting the total flux between $(fs[1]) and $(fs[2])"
-        return Uniform(fs[1], fs[2])
+        # VLBIUniform (not Distributions.Uniform) so the fit-flux prior traces under Reactant
+        # as well as on CPU.
+        return VLBIImagePriors.VLBIUniform(fs[1], fs[2])
     else
         error("flux.ftot must have 1 (fixed) or 2 (range) values, got $(fs)")
     end

@@ -63,6 +63,8 @@ function getcohfield(fname)
         cind12 = findall(x -> (((x[1] == "R") || (x[1] == "X")) && ((x[2] == "L") || (x[2] == "Y"))), zip(g.Pol1, g.Pol2) |> collect)
         cind22 = findall(x -> (((x[1] == "L") || (x[1] == "Y")) && ((x[2] == "L") || (x[2] == "Y"))), zip(g.Pol1, g.Pol2) |> collect)
 
+        @assert length(cind11) <= 1 && length(cind21) <= 1 && length(cind12) <= 1 && length(cind22) <= 1 "Multiple entries for the same baseline and time. This parser assumes each line in the dlist is a unique baseline+time+freq."
+
         c[1, 1] = length(cind11) == 0 ? NaN : complex(g.visre[first(cind11)], g.visim[first(cind11)])
         c[2, 1] = length(cind21) == 0 ? NaN : complex(g.visre[first(cind21)], g.visim[first(cind21)])
         c[1, 2] = length(cind12) == 0 ? NaN : complex(g.visre[first(cind12)], g.visim[first(cind12)])

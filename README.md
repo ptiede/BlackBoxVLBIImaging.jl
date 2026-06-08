@@ -5,8 +5,8 @@
 [![Build Status](https://github.com/ptiede/BlackBoxVLBIImaging.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/ptiede/BlackBoxVLBIImaging.jl/actions/workflows/CI.yml?query=branch%3Amain)
 [![Coverage](https://codecov.io/gh/ptiede/BlackBoxVLBIImaging.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/ptiede/BlackBoxVLBIImaging.jl)
 
-Bayesian VLBI imaging of EHT data with [Comrade.jl](https://github.com/ptiede/Comrade.jl),
-driven entirely by **four TOML config files** instead of a long list of command-line flags.
+Bayesian VLBI imaging of EHT data with [Comrade.jl](https://github.com/ptiede/Comrade.jl).
+The model is specified by **four TOML config files**:
 
 A run is described by:
 
@@ -34,8 +34,7 @@ julia --project=drivers -t auto drivers/main.jl \
 
 Sampling on Reactant NUTS is selected inside the fitting TOML (`use_reactant = true`,
 `sampler = "reactant"`), since that choice also governs the optimizer path. To resume a
-previous run from its serialized optimum, add the one-off `--restart` flag (it is not stored
-in any TOML):
+previous run from its serialized optimum, add the one-off `--restart`:
 
 ```bash
 julia --project=drivers -t auto drivers/main.jl --restart \

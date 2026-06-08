@@ -28,6 +28,6 @@ base_window = 25
 [run]
 use_reactant = false
 benchmark = true
-checkpoint = 0       # Reactant only: every N optimization iters (and each sampling chunk)
-                     # save the current image (FITS + PNG + residuals). 0 disables it.
+sample_checkpoint = 0   # Reactant only: render a checkpoint (FITS + PNG + residuals) every N
+                        # sampling samples (also the sampling disk stride). 0 disables it.
 # start = "/path/to/start.jls"   # warm-start from a serialized parameter vector

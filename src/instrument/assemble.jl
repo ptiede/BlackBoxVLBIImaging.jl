@@ -47,7 +47,7 @@ end
 
 Build a Comrade `InstrumentModel` from a parsed instrument TOML. `cfg` must contain a
 `[gain]` section with a `scheme`, an optional `[leakage]` section, an optional
-`field_rotation` flag, and a `[priors]` table with one entry per parameter required by the
+`frcal` flag, and a `[priors]` table with one entry per parameter required by the
 chosen gain (and leakage) scheme. Throws if any required prior is missing.
 """
 function assemble_instrument(cfg::AbstractDict)
@@ -62,7 +62,7 @@ function assemble_instrument(cfg::AbstractDict)
         error("unknown leakage scheme '$lname'. Allowed: $(sort(collect(keys(LEAKAGE_SCHEMES))))")
     lsch = LEAKAGE_SCHEMES[lname]
 
-    field_rotation = Bool(get(cfg, "field_rotation", false))
+    frcal = Bool(get(cfg, "frcal", false))
 
     required = Symbol[gsch.params..., lsch.params...]
     priors = get(cfg, "priors", Dict{String, Any}())
@@ -72,17 +72,17 @@ function assemble_instrument(cfg::AbstractDict)
 
     intprior = NamedTuple([p => _build_array_prior(priors[String(p)]) for p in required])
 
-    G = gsch.kind === :single ? SingleStokesGain(gsch.closure) : JonesG(gsch.closure)
+    G = gsch.kind === :single ? SingleStokesGain(gsch.parameterization) : JonesG(gsch.parameterization)
 
     if lname == "none"
         J = G
     else
-        D = JonesD(lsch.closure)
+        D = JonesD(lsch.parameterization)
         R = JonesR(; add_fr = true)
-        sw = field_rotation ? sandwich_withfrcal : sandwich
+        sw = frcal ? sandwich_withfrcal : sandwich
         J = JonesSandwich(sw, G, D, R)
     end
 
-    @info "Instrument: gain=$gname leakage=$lname field_rotation=$field_rotation nparams=$(length(required))"
+    @info "Instrument: gain=$gname leakage=$lname frcal=$frcal nparams=$(length(required))"
     return InstrumentModel(J, intprior)
 end
