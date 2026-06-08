@@ -85,35 +85,43 @@ function best_image(post, ntrials = 20, maxiters = 10_000, rng = Random.default_
     return sols_v[inds], lm_v[inds]
 end
 
+# One tempering stage: optimize `post_i`, warm-started from `xprev`. The CPU path random-
+# restarts with `best_image` on the first stage and refines with `comrade_opt` afterwards;
+# the Reactant path uses `reactant_opt`, which folds restart-then-refine into a single call
+# (it multi-starts when `initial_params === nothing`, and warm-starts otherwise).
+function _optimize_stage(post_i, opt, xprev, i, nstage, frac, strategy, rng)
+    if strategy.use_reactant
+        # Mirror the CPU schedule: full maxiters on the first and last stage, half on the
+        # intermediate refine stages; `g_tol` early-stop as in `comrade_opt`/`best_image`.
+        mi = (i == 1 || i == nstage) ? strategy.maxiters : strategy.maxiters ÷ 2
+        @info "Optimization stage $i/$nstage on Reactant (added noise = $frac)"
+        x, _ = reactant_opt(
+            post_i, opt; initial_params = xprev, maxiters = mi, ntrials = strategy.ntrials,
+            g_tol = strategy.g_tol, verify = strategy.verify_reactant, rng = rng
+        )
+        return x
+    elseif i == 1
+        @info "Optimization stage $i/$nstage: random restarts (added noise = $frac)"
+        sols, _ = best_image(post_i, strategy.ntrials, strategy.maxiters, rng; opt = opt)
+        return sols[1]
+    else
+        mi = (i == nstage) ? strategy.maxiters : strategy.maxiters ÷ 2
+        @info "Optimization stage $i/$nstage: refine (added noise = $frac)"
+        x, _ = comrade_opt(post_i, opt; initial_params = xprev, maxiters = mi, g_tol = strategy.g_tol)
+        return x
+    end
+end
+
 function _optimize_tempered(imgbase, skym, intm, data, imgdata, strategy, opt, rng)
+    # `nothing` so stage 1 random-restarts on both paths (CPU `best_image`, and `reactant_opt`
+    # whose multi-start triggers only when `initial_params === nothing`); later stages
+    # warm-start from the previous stage's result.
     xprev = nothing
     nstage = length(strategy.noise_schedule)
     for (i, frac) in enumerate(strategy.noise_schedule)
         dat_i = frac == 0.0 ? data : map(d -> add_fractional_noise(d, frac), data)
-        if strategy.use_reactant
-            # Reactant path: Optimisers.jl loop on the device (no random restarts, since each
-            # device posterior recompiles). `post_i` (admode=nothing, like the sampler path)
-            # stays on the host for the residual plot; `reactant_opt` moves its own copy to
-            # the device.
-            post_i = VLBIPosterior(skym, intm, dat_i...; imgdata, admode = nothing)
-            @info "Optimization stage $i/$nstage on Reactant (added noise = $frac)"
-            xprev, _ = reactant_opt(
-                post_i, opt; initial_params = xprev, maxiters = strategy.maxiters,
-                ntrials = strategy.ntrials, verify = strategy.verify_reactant, rng = rng
-            )
-            plot_residuals_png(imgbase * "_residuals_step$(i)_map.png", post_i, xprev)
-            continue
-        end
         post_i = VLBIPosterior(skym, intm, dat_i...; imgdata)
-        if i == 1
-            @info "Optimization stage $i/$nstage: random restarts (added noise = $frac)"
-            sols, _ = best_image(post_i, strategy.ntrials, strategy.maxiters, rng; opt = opt)
-            xprev = sols[1]
-        else
-            mi = (i == nstage) ? strategy.maxiters : strategy.maxiters ÷ 2
-            @info "Optimization stage $i/$nstage: refine (added noise = $frac)"
-            xprev, _ = comrade_opt(post_i, opt; initial_params = xprev, maxiters = mi, g_tol = strategy.g_tol)
-        end
+        xprev = _optimize_stage(post_i, opt, xprev, i, nstage, frac, strategy, rng)
         plot_residuals_png(imgbase * "_residuals_step$(i)_map.png", post_i, xprev)
     end
     return xprev
@@ -136,9 +144,12 @@ function _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart)
     return trace, (strategy.nadapt + 1):10:strategy.nsample
 end
 
-function _sample_reactant(out, skym, intm, data, imgdata, xopt, strategy, restart, gimg, imgbase)
+function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase)
     @info "Building Reactant device posterior for sampling"
-    post_cpu = VLBIPosterior(skym, intm, data...; imgdata, admode = nothing)
+    # Reuse the already-built posterior, just dropping the Enzyme AD mode: `prepare_device`
+    # iterates every field and would try to `to_rarray` the admode, and the device computes
+    # its own gradients. This avoids rebuilding the instrument Jones matrices / FFT plans.
+    post_cpu = @set post.admode = nothing
     rpost = Comrade.prepare_device(post_cpu, Comrade.ComradeBase.ReactantEx())
     smplr = Comrade.ReactantNUTS(;
         n_adapts = strategy.nadapt, init_step_size = strategy.step_size,

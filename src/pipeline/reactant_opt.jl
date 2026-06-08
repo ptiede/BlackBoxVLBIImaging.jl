@@ -28,7 +28,8 @@ end
 function _reactant_opt_step!(opt_state, tpost, x)
     grad, val = _reactant_value_and_grad(tpost, x)
     new_state, new_x = Optimisers.update!(opt_state, x, grad)
-    return new_state, new_x, val
+    # 4th return: the gradient ∞-norm, used for `comrade_opt`-style `g_tol` early-stopping.
+    return new_state, new_x, val, maximum(abs, grad)
 end
 
 """
@@ -66,7 +67,7 @@ function check_reactant_consistency(
     xr = Reactant.to_rarray(copy(xx))
     st = Reactant.@jit Optimisers.setup(Optimisers.Descent(1), xr)
     step = Reactant.@compile _reactant_opt_step!(st, tpostd, xr)
-    _, x1, loss = step(st, tpostd, xr)
+    _, x1, loss, _ = step(st, tpostd, xr)
     vd = -(Reactant.@allowscalar Float64(loss))
     gd = collect(Comrade.Adapt.adapt(Array, x1)) .- xx
 
@@ -106,8 +107,8 @@ the host each step is far slower than the device step itself).
 """
 function reactant_opt(
         post::VLBIPosterior, optimiser; initial_params = nothing, maxiters = 10_000,
-        ntrials = 1, log_stride = 250, gc_stride = 100, verify = true, rtol = 1.0e-2,
-        rng = Random.default_rng()
+        ntrials = 1, log_stride = 250, gc_stride = 100, g_tol = 1.0e-1, verify = true,
+        rtol = 1.0e-2, rng = Random.default_rng()
     )
     dpost = Comrade.prepare_device(post, Comrade.ComradeBase.ReactantEx())
     tpost = asflat(dpost)
@@ -136,9 +137,16 @@ function reactant_opt(
         end
         loss = nothing
         for i in 1:maxiters
-            opt_state, xr, loss = step_jit(opt_state, tpost, xr)
+            opt_state, xr, loss, gnorm = step_jit(opt_state, tpost, xr)
+            # Log and check `g_tol` convergence at the same cadence (both read device scalars
+            # to the host, which forces a sync — so we avoid doing it every iteration).
             if i == 1 || i % log_stride == 0 || i == maxiters
-                @info "reactant_opt trial $t/$nstarts iter $i: -logdensity = $(Reactant.@allowscalar Float64(loss))"
+                gn = Reactant.@allowscalar Float64(gnorm)
+                @info "reactant_opt trial $t/$nstarts iter $i: -logdensity = $(Reactant.@allowscalar Float64(loss)) |g|∞ = $gn"
+                if gn < g_tol
+                    @info "reactant_opt trial $t/$nstarts converged at iter $i (|g|∞ = $gn < g_tol = $g_tol)"
+                    break
+                end
             end
             i % gc_stride == 0 && GC.gc()
         end
