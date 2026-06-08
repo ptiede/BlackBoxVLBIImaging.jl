@@ -1,6 +1,6 @@
 # Tiny Reactant fitting strategy for an end-to-end smoke: a few optimization iters on
-# Reactant, a token Reactant NUTS chain, and checkpointing on (FITS + PNG + residuals every
-# 2 opt iters and after each sampling chunk).
+# Reactant, a token Reactant NUTS chain, and sampling checkpoints on (FITS + PNG + residuals
+# every 2 sampling samples).
 
 [optimizer]
 method = "Adam"
@@ -25,4 +25,4 @@ base_window = 15
 [run]
 use_reactant = true
 benchmark = false
-checkpoint = 2
+sample_checkpoint = 2

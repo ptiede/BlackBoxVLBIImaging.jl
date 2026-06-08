@@ -9,7 +9,7 @@ scheme = "gain"          # lg1, gp1, lgratμ, lgratσ, lgrat, gprat, gpratμ
 [leakage]
 scheme = "leakage_simple"   # d1re, d1im, d2re, d2im
 
-field_rotation = false      # false -> g*d*r (jnofr); true -> adjoint(r)*g*d*r
+frcal = false      # false -> g*d*r (jnofr); true -> adjoint(r)*g*d*r
 
 # --- gain amplitudes -------------------------------------------------------------------
 [priors.lg1]
