@@ -1,15 +1,22 @@
-# Data loading + flagging. Edit `file`/`array` to point at your observation.
+# Data loading + flagging. Edit [paths] to point at your observation.
 
+[paths]
 file = "/home/ptiede/Harvard University Dropbox/Paul Tiede/CHWorkshop/data/3809/hops_3809_M87.apriori.uvfits"
 array = "/home/ptiede/Harvard University Dropbox/Paul Tiede/CHWorkshop/data/array.txt"
-format = "auto"     # auto | uvfits | dlist (auto infers from the file extension)
-avg = "scan"        # "scan" or a number of seconds (e.g. "60")
-ferr = 0.005        # fractional systematic noise added to the coherencies
-trange = []         # [] = all; or [start, end] in UT decimal hours
+# Resolve relative file/array paths against "toml" (this file's dir) or "cwd" (launch dir).
+# Absolute paths (as above) are used as-is either way.
+path_mode = "toml"
 
-# --- flagging (closed schema; see src/data/flagtable.jl) -------------------------------
-corr_polbasis = []                  # e.g. ["HAY"] to flip a site's feed basis
-sites = []                          # e.g. ["AP"] to drop all baselines to a site
-baselines = []                      # e.g. [["AA", "LM"]]
-tranges = []                        # e.g. [[4.5, 5.2]] UT decimal-hour ranges to drop
-uvranges = []                       # e.g. [[0.0, 1.0e8]] uv-distance ranges (λ) to drop
+[data]
+format = "auto"      # auto | uvfits | dlist (auto infers from the file extension)
+avg = "scan"         # "scan" or a number of seconds (e.g. "60")
+ferr = 0.005         # fractional systematic noise added to the coherencies
+keep_trange = []     # [] = all; or [lo, hi] UT decimal hours to restrict to at load
+
+# --- flagging (closed schema; see src/data/flagtable.jl) ------------------------------
+[flags]
+corr_polbasis = []   # e.g. ["HAY"] to flip a site's feed basis
+sites = []           # e.g. ["AP"] to drop all baselines to a site
+baselines = []       # e.g. [["AA", "LM"]]
+drop_tranges = []    # e.g. [[4.5, 5.2]] UT decimal-hour windows to drop
+uvranges = []        # e.g. [[0.0, 1.0e8]] uv-distance windows (λ) to drop

@@ -70,8 +70,10 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
     arrayfile = "/home/ptiede/Harvard University Dropbox/Paul Tiede/CHWorkshop/data/array.txt"
     @testset "integration: posterior + tiny optimize" begin
         if isfile(datafile) && isfile(arrayfile)
-            dcfg = Dict{String, Any}("file" => datafile, "array" => arrayfile,
-                "format" => "uvfits", "ferr" => 0.01)
+            dcfg = Dict{String, Any}(
+                "paths" => Dict{String, Any}("file" => datafile, "array" => arrayfile, "path_mode" => "cwd"),
+                "data" => Dict{String, Any}("format" => "uvfits", "ferr" => 0.01),
+            )
             dcoh = build_data_config(dcfg)
             skym, imgdata = build_sky_config(exconfig("image_smoke.toml"))
             intm = build_instrument_config(exconfig("instrument_mixed.toml"))

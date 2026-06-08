@@ -27,7 +27,9 @@ function image_from_toml(
     strategy = build_fitting_config(fitcfg)
     (skym, imgdata) = build_sky_config(skycfg)
     intm = build_instrument_config(intcfg)
-    dcoh = build_data_config(datacfg)
+    # `base_dir` lets `[paths] path_mode = "toml"` resolve relative file/array paths against
+    # the data TOML's own directory (so a config dir is portable).
+    dcoh = build_data_config(datacfg; base_dir = dirname(abspath(data)))
 
     outdir = dirname(outpath)
     mkpath(isempty(outdir) ? "." : outdir)
