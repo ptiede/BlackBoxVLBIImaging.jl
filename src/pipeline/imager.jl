@@ -142,8 +142,7 @@ function _sample_reactant(out, skym, intm, data, imgdata, xopt, strategy, restar
     rpost = Comrade.prepare_device(post_cpu, Comrade.ComradeBase.ReactantEx())
     smplr = Comrade.ReactantNUTS(;
         n_adapts = strategy.nadapt, init_step_size = strategy.step_size,
-        max_tree_depth = strategy.max_tree_depth, init_buffer = strategy.init_buffer,
-        term_buffer = strategy.term_buffer, base_window = strategy.base_window
+        max_tree_depth = strategy.max_tree_depth
     )
 
     # `sample_checkpoint` sets the sampling DiskStore stride (= batch / checkpoint frequency,
@@ -158,14 +157,14 @@ function _sample_reactant(out, skym, intm, data, imgdata, xopt, strategy, restar
             @info "sampling batch $(info.round)/$(info.nrounds): n_divergences=$ndiv (checkpoint saved)"
             return (; info.round, n_divergences = ndiv)
         end
-        # Warmup runs as a separate phase that bypasses the DiskStore, so it needs its own
-        # callback to also render checkpoints during the adaptation rounds. The warmup `info`
-        # carries `phase`/`round`/`params` (no `numerical_error`); `params` is already host-side.
+        # Warmup is a single fused call that bypasses the DiskStore, so its callback fires
+        # once after warmup completes. The fused-warmup `info` carries `num_warmup`/`step_size`/
+        # `params` (host-side) — NOT the old per-round `phase`/`round`/`nrounds` fields.
         wcb = function (info)
             params = Comrade.Adapt.adapt(Array, info.params)
-            save_checkpoint(post_cpu, params, gimg, imgbase, "warmup_$(info.phase)_round$(info.round)")
-            @info "warmup round $(info.round)/$(info.nrounds) phase=$(info.phase) step_size=$(info.step_size) (checkpoint saved)"
-            return (; info.round, info.phase, info.step_size)
+            save_checkpoint(post_cpu, params, gimg, imgbase, "warmup_final")
+            @info "warmup complete: num_warmup=$(info.num_warmup) step_size=$(info.step_size) (checkpoint saved)"
+            return (; info.num_warmup, info.step_size)
         end
         disk = DiskStore(; name = mkpath(out), stride = stride, callback = cb)
         trace = sample(
