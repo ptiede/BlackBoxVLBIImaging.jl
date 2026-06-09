@@ -52,7 +52,7 @@ chosen gain (and leakage) scheme. Throws if any required prior is missing.
 """
 function assemble_instrument(cfg::AbstractDict)
     haskey(cfg, "gain") || error("instrument config needs a [gain] section")
-    gname = String(get(cfg["gain"], "scheme", "") )
+    gname = String(get(cfg["gain"], "scheme", ""))
     haskey(GAIN_SCHEMES, gname) ||
         error("unknown gain scheme '$gname'. Allowed: $(sort(collect(keys(GAIN_SCHEMES))))")
     gsch = GAIN_SCHEMES[gname]

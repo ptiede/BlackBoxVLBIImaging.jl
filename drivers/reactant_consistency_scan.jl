@@ -35,7 +35,7 @@ imgf, intf, datf, fitf = if length(ARGS) >= 4
     ARGS[1], ARGS[2], ARGS[3], ARGS[4]
 else
     joinpath(EXDIR, "image.toml"), joinpath(EXDIR, "instrument.toml"),
-    joinpath(EXDIR, "data.toml"), joinpath(EXDIR, "fitting_reactant.toml")
+        joinpath(EXDIR, "data.toml"), joinpath(EXDIR, "fitting_reactant.toml")
 end
 optjls = length(ARGS) >= 5 ? ARGS[5] : nothing
 const RTOL = 1.0e-2
@@ -143,8 +143,10 @@ vd0, gd0 = device_vg(x0)
 println()
 println("="^96)
 println("Per-block gradient reldiff at the base point (global-normalized check would MISS these):")
-@printf("  sky:  %.3e   gain: %.3e   leak: %.3e\n",
-    blockrel(gc0, gd0, Isky), blockrel(gc0, gd0, Igain), blockrel(gc0, gd0, Ileak))
+@printf(
+    "  sky:  %.3e   gain: %.3e   leak: %.3e\n",
+    blockrel(gc0, gd0, Isky), blockrel(gc0, gd0, Igain), blockrel(gc0, gd0, Ileak)
+)
 println("="^96)
 
 # ---- scan 1: leakage toward physical magnitudes -------------------------------------------
@@ -160,8 +162,10 @@ function run_scan(title, header, points, makex)
         gl = blockrel(gc, gd, Ileak); gg = blockrel(gc, gd, Igain); gs = blockrel(gc, gd, Isky)
         dmax = leak_maxmag(x)
         flag = (vrel > RTOL || gl > RTOL || gg > RTOL) ? "  <-- DIVERGES" : ""
-        @printf("  s=%6.3f |d|max=%5.3f  ld_cpu=%+.6e ld_dev=%+.6e  vrel=%.2e  g[sky]=%.2e g[gain]=%.2e g[leak]=%.2e%s\n",
-            s, dmax, vc, vd, vrel, gs, gg, gl, flag)
+        @printf(
+            "  s=%6.3f |d|max=%5.3f  ld_cpu=%+.6e ld_dev=%+.6e  vrel=%.2e  g[sky]=%.2e g[gain]=%.2e g[leak]=%.2e%s\n",
+            s, dmax, vc, vd, vrel, gs, gg, gl, flag
+        )
         if isnothing(first_div) && !isempty(flag)
             first_div = (; s, dmax, vrel, gl, gg)
         end
@@ -201,10 +205,14 @@ else
     println("DIVERGENCE FOUND — the device log-density/gradient peels away from CPU as the")
     println("instrument terms grow, while matching at the base point. Both the optimizer and the")
     println("sampler then target a distorted posterior -> garbage, for every sky model.")
-    !isnothing(div1) && @printf("  leakage scan: first diverges at s=%.3f (|d|max=%.3f): vrel=%.2e g[leak]=%.2e\n",
-        div1.s, div1.dmax, div1.vrel, div1.gl)
-    !isnothing(div2) && @printf("  instrument scan: first diverges at k=%.3f: vrel=%.2e g[gain]=%.2e\n",
-        div2.s, div2.vrel, div2.gg)
+    !isnothing(div1) && @printf(
+        "  leakage scan: first diverges at s=%.3f (|d|max=%.3f): vrel=%.2e g[leak]=%.2e\n",
+        div1.s, div1.dmax, div1.vrel, div1.gl
+    )
+    !isnothing(div2) && @printf(
+        "  instrument scan: first diverges at k=%.3f: vrel=%.2e g[gain]=%.2e\n",
+        div2.s, div2.vrel, div2.gg
+    )
     println("\nNext: bisect the instrument Jones path (JonesSandwich g*d*r / field-rotation")
     println("JonesR / refbasis / corr_polbasis) under Reactant at the diverging point.")
 end

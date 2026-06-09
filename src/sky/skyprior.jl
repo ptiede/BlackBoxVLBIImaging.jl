@@ -46,7 +46,7 @@ end
 function genimgprior(::Type{<:TotalIntensity}, base::SRF{<:MarkovRF{N}}, grid, beamsize, order) where {N}
     bs = beamsize / step(grid.X)
     cprior = VLBIImagePriors.std_dist(base.plan)
-    ρs = ntuple(Returns(VLBITruncated(VLBIUniform(0.1, 1.0*max(size(grid)...)); lower = 0.1, upper = 1.0)), N)
+    ρs = ntuple(Returns(VLBITruncated(VLBIUniform(0.1, 1.0 * max(size(grid)...)); lower = 0.1, upper = 1.0)), N)
     default = Dict(
         :c => cprior,
         :σ => VLBITruncated(VLBIGaussian(0.0, 1.0); lower = 0.0),

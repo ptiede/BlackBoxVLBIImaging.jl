@@ -204,9 +204,9 @@ function make_pol2expimage(ftot, a, b, c, d, mimg)
     ft = sum(bpmapI)
     bpmapI .*= ftot ./ ft
     map((:Q, :U, :V)) do s
-         bpmapS = stokes(bpmap, s)
-         bpmapS .*= bmimg
-         bpmapS .*= ftot ./ ft
+        bpmapS = stokes(bpmap, s)
+        bpmapS .*= bmimg
+        bpmapS .*= ftot ./ ft
     end
     return pmap
 end

@@ -94,9 +94,3 @@ end
 
 @inline sandwich_withfrcal(g, d, r) = adjoint(r) * g * d * r
 @inline sandwich(g, d, r) = g * d * r
-
-
-
-
-
-

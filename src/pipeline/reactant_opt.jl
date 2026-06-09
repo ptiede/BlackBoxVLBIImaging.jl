@@ -80,9 +80,9 @@ function check_reactant_consistency(
     if vrel > rtol || grel > rtol
         error(
             "Reactant device posterior disagrees with the CPU/Enzyme reference beyond " *
-            "rtol=$rtol: logdensity reldiff=$vrel, gradient max reldiff=$grel " *
-            "(worst gradient component $i: cpu=$(gc[i]) device=$(gd[i])). The Reactant " *
-            "model or its gradient is wrong — fits will be garbage. Aborting."
+                "rtol=$rtol: logdensity reldiff=$vrel, gradient max reldiff=$grel " *
+                "(worst gradient component $i: cpu=$(gc[i]) device=$(gd[i])). The Reactant " *
+                "model or its gradient is wrong — fits will be garbage. Aborting."
         )
     end
     return (; value_reldiff = vrel, grad_reldiff = grel)
@@ -170,8 +170,8 @@ function reactant_opt(
         if reldiff > rtol
             error(
                 "Reactant device optimum disagrees with the CPU/Enzyme log-density at the same " *
-                "point (CPU=$cpu_ld, device=$dev_ld, reldiff=$reldiff > rtol=$rtol). The device " *
-                "model is wrong somewhere the optimizer reached — the fit would be garbage."
+                    "point (CPU=$cpu_ld, device=$dev_ld, reldiff=$reldiff > rtol=$rtol). The device " *
+                    "model is wrong somewhere the optimizer reached — the fit would be garbage."
             )
         end
     end

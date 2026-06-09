@@ -132,7 +132,7 @@ function make_mean(mimg::JetGauss, grid, θ)
     fl = sum(img)
     pimg = baseimage(img)
     pcore = baseimage(mimg.core)
-    pimg .= pcore .* (1 - fj) .+ pimg .* (fj/fl)
+    pimg .= pcore .* (1 - fj) .+ pimg .* (fj / fl)
     return img
 end
 
@@ -168,7 +168,7 @@ function make_mean(p::GaussBkgdMean, grid, θ)
     m = modify(Gaussian(), Stretch(fwhm / fwhmfac))
     mimg = intensitymap(m, grid)
     pmimg = baseimage(mimg)
-    pf =  sum(pmimg)
+    pf = sum(pmimg)
     pmimg .= pmimg ./ pf * (1 - fb) .+ p.bkgd ./ sum(p.bkgd) * fb
     return mimg
 end

@@ -36,8 +36,10 @@ function image_from_toml(
     outdir = dirname(outpath)
     mkpath(isempty(outdir) ? "." : outdir)
     # Copy the configs next to the run for provenance.
-    for (f, suffix) in ((image, "image.toml"), (instrument, "instrument.toml"),
-            (data, "data.toml"), (fitting, "fitting.toml"))
+    for (f, suffix) in (
+            (image, "image.toml"), (instrument, "instrument.toml"),
+            (data, "data.toml"), (fitting, "fitting.toml"),
+        )
         try
             cp(f, outpath * "_" * suffix; force = true)
         catch err

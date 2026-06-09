@@ -3,13 +3,12 @@ using Optimisers
 
 function opt_step(opt_state, tpostr, xr)
     grad, val = gl(tpostr, xr)
-    Optimisers.update!(opt_state, xr, -grad), -val
+    return Optimisers.update!(opt_state, xr, -grad), -val
 end
 
 
-
 function callback(tpost, xr)
-    ps = Comrade.transform(tpost, xr);
+    ps = Comrade.transform(tpost, xr)
     ms = skymodel(tpost.lpost, ps)
     res = residuals(tpost.lpost, ps)
     return ps, ms, res
@@ -25,7 +24,7 @@ using Adapt, CairoMakie
 gpl = refinespatial(grd, 2)
 
 
-_, val0 =os(opt_state, tpost, xr)
+_, val0 = os(opt_state, tpost, xr)
 for i in 1:1000
     _, val = os(opt_state, tpost, xr)
     if i % 100 == 0 || i == 1
