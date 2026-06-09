@@ -74,15 +74,29 @@ function _parse_ftot(ftot)
     end
 end
 
-function _build_mean_model(meancfg::AbstractDict, g)
+# Mean Gaussian FWHM in radians. Data-driven by default: `fwhm_beams` × the observation beam
+# (default 1× beam, matching MixedPolPaper's `Stretch(beamsize(dcoh)/fwhmfac)`). An explicit
+# `fwhm` (μas) overrides. `default_μas` is only used when the sky is built without a beam
+# (standalone/no data).
+function _mean_fwhm_rad(meancfg::AbstractDict, beam, default_μas)
+    if haskey(meancfg, "fwhm")
+        return μas2rad(Float64(meancfg["fwhm"]))
+    elseif !isnothing(beam)
+        return Float64(get(meancfg, "fwhm_beams", 1.0)) * beam
+    else
+        return μas2rad(default_μas)
+    end
+end
+
+function _build_mean_model(meancfg::AbstractDict, g, beam)
     mtype = String(get(meancfg, "type", "Bkgd"))
     if mtype == "GaussBkgd"
         @info "Using a Gaussian background mean for the sky model"
         return GaussBkgdMean(g)
     elseif mtype == "Bkgd"
-        @info "Using a background mean for the sky model"
-        fwhm = Float64(get(meancfg, "fwhm", 50.0))
-        mimg = intensitymap(modify(Gaussian(), Stretch(μas2rad(fwhm) / fwhmfac)), g)
+        fwhm = _mean_fwhm_rad(meancfg, beam, 50.0)
+        @info "Using a background mean for the sky model (Gaussian FWHM = $(round(rad2μas(fwhm), digits = 1)) μas)"
+        mimg = intensitymap(modify(Gaussian(), Stretch(fwhm / fwhmfac)), g)
         return MimgPlusBkg(mimg ./ sum(mimg))
     elseif mtype == "Gauss"
         @info "Using a Gaussian mean for the sky model"
@@ -94,9 +108,9 @@ function _build_mean_model(meancfg::AbstractDict, g)
         @info "Using a Student-t blob mean for the sky model"
         return TBlobMean()
     elseif mtype == "JetGauss"
-        @info "Using a jet+Gaussian mean for the sky model"
-        fwhm = Float64(get(meancfg, "fwhm", 30.0))
-        mimg = intensitymap(modify(Gaussian(), Stretch(μas2rad(fwhm) / fwhmfac)), g)
+        fwhm = _mean_fwhm_rad(meancfg, beam, 30.0)
+        @info "Using a jet+Gaussian mean for the sky model (Gaussian FWHM = $(round(rad2μas(fwhm), digits = 1)) μas)"
+        mimg = intensitymap(modify(Gaussian(), Stretch(fwhm / fwhmfac)), g)
         return JetGauss(mimg ./ sum(mimg))
     else
         error("unknown mean type '$mtype'. Allowed: GaussBkgd, Bkgd, Gauss, Ring, TBlob, JetGauss")
@@ -112,12 +126,18 @@ function _parse_sky_overrides(ocfg::AbstractDict)
 end
 
 """
-    build_sky_config(cfg::AbstractDict) -> (SkyModel, imgdata)
+    build_sky_config(cfg::AbstractDict; beam=nothing) -> (SkyModel, imgdata)
 
 Construct the `SkyModel` and (optional) centroid-regularizer image data from a parsed
 image/sky TOML. `imgdata` is `nothing` unless `model.creg = true`.
+
+`beam` is the observation's nominal resolution in radians (`beamsize(dcoh)`); the driver
+passes it so the random-field correlation length and the mean-Gaussian width are set from the
+data rather than hand-tuned. The random-field correlation length defaults to `model.beamsize_beams`
+× `beam` (1× by default); an explicit `model.beamsize` (μas) overrides. When `beam` is `nothing`
+(building the sky standalone, without data) the legacy 20 μas / `fwhm` defaults are used.
 """
-function build_sky_config(cfg::AbstractDict)
+function build_sky_config(cfg::AbstractDict; beam = nothing)
     grid = get(cfg, "grid", Dict{String, Any}())
     model = get(cfg, "model", Dict{String, Any}())
 
@@ -137,7 +157,17 @@ function build_sky_config(cfg::AbstractDict)
     polrep = _parse_polrep(String(get(model, "polrep", "PolExp")))
     addg = Bool(get(model, "addgauss", false))
     creg = Bool(get(model, "creg", false))
-    beamsize = Float64(get(model, "beamsize", 20.0))   # μas
+
+    # Random-field correlation length: from the data beam by default (× `beamsize_beams`),
+    # `model.beamsize` (μas) overrides, 20 μas fallback only when no beam is available.
+    corr_beam = if haskey(model, "beamsize")
+        μas2rad(Float64(model["beamsize"]))
+    elseif !isnothing(beam)
+        Float64(get(model, "beamsize_beams", 1.0)) * beam
+    else
+        μas2rad(20.0)
+    end
+    isnothing(beam) || @info "Data beam = $(round(rad2μas(beam), digits = 1)) μas; random-field correlation = $(round(rad2μas(corr_beam), digits = 1)) μas"
 
     ex = imaging_executor()
     g = imagepixels(
@@ -145,7 +175,19 @@ function build_sky_config(cfg::AbstractDict)
         μas2rad(x0), μas2rad(y0), posang = deg2rad(pa), executor = ex
     )
 
-    mmodel = _build_mean_model(get(cfg, "mean", Dict{String, Any}()), g)
+    # Resolution check: how finely the grid samples the beam. Aim for ≳ 3-4 pixels/beam;
+    # fewer means the grid under-resolves the data and the reconstruction will be pixelated.
+    px = pixelsizes(g)
+    if !isnothing(beam)
+        ppbx, ppby = beam / px.X, beam / px.Y
+        msg = "Pixel size = $(round(rad2μas(px.X), digits = 2)) × $(round(rad2μas(px.Y), digits = 2)) μas " *
+            "→ $(round(ppbx, digits = 1)) × $(round(ppby, digits = 1)) pixels/beam"
+        min(ppbx, ppby) < 3 ? (@warn "$msg (under 3 px/beam — consider more pixels / smaller FOV)") : (@info msg)
+    else
+        @info "Pixel size = $(round(rad2μas(px.X), digits = 2)) × $(round(rad2μas(px.Y), digits = 2)) μas"
+    end
+
+    mmodel = _build_mean_model(get(cfg, "mean", Dict{String, Any}()), g, beam)
     ftotpr = _parse_ftot(get(get(cfg, "flux", Dict{String, Any}()), "ftot", [1.0]))
     overrides = _parse_sky_overrides(get(cfg, "overrides", Dict{String, Any}()))
 
@@ -158,7 +200,7 @@ function build_sky_config(cfg::AbstractDict)
         imgdata = (Comrade.ImgNormalData(rad2μas ∘ centroid, SVector(0.0, 0.0), 1.0),)
     end
 
-    pr = skyprior(msky; beamsize = μas2rad(beamsize), overrides = overrides)
+    pr = skyprior(msky; beamsize = corr_beam, overrides = overrides)
     skym = SkyModel(msky, pr, g; algorithm = FINUFFTAlg(; threads = Threads.nthreads()))
     return (skym, imgdata)
 end

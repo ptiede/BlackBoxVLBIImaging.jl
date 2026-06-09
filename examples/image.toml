@@ -1,4 +1,5 @@
-# Image / sky-model configuration.
+# Image / sky-model configuration — the documented template. Each key below explains how to
+# change that part of the model. (The other examples/*/image.toml are concrete configs.)
 
 [grid]
 fovx = 200.0     # field of view, μas
@@ -6,23 +7,61 @@ fovy = 200.0
 nx = 64          # pixel counts (auto-snapped to FFT-friendly sizes per random-field base)
 ny = 64
 pa = 0.0         # grid position angle, degrees
-x0 = 0.0         # phase-center offset, μas
+x0 = 0.0         # phase-center offset, μas (shifts the image center)
 y0 = 0.0
 
 [model]
-polrep = "PolExp"   # PolExp | Poincare | TotalIntensity
-order = 2           # >1 NonCenteredMRF(GMRF); 1 GMRF; <0 MarkovRF(|order|); 0 Matern
-addgauss = false    # add an over-resolved Gaussian component
-creg = false        # centroid regularization (adds ImgNormalData; fixes center off)
-beamsize = 20.0     # μas, sets the random-field correlation scale
+# --- polarization representation: what is imaged and how polarization is parameterized ---
+#   "PolExp"         – full polarization, matrix-exponential parameterization (default)
+#   "Poincare"       – full polarization, Poincaré-sphere parameterization
+#   "TotalIntensity" – Stokes I only (no polarization)
+polrep = "PolExp"
+
+# --- random-field base: the prior over the image-fluctuation raster -------------------
+#   1   – GMRF (first-order Gaussian Markov random field; the usual choice)
+#   >1  – NonCenteredMRF(GMRF) of that order (smoother)
+#   <0  – Markov RF expansion of order |order|
+#   0   – Matérn covariance
+# Note: PolExp and TotalIntensity support all of these; "Poincare" supports only order 1 or 0.
+order = 2
+
+# add an over-resolved Gaussian component (a wide Gaussian fit alongside the raster, for
+# large-scale flux outside the FOV). Enables the g*/p*g override parameters.
+addgauss = false
+
+# centroid regularization: pin the image centroid (adds an ImgNormalData constraint and turns
+# off automatic re-centering). Use when the absolute source position matters.
+creg = false
+
+# --- random-field correlation length --------------------------------------------------
+# Set from the observation beam by default (the driver passes beamsize(dcoh)):
+beamsize_beams = 1.0   # correlation length in beams (× the data beam; default 1×)
+# ...or override with an absolute value in μas (ignores the beam):
+# beamsize = 20.0      # μas
 
 [mean]
-type = "Bkgd"       # GaussBkgd | Bkgd | Gauss | Ring | TBlob | JetGauss
-fwhm = 50.0         # μas (used by Bkgd / JetGauss seed Gaussian)
+# The fixed mean image the raster fluctuates around. `type` selects the model; each uses a
+# different parameter set (most are FIT with built-in priors — only the seed sizes here are
+# specified):
+#   "Bkgd"      – fixed Gaussian blended with a disk background   (seed: fwhm / fwhm_beams)
+#   "GaussBkgd" – Gaussian + disk background, FWHM & bkgd-fraction fit   (no seed needed)
+#   "Gauss"     – a single Gaussian, FWHM fit                            (no seed needed)
+#   "Ring"      – double-power-law ring, radius & in/out slopes fit      (no seed needed)
+#   "TBlob"     – Student-t blob, FWHM & shape fit                       (no seed needed)
+#   "JetGauss"  – core image + a jet Gaussian               (seed: fwhm / fwhm_beams)
+type = "Bkgd"
+# Seed-Gaussian size for Bkgd / JetGauss — from the beam by default (× fwhm_beams), or set an
+# absolute fwhm (μas) to override:
+fwhm_beams = 1.0
+# fwhm = 50.0    # μas (overrides fwhm_beams)
 
 [flux]
-ftot = [0.1, 2.5]   # one value = fixed flux; two values = Uniform(lo, hi) prior
+# Total flux. One value = fixed; two values = a Uniform(lo, hi) prior that is fit.
+ftot = [0.1, 2.5]
 
-# Optional prior overrides keyed by sky-prior parameter name:
+# --- optional per-prior overrides ------------------------------------------------------
+# Replace individual sky-prior entries by parameter name. The available names depend on
+# polrep/order (e.g. PolExp uses the a/b/c/d rasters and σa/σb/σc/σd scales). Distributions use
+# the same closed allowlist as the instrument priors (see src/instrument/distspec.jl).
 # [overrides]
 # σa = { dist = "Exponential", args = [0.5] }

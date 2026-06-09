@@ -21,8 +21,10 @@ Load and flag the coherency data described by a parsed data TOML. Sections:
 - `[paths]` — `file`, `array`, and `path_mode` (`"toml"` resolves relative `file`/`array`
   against `base_dir` — the TOML's own directory when called via the driver — and `"cwd"`
   leaves them relative to the launch directory; absolute paths are used as-is either way).
-- `[data]` — `format` (`"auto"`/`"uvfits"`/`"dlist"`), `avg`, `ferr`, and `keep_trange`
-  (a single `[lo, hi]` UT-hour window the data is restricted to at load; `[]` = keep all).
+- `[data]` — `format` (`"auto"`/`"uvfits"`/`"dlist"`), `avg`, `ferr`, `IF` (1-based single
+  intermediate-frequency selection for a multi-IF UVFITS file; omit it for the frequency-
+  averaged band), and `keep_trange` (a single `[lo, hi]` UT-hour window the data is restricted
+  to at load; `[]` = keep all).
 - `[flags]` — the flag-table keys consumed by [`parse_flagtable`](@ref), including
   `drop_tranges` (UT-hour windows to remove). `keep_trange` selects; `drop_tranges` removes.
 """
@@ -48,11 +50,15 @@ function build_data_config(cfg::AbstractDict; base_dir::AbstractString = pwd())
     ferr = Float64(get(dat, "ferr", 0.005))
     kt = get(dat, "keep_trange", Float64[])
     keep_trange = isempty(kt) ? nothing : Tuple(Float64.(kt))
+    # `IF` (1-based, matching Julia indexing) selects a single intermediate frequency from a
+    # multi-IF UVFITS file; omit it to keep the frequency-averaged band. dlist files have no IFs.
+    IF = haskey(dat, "IF") ? Int(dat["IF"]) : nothing
 
     @info "Loading $fmt data: $file"
     if fmt == "uvfits"
-        dcoh = build_data_uvfits(file, array; avg, ferr, trange = keep_trange)
+        dcoh = build_data_uvfits(file, array; avg, ferr, trange = keep_trange, IF)
     elseif fmt == "dlist"
+        isnothing(IF) || @warn "data.IF is set but dlist files have no IFs; ignoring."
         dcoh = build_data_dlist(file, array; avg, ferr, trange = keep_trange)
     else
         error("unknown data format '$fmt'. Allowed: uvfits, dlist (or 'auto')")

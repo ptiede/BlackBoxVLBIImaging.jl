@@ -136,12 +136,15 @@ function _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart)
         init_buffer = strategy.init_buffer, term_buffer = strategy.term_buffer
     )
     smplr = HMCSampler(kernel, metric, adaptor)
+    # `nsample` is the number of POST-warmup samples (matching the Reactant path). AdvancedHMC
+    # counts adaptation in its total chain length, so draw `nadapt + nsample` and keep the tail.
+    total = strategy.nadapt + strategy.nsample
     trace = sample(
-        rng, post, smplr, strategy.nsample;
+        rng, post, smplr, total;
         saveto = DiskStore(mkpath(out), 25), n_adapts = strategy.nadapt,
         initial_params = xopt, restart = restart
     )
-    return trace, (strategy.nadapt + 1):10:strategy.nsample
+    return trace, (strategy.nadapt + 1):10:total
 end
 
 function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase)
@@ -258,7 +261,7 @@ function comrade_imager(
 
     # ---- sampling --------------------------------------------------------------------
     if strategy.use_reactant
-        trace, range = _sample_reactant(out, skym, intm, data, imgdata, xopt, strategy, restart, gimg, imgbase)
+        trace, range = _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase)
     else
         trace, range = _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart)
     end

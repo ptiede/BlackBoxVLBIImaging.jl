@@ -13,8 +13,7 @@ eta = 0.001         # learning rate for the Optimisers.jl rules (Adam/AdamW)
 noise_schedule = [0.05, 0.025, 0.0]
 
 [sampler]
-kind = "ahmc"       # "ahmc" (AdvancedHMC NUTS) | "reactant" (Reactant NUTS)
-nsample = 20000
+nsample = 10000   # post-warmup samples to keep (drawn after `nadapt` warmup)
 nadapt = 10000
 step_size = 0.01
 target_accept = 0.9

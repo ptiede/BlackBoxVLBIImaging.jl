@@ -20,8 +20,6 @@ Base.@kwdef struct FittingStrategy
     eta::Float64 = 0.001            # learning rate for the Optimisers.jl rules (Adam/AdamW)
     # tempering: fractional-noise level per optimization round (0.0 = full data)
     noise_schedule::Vector{Float64} = [0.05, 0.025, 0.0]
-    # sampler
-    sampler::String = "ahmc"            # "ahmc" | "reactant"
     nsample::Int = 10_000
     nadapt::Int = 5_000
     step_size::Float64 = 0.01
@@ -50,8 +48,8 @@ end
     build_fitting_config(cfg::AbstractDict) -> FittingStrategy
 
 Parse a fitting-strategy TOML into a [`FittingStrategy`](@ref). Sections: `[optimizer]`,
-`[tempering]`, `[sampler]`, `[run]`. Errors if `sampler.kind="reactant"` but
-`run.use_reactant` is not enabled.
+`[tempering]`, `[sampler]` (NUTS tuning), `[run]`. The sampler is always NUTS; the backend
+(AdvancedHMC NUTS vs Reactant NUTS) follows `run.use_reactant`.
 """
 function build_fitting_config(cfg::AbstractDict)
     opt = get(cfg, "optimizer", Dict{String, Any}())
@@ -59,13 +57,7 @@ function build_fitting_config(cfg::AbstractDict)
     samp = get(cfg, "sampler", Dict{String, Any}())
     run = get(cfg, "run", Dict{String, Any}())
 
-    sampler = String(get(samp, "kind", "ahmc"))
-    sampler in ("ahmc", "reactant") ||
-        error("unknown sampler.kind '$sampler'. Allowed: ahmc, reactant")
-    use_reactant = Bool(get(run, "use_reactant", sampler == "reactant"))
-    if sampler == "reactant" && !use_reactant
-        error("sampler.kind=\"reactant\" requires run.use_reactant=true")
-    end
+    use_reactant = Bool(get(run, "use_reactant", false))
 
     opt_method = String(get(opt, "method", "Adam"))
     opt_method in ("Adam", "AdamW", "LBFGS") ||
@@ -81,7 +73,6 @@ function build_fitting_config(cfg::AbstractDict)
         g_tol = Float64(get(opt, "g_tol", 0.1)),
         eta = Float64(get(opt, "eta", 0.001)),
         noise_schedule = Float64.(get(temp, "noise_schedule", [0.05, 0.025, 0.0])),
-        sampler = sampler,
         nsample = Int(get(samp, "nsample", 10_000)),
         nadapt = Int(get(samp, "nadapt", 5_000)),
         step_size = Float64(get(samp, "step_size", 0.01)),

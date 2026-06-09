@@ -114,14 +114,12 @@ function reactant_opt(
     tpost = asflat(dpost)
     tpost_cpu = asflat(post)   # CPU reference (value-only; no AD mode needed)
 
-    # Multi-start only from random prior draws; a supplied initial_params is one warm start.
-    nstarts = isnothing(initial_params) ? max(ntrials, 1) : 1
-    _start() = isnothing(initial_params) ? prior_sample(rng, dpost) : initial_params
+    multistart = isnothing(initial_params)
+    nstarts = multistart ? max(ntrials, 1) : 1
+    npass = multistart ? 2 : 1
+    passmax = max(maxiters ÷ npass, 1)
+    _start() = multistart ? prior_sample(rng, dpost) : initial_params
 
-    # Allocate the parameter buffer once and reuse it across trials. The step is compiled once
-    # and `_reactant_opt_step!` mutates `opt_state`/`xr` in place every iteration (no per-step
-    # allocation); between trials we overwrite `xr` in place (copyto!) and re-init the (small)
-    # optimizer state fresh, since Adam carries no momentum across restarts.
     xr = Reactant.to_rarray(Comrade.inverse(tpost, _start()))
     opt_state = Reactant.@jit Optimisers.setup(optimiser, xr)
     step_jit = Reactant.@compile _reactant_opt_step!(opt_state, tpost, xr)
@@ -129,44 +127,36 @@ function reactant_opt(
     best_x_flat = nothing
     best_loss = Inf
     for t in 1:nstarts
-        if t > 1
-            # Reuse the parameter buffer: overwrite xr with a fresh start in place, and start
-            # the optimizer state from scratch for this restart.
-            copyto!(xr, Comrade.inverse(tpost, _start()))
-            opt_state = Reactant.@jit Optimisers.setup(optimiser, xr)
-        end
-        loss = nothing
-        for i in 1:maxiters
-            opt_state, xr, loss, gnorm = step_jit(opt_state, tpost, xr)
-            # Log and check `g_tol` convergence at the same cadence (both read device scalars
-            # to the host, which forces a sync — so we avoid doing it every iteration).
-            if i == 1 || i % log_stride == 0 || i == maxiters
-                gn = Reactant.@allowscalar Float64(gnorm)
-                @info "reactant_opt trial $t/$nstarts iter $i: -logdensity = $(Reactant.@allowscalar Float64(loss)) |g|∞ = $gn"
-                if gn < g_tol
-                    @info "reactant_opt trial $t/$nstarts converged at iter $i (|g|∞ = $gn < g_tol = $g_tol)"
-                    break
+        t > 1 && copyto!(xr, Comrade.inverse(tpost, _start()))   # fresh restart
+        for p in 1:npass
+            opt_state = Reactant.@jit Optimisers.setup(optimiser, xr)   # fresh optimizer per pass
+            loss = nothing
+            for i in 1:passmax
+                opt_state, xr, loss, gnorm = step_jit(opt_state, tpost, xr)
+                # Log and check `g_tol` convergence at the same cadence (both read device
+                # scalars to the host, forcing a sync — so we avoid doing it every iteration).
+                if i == 1 || i % log_stride == 0 || i == passmax
+                    gn = Reactant.@allowscalar Float64(gnorm)
+                    @info "reactant_opt trial $t/$nstarts pass $p/$npass iter $i: -logdensity = $(Reactant.@allowscalar Float64(loss)) |g|∞ = $gn"
+                    if gn < g_tol
+                        @info "reactant_opt trial $t/$nstarts pass $p/$npass converged at iter $i (|g|∞ = $gn < g_tol = $g_tol)"
+                        break
+                    end
                 end
+                i % gc_stride == 0 && GC.gc()
             end
-            i % gc_stride == 0 && GC.gc()
+            l = Reactant.@allowscalar Float64(loss)
+            @info "reactant_opt trial $t/$nstarts pass $p/$npass final -logdensity = $l"
+            if l < best_loss
+                best_loss = l
+                best_x_flat = collect(Comrade.Adapt.adapt(Array, xr))
+            end
+            GC.gc()
         end
-        l = Reactant.@allowscalar Float64(loss)
-        @info "reactant_opt trial $t/$nstarts final -logdensity = $l"
-        # Keep the winner's flat host vector so the device buffer can be reused next trial.
-        if l < best_loss
-            best_loss = l
-            best_x_flat = collect(Comrade.Adapt.adapt(Array, xr))
-        end
-        GC.gc()
     end
     # Fall back to the last point if every trial returned a non-finite objective.
     isnothing(best_x_flat) && (best_x_flat = collect(Comrade.Adapt.adapt(Array, xr)))
 
-    # Optimum consistency: compare the device objective to the CPU/Enzyme log-density at the
-    # SAME flat optimum. The device can converge to a point it scores well but the CPU model
-    # scores poorly — a parameter-dependent device discrepancy a prior-draw check misses (the
-    # leakage prior is narrow, so prior draws never probe the large d-terms the device drifts
-    # to). Both are transformed-space log-densities, so directly comparable; no `inverse`.
     if verify
         # Evaluate BOTH at the same point (best_x_flat). Note `best_loss` is the step's loss,
         # which is one Adam update *behind* `best_x_flat` (the step returns the value at x but
@@ -186,9 +176,6 @@ function reactant_opt(
         end
     end
 
-    # Materialize the optimum on the HOST from the flat host vector via the CPU transform, so
-    # every field is plain Float64 — the device transform leaves scalar params as
-    # `ConcretePJRTNumber`, which break downstream CPU rendering/serialization.
     best_params = Comrade.transform(tpost_cpu, best_x_flat)
     return best_params, (; objective = best_loss)
 end
