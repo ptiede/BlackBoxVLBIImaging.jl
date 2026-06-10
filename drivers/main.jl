@@ -3,10 +3,6 @@ Pkg.activate(@__DIR__)
 
 using Comonicon
 using BlackBoxVLBIImaging
-# Loading Plots activates BlackBoxVLBIImagingPlotsExt so the run writes
-# image/residual/caltable PNGs. (Reactant is imported by the package; the fitting TOML's
-# sampler choice decides whether it is used.)
-using Plots
 
 """
 Image a VLBI observation, configured entirely from four TOML files.
