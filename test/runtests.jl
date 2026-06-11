@@ -1,7 +1,6 @@
 using BlackBoxVLBIImaging
 using Test
 using TOML
-using Distributions
 using Random
 
 const EXDIR = normpath(joinpath(@__DIR__, "..", "examples"))
@@ -10,14 +9,16 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
 @testset "BlackBoxVLBIImaging.jl" begin
 
     @testset "distribution spec parser" begin
-        # parse_dist emits the Reactant-friendly VLBI* variants (also CPU-compatible).
-        @test occursin("VLBIGaussian", string(typeof(parse_dist(Dict("dist" => "Normal", "args" => [0.0, 0.4])))))
-        @test occursin("VLBIExponential", string(typeof(parse_dist(Dict("dist" => "Exponential", "args" => [0.2])))))
+        # parse_dist emits the Reactant-friendly VLBI* variants (also CPU-compatible); the
+        # VLBI* constructors return AffineDistribution-wrapped Std* distributions.
+        @test occursin("StdNormal", string(typeof(parse_dist(Dict("dist" => "Normal", "args" => [0.0, 0.4])))))
+        @test occursin("StdExponential", string(typeof(parse_dist(Dict("dist" => "Exponential", "args" => [0.2])))))
         d = parse_dist(Dict("dist" => "Normal", "args" => [0.0, 1.0], "lower" => 0.0))
         @test occursin("VLBITruncated", string(typeof(d)))
         @test parse_dist(Dict("dist" => "DiagonalVonMises", "args" => [0.0, 3.14159])) isa DiagonalVonMises
         @test_throws ErrorException parse_dist(Dict("dist" => "Nonsense", "args" => [1.0]))
-        @test_throws ErrorException parse_dist(Dict("args" => [1.0]))   # missing 'dist'
+        @test_throws ErrorException parse_dist(Dict("args" => [1.0]))               # missing 'dist'
+        @test_throws ErrorException parse_dist(Dict("dist" => "Normal", "arg" => [1.0]))  # typo'd key
     end
 
     @testset "scheme registry" begin
@@ -42,22 +43,72 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws ErrorException assemble_instrument(cfg2)
     end
 
+    @testset "config key validation" begin
+        # the original footgun: frcal placed below a [section] header nests under it
+        cfg = exconfig("instrument_mixed.toml")
+        cfg["gain"]["frcal"] = true
+        @test_throws ErrorException assemble_instrument(cfg)
+        # unknown keys error at every level of the instrument config
+        mutations = (
+            c -> c["fcral"] = true,                                        # top level
+            c -> c["gain"]["sheme"] = "gain",                              # [gain]
+            c -> c["priors"]["lg1"]["sg"] = "integ",                       # prior entry
+            c -> c["priors"]["lg1"]["overrides"]["LM"]["phase"] = true,    # override entry
+            c -> c["priors"]["gp1"]["refant"]["value"] = 0.0,              # refant spec
+            c -> c["priors"]["lg1"]["dist"]["arg"] = [1.0],                # dist spec
+        )
+        for mutate! in mutations
+            c = exconfig("instrument_mixed.toml")
+            mutate!(c)
+            @test_throws ErrorException assemble_instrument(c)
+        end
+        # priors unused by the chosen schemes warn but still build
+        c = exconfig("instrument_mixed.toml")
+        c["priors"]["lgoops"] = Dict{String, Any}(
+            "seg" => "track", "dist" => Dict{String, Any}("dist" => "Normal", "args" => [0.0, 1.0])
+        )
+        intm = @test_logs (:warn, r"unused") match_mode = :any build_instrument_config(c)
+        @test intm isa InstrumentModel
+        # the sky, fitting, data, and flag configs reject unknown keys too
+        s = exconfig("image_smoke.toml")
+        s["grid"]["fox"] = 100.0
+        @test_throws ErrorException build_sky_config(s)
+        f = exconfig("fitting.toml")
+        f["sampler"]["nsamples"] = 100
+        @test_throws ErrorException build_fitting_config(f)
+        d = exconfig("data.toml")
+        d["path"] = Dict{String, Any}()
+        @test_throws ErrorException build_data_config(d)   # errors before touching the file
+        @test_throws ErrorException parse_flagtable(Dict{String, Any}("site" => ["AA"]))
+    end
+
     @testset "fitting config" begin
         s = build_fitting_config(exconfig("fitting.toml"))
         @test s isa FittingStrategy
         @test s.noise_schedule == [0.05, 0.025, 0.0]
-        @test s.sampler == "ahmc"
-        # reactant kind requires use_reactant = true
+        @test s.opt_method == "Adam"
+        @test s.nsample == 10_000
+        @test !s.use_reactant
+        @test isnothing(s.start)
+        # `checkpoint` is accepted as an alias for `sample_checkpoint` (which wins when both
+        # are set, so drop the explicit key first)
         cfg = exconfig("fitting.toml")
-        cfg["sampler"]["kind"] = "reactant"
-        cfg["run"]["use_reactant"] = false
-        @test_throws ErrorException build_fitting_config(cfg)
+        delete!(cfg["run"], "sample_checkpoint")
+        cfg["run"]["checkpoint"] = 7
+        @test build_fitting_config(cfg).sample_checkpoint == 7
+        # unknown optimizer must error
+        cfg2 = exconfig("fitting.toml")
+        cfg2["optimizer"]["method"] = "SGD"
+        @test_throws ErrorException build_fitting_config(cfg2)
     end
 
     @testset "sky config + grid snapping" begin
         skym, imgdata = build_sky_config(exconfig("image_smoke.toml"))
         @test skym isa SkyModel
         @test isnothing(imgdata)
+        # the documented template builds too (order 2 → NonCenteredMRF, snapped grid)
+        skym2, _ = build_sky_config(exconfig("image.toml"))
+        @test skym2 isa SkyModel
         # NonCenteredMRF (order 2) wants nx such that nx+1 is a product of small primes
         nx, ny = BlackBoxVLBIImaging.snap_grid_size(NonCenteredMRF(GMRF), 2, 64, 64)
         @test (nx == 63) && (ny == 63)

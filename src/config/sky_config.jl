@@ -138,8 +138,20 @@ data rather than hand-tuned. The random-field correlation length defaults to `mo
 (building the sky standalone, without data) the legacy 20 μas / `fwhm` defaults are used.
 """
 function build_sky_config(cfg::AbstractDict; beam = nothing)
+    check_config_keys(
+        cfg, ("grid", "model", "mean", "flux", "overrides"), "the image config (top level)"
+    )
     grid = get(cfg, "grid", Dict{String, Any}())
     model = get(cfg, "model", Dict{String, Any}())
+    check_config_keys(grid, ("fovx", "fovy", "nx", "ny", "pa", "x0", "y0"), "[grid]")
+    check_config_keys(
+        model, ("polrep", "order", "addgauss", "creg", "beamsize_beams", "beamsize"),
+        "[model]"
+    )
+    check_config_keys(
+        get(cfg, "mean", Dict{String, Any}()), ("type", "fwhm", "fwhm_beams"), "[mean]"
+    )
+    check_config_keys(get(cfg, "flux", Dict{String, Any}()), ("ftot",), "[flux]")
 
     fovx = Float64(get(grid, "fovx", 200.0))
     fovy = Float64(get(grid, "fovy", 200.0))

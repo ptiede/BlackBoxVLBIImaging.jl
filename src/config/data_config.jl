@@ -29,8 +29,10 @@ Load and flag the coherency data described by a parsed data TOML. Sections:
   `drop_tranges` (UT-hour windows to remove). `keep_trange` selects; `drop_tranges` removes.
 """
 function build_data_config(cfg::AbstractDict; base_dir::AbstractString = pwd())
+    check_config_keys(cfg, ("paths", "data", "flags"), "the data config (top level)")
     haskey(cfg, "paths") || error("data config needs a [paths] section with 'file' and 'array'")
     paths = cfg["paths"]
+    check_config_keys(paths, ("file", "array", "path_mode"), "[paths]")
     haskey(paths, "file") || error("data config [paths] needs a 'file'")
     haskey(paths, "array") || error("data config [paths] needs an 'array'")
 
@@ -44,6 +46,7 @@ function build_data_config(cfg::AbstractDict; base_dir::AbstractString = pwd())
     array = _resolve(String(paths["array"]))
 
     dat = get(cfg, "data", Dict{String, Any}())
+    check_config_keys(dat, ("format", "avg", "ferr", "IF", "keep_trange"), "[data]")
     fmt = String(get(dat, "format", "auto"))
     fmt = fmt == "auto" ? _infer_format(file) : fmt
     avg = string(get(dat, "avg", "scan"))

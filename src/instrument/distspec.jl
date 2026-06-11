@@ -32,6 +32,7 @@ Parse a TOML distribution spec into a (Reactant-friendly `VLBI*`) distribution, 
 to the closed allowlist in `_DIST_ALLOWLIST`. Throws on an unknown distribution name.
 """
 function parse_dist(spec::AbstractDict)
+    check_config_keys(spec, ("dist", "args", "lower", "upper"), "a distribution spec")
     haskey(spec, "dist") || error("distribution spec is missing the 'dist' key: $spec")
     name = String(spec["dist"])
     haskey(_DIST_ALLOWLIST, name) ||

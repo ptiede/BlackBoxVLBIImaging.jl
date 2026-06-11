@@ -52,10 +52,29 @@ Parse a fitting-strategy TOML into a [`FittingStrategy`](@ref). Sections: `[opti
 (AdvancedHMC NUTS vs Reactant NUTS) follows `run.use_reactant`.
 """
 function build_fitting_config(cfg::AbstractDict)
+    check_config_keys(
+        cfg, ("optimizer", "tempering", "sampler", "run"), "the fitting config (top level)"
+    )
     opt = get(cfg, "optimizer", Dict{String, Any}())
     temp = get(cfg, "tempering", Dict{String, Any}())
     samp = get(cfg, "sampler", Dict{String, Any}())
     run = get(cfg, "run", Dict{String, Any}())
+
+    check_config_keys(opt, ("method", "maxiters", "ntrials", "g_tol", "eta"), "[optimizer]")
+    check_config_keys(temp, ("noise_schedule",), "[tempering]")
+    check_config_keys(
+        samp,
+        (
+            "nsample", "nadapt", "step_size", "target_accept", "init_buffer",
+            "term_buffer", "max_tree_depth", "chunk_size", "base_window",
+        ),
+        "[sampler]"
+    )
+    check_config_keys(
+        run,
+        ("use_reactant", "benchmark", "verify_reactant", "start", "sample_checkpoint", "checkpoint"),
+        "[run]"
+    )
 
     use_reactant = Bool(get(run, "use_reactant", false))
 

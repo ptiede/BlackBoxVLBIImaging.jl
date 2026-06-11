@@ -34,7 +34,10 @@ function make_mean(mimg::MimgPlusBkg, grid, θ)
 end
 
 function genmeanprior(::MimgPlusBkg)
-    return Dict(:fb => VLBITruncated(VLBIExponential(0.1); upper = 1.0))
+    # `lower = 0.0` must be explicit: VLBITruncated's flat transform is built from the
+    # truncation bounds only, so a one-sided `upper` maps ℝ → (-∞, 1) and lets the
+    # optimizer/sampler walk into fb < 0 (negative background flux) where logpdf = -Inf.
+    return Dict(:fb => VLBITruncated(VLBIExponential(0.1); lower = 0.0, upper = 1.0))
 end
 
 # --- Gaussian mean ---------------------------------------------------------------------
@@ -96,7 +99,7 @@ function genmeanprior(::DblRingWBkgd)
         :r0 => VLBIUniform(μas2rad(10.0), μas2rad(25.0)),
         :ain => VLBIExponential(5.0),
         :aout => VLBIExponential(5.0),
-        :fb => VLBITruncated(Exponential(0.1); upper = 1.0)
+        :fb => VLBITruncated(VLBIExponential(0.1); lower = 0.0, upper = 1.0)
     )
 end
 
@@ -106,7 +109,7 @@ centerfix(::Type{<:TBlobMean}) = true
 
 function make_mean(::TBlobMean, grid, θ)
     (; fwhm, s) = θ
-    m = modify(TBlobNN(s), Stretch(fwhm / fwhmfac))
+    m = modify(TBlob(s), Stretch(fwhm / fwhmfac))
     mimg = intensitymap(m, grid)
     pmimg = baseimage(mimg)
     pmimg ./= sum(pmimg)
@@ -146,7 +149,7 @@ function genmeanprior(m::JetGauss)
         :ξτ => DiagonalVonMises(0.0, inv(π^2)),
         :x => VLBIUniform(-fovx / 4 - x0, fovx / 4 - x0),
         :y => VLBIUniform(-fovy / 4 - y0, fovy / 4 - y0),
-        :fj => VLBITruncated(Exponential(0.1); upper = 1.0)
+        :fj => VLBITruncated(VLBIExponential(0.1); lower = 0.0, upper = 1.0)
     )
 end
 

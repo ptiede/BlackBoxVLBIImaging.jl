@@ -5,6 +5,7 @@
 
 function _parse_refant(spec)
     isnothing(spec) && return NoReference()
+    check_config_keys(spec, ("kind", "val", "site"), "a refant spec")
     kind = String(get(spec, "kind", "None"))
     if kind == "None"
         return NoReference()
@@ -24,19 +25,27 @@ function _segmentation(name)
     return SEGMENTATIONS[name]
 end
 
-function _iid_site_prior(t::AbstractDict)
-    haskey(t, "seg") || error("prior entry is missing 'seg': $t")
-    haskey(t, "dist") || error("prior entry is missing 'dist': $t")
+function _iid_site_prior(t::AbstractDict, where_::AbstractString)
+    haskey(t, "seg") || error("$where_ is missing 'seg': $t")
+    haskey(t, "dist") || error("$where_ is missing 'dist': $t")
     return IIDSitePrior(_segmentation(String(t["seg"])), parse_dist(t["dist"]))
 end
 
-function _build_array_prior(pcfg::AbstractDict)
-    default = _iid_site_prior(pcfg)
+function _build_array_prior(pcfg::AbstractDict, name::AbstractString)
+    check_config_keys(
+        pcfg, ("seg", "dist", "phase", "refant", "overrides"), "[priors.$name]"
+    )
+    default = _iid_site_prior(pcfg, "[priors.$name]")
     phase = Bool(get(pcfg, "phase", false))
     refant = _parse_refant(get(pcfg, "refant", nothing))
 
     overrides = get(pcfg, "overrides", Dict{String, Any}())
-    ovr_pairs = [Symbol(site) => _iid_site_prior(scfg) for (site, scfg) in overrides]
+    # Site overrides replace only the IIDSitePrior, so `phase`/`refant` are not accepted
+    # here — they live on the parameter-level entry.
+    ovr_pairs = map(collect(overrides)) do (site, scfg)
+        check_config_keys(scfg, ("seg", "dist"), "[priors.$name.overrides.$site]")
+        return Symbol(site) => _iid_site_prior(scfg, "[priors.$name.overrides.$site]")
+    end
     ovr = NamedTuple(ovr_pairs)
 
     return ArrayPrior(default; refant = refant, phase = phase, ovr...)
@@ -51,7 +60,21 @@ Build a Comrade `InstrumentModel` from a parsed instrument TOML. `cfg` must cont
 chosen gain (and leakage) scheme. Throws if any required prior is missing.
 """
 function assemble_instrument(cfg::AbstractDict)
+    check_config_keys(
+        cfg, ("gain", "leakage", "frcal", "priors"), "the instrument config (top level)"
+    )
+
     haskey(cfg, "gain") || error("instrument config needs a [gain] section")
+    # frcal is top-level; a `frcal` line placed below a [gain]/[leakage] header parses as a
+    # nested key and would otherwise be silently ignored.
+    for sec in ("gain", "leakage")
+        haskey(cfg, sec) && haskey(cfg[sec], "frcal") && error(
+            "'frcal' was found inside [$sec] — it is a top-level key, so move it above the " *
+                "first [section] header in the instrument TOML."
+        )
+        haskey(cfg, sec) && check_config_keys(cfg[sec], ("scheme",), "[$sec]")
+    end
+
     gname = String(get(cfg["gain"], "scheme", ""))
     haskey(GAIN_SCHEMES, gname) ||
         error("unknown gain scheme '$gname'. Allowed: $(sort(collect(keys(GAIN_SCHEMES))))")
@@ -70,7 +93,13 @@ function assemble_instrument(cfg::AbstractDict)
     isempty(missing_params) ||
         error("instrument config is missing priors for: $(missing_params)")
 
-    intprior = NamedTuple([p => _build_array_prior(priors[String(p)]) for p in required])
+    # Priors for parameters the chosen schemes never read are legal (e.g. kept around while
+    # switching schemes) but inert, so say so rather than silently skipping them.
+    unused = sort!([k for k in keys(priors) if Symbol(k) ∉ required])
+    isempty(unused) ||
+        @warn "instrument [priors] entries unused by gain=$gname/leakage=$lname (ignored): $(unused)"
+
+    intprior = NamedTuple([p => _build_array_prior(priors[String(p)], String(p)) for p in required])
 
     G = gsch.kind === :single ? SingleStokesGain(gsch.parameterization) : JonesG(gsch.parameterization)
 

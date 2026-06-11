@@ -19,6 +19,10 @@ Parse and validate flag-table keys out of a TOML dict (`cfg`). Shared by
 and flag the data.
 """
 function parse_flagtable(cfg::AbstractDict)
+    check_config_keys(
+        cfg, ("corr_polbasis", "sites", "baselines", "drop_tranges", "uvranges"),
+        "the [flags] table"
+    )
     sites_corr = Symbol.(get(cfg, "corr_polbasis", String[]))
     sites = Symbol.(get(cfg, "sites", String[]))
     baselines = [Set(Symbol.(bl)) for bl in get(cfg, "baselines", Vector{String}[])]
