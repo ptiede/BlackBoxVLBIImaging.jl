@@ -73,7 +73,7 @@ function genmeanprior(::DblRingMean)
     return Dict(
         :r0 => VLBIUniform(μas2rad(0.1), μas2rad(25.0)),
         :ain => VLBIUniform(0.0, 10.0),
-        :aout => VLBIUniform(0.0, 10.0)
+        :aout => VLBIUniform(1.0, 10.0)
     )
 end
 
@@ -94,8 +94,8 @@ end
 function genmeanprior(::DblRingWBkgd)
     return Dict(
         :r0 => VLBIUniform(μas2rad(10.0), μas2rad(25.0)),
-        :ain => VLBIExponential(3.0),
-        :aout => VLBIExponential(3.0),
+        :ain => VLBIExponential(5.0),
+        :aout => VLBIExponential(5.0),
         :fb => VLBITruncated(Exponential(0.1); upper = 1.0)
     )
 end
