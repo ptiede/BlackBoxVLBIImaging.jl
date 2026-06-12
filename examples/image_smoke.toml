@@ -1,0 +1,19 @@
+# Tiny image config for smoke tests: small grid, GMRF order 1, fixed flux.
+
+[grid]
+fovx = 160.0
+fovy = 160.0
+nx = 24
+ny = 24
+
+[model]
+polrep = "PolExp"
+order = 1
+beamsize = 20.0
+
+[mean]
+type = "Gauss"
+fwhm = 40.0
+
+[flux]
+ftot = [0.6]

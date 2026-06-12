@@ -52,11 +52,11 @@ function snap_grid_size(base, order::Int, nx::Int, ny::Int)
     return nx, ny
 end
 
+# Names are bound at the definition sites: POLREPS in sky/polreps.jl, MEAN_MODELS in
+# sky/meanmodels.jl.
 function _parse_polrep(s::AbstractString)
-    s == "PolExp" && return PolExp()
-    s == "Poincare" && return Poincare()
-    s == "TotalIntensity" && return TotalIntensity()
-    error("unknown polrep '$s'. Allowed: PolExp, Poincare, TotalIntensity")
+    haskey(POLREPS, s) || error("unknown polrep '$s'. Allowed: $(_allowed(POLREPS))")
+    return POLREPS[s]
 end
 
 function _parse_ftot(ftot)
@@ -74,47 +74,11 @@ function _parse_ftot(ftot)
     end
 end
 
-# Mean Gaussian FWHM in radians. Data-driven by default: `fwhm_beams` × the observation beam
-# (default 1× beam, matching MixedPolPaper's `Stretch(beamsize(dcoh)/fwhmfac)`). An explicit
-# `fwhm` (μas) overrides. `default_μas` is only used when the sky is built without a beam
-# (standalone/no data).
-function _mean_fwhm_rad(meancfg::AbstractDict, beam, default_μas)
-    if haskey(meancfg, "fwhm")
-        return μas2rad(Float64(meancfg["fwhm"]))
-    elseif !isnothing(beam)
-        return Float64(get(meancfg, "fwhm_beams", 1.0)) * beam
-    else
-        return μas2rad(default_μas)
-    end
-end
-
 function _build_mean_model(meancfg::AbstractDict, g, beam)
     mtype = String(get(meancfg, "type", "Bkgd"))
-    if mtype == "GaussBkgd"
-        @info "Using a Gaussian background mean for the sky model"
-        return GaussBkgdMean(g)
-    elseif mtype == "Bkgd"
-        fwhm = _mean_fwhm_rad(meancfg, beam, 50.0)
-        @info "Using a background mean for the sky model (Gaussian FWHM = $(round(rad2μas(fwhm), digits = 1)) μas)"
-        mimg = intensitymap(modify(Gaussian(), Stretch(fwhm / fwhmfac)), g)
-        return MimgPlusBkg(mimg ./ sum(mimg))
-    elseif mtype == "Gauss"
-        @info "Using a Gaussian mean for the sky model"
-        return GaussMean()
-    elseif mtype == "Ring"
-        @info "Using a ring mean for the sky model"
-        return DblRingMean()
-    elseif mtype == "TBlob"
-        @info "Using a Student-t blob mean for the sky model"
-        return TBlobMean()
-    elseif mtype == "JetGauss"
-        fwhm = _mean_fwhm_rad(meancfg, beam, 30.0)
-        @info "Using a jet+Gaussian mean for the sky model (Gaussian FWHM = $(round(rad2μas(fwhm), digits = 1)) μas)"
-        mimg = intensitymap(modify(Gaussian(), Stretch(fwhm / fwhmfac)), g)
-        return JetGauss(mimg ./ sum(mimg))
-    else
-        error("unknown mean type '$mtype'. Allowed: GaussBkgd, Bkgd, Gauss, Ring, TBlob, JetGauss")
-    end
+    haskey(MEAN_MODELS, mtype) ||
+        error("unknown mean type '$mtype'. Allowed: $(_allowed(MEAN_MODELS))")
+    return MEAN_MODELS[mtype](meancfg, g, beam)
 end
 
 function _parse_sky_overrides(ocfg::AbstractDict)

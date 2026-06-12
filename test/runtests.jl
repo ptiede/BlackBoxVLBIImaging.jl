@@ -28,6 +28,17 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         end
         @test BlackBoxVLBIImaging.LEAKAGE_SCHEMES["none"].params == ()
         @test !isempty(BlackBoxVLBIImaging.LEAKAGE_SCHEMES["leakage_simple"].params)
+        # names registered at the definition sites resolve in both directions
+        @test BlackBoxVLBIImaging.toml_name(BlackBoxVLBIImaging.gain) == "gain"
+        @test BlackBoxVLBIImaging.toml_name(PolExp()) == "PolExp"
+        @test BlackBoxVLBIImaging.POLREPS["TotalIntensity"] isa TotalIntensity
+        @test haskey(BlackBoxVLBIImaging.MEAN_MODELS, "Bkgd")
+        # re-registering an existing TOML name must error, never silently overwrite
+        @test_throws ErrorException BlackBoxVLBIImaging.register_polrep!("PolExp", PolExp())
+        @test_throws ErrorException BlackBoxVLBIImaging.register_gain_scheme!(
+            "gain", identity; kind = :jones, params = (:lg,)
+        )
+        @test_throws ErrorException BlackBoxVLBIImaging.toml_name(identity)
     end
 
     @testset "instrument assembler" begin
@@ -114,6 +125,26 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test (nx == 63) && (ny == 63)
         # GMRF order 1 snaps to a product of small primes
         @test BlackBoxVLBIImaging.snap_grid_size(GMRF, 1, 23, 23) == (24, 24)
+        # every registered mean model and polrep builds through the registry lookup
+        for mtype in keys(BlackBoxVLBIImaging.MEAN_MODELS)
+            c = exconfig("image_smoke.toml")
+            c["mean"]["type"] = mtype
+            skm, _ = build_sky_config(c)
+            @test skm isa SkyModel
+        end
+        for prep in keys(BlackBoxVLBIImaging.POLREPS)
+            c = exconfig("image_smoke.toml")
+            c["model"]["polrep"] = prep
+            skm, _ = build_sky_config(c)
+            @test skm isa SkyModel
+        end
+        # unknown names error with the registered alternatives listed
+        c = exconfig("image_smoke.toml")
+        c["mean"]["type"] = "Nope"
+        @test_throws ErrorException build_sky_config(c)
+        c = exconfig("image_smoke.toml")
+        c["model"]["polrep"] = "Nope"
+        @test_throws ErrorException build_sky_config(c)
     end
 
     # Integration smoke test — runs only if the workshop test data is present.

@@ -1,5 +1,6 @@
 # The generic instrument-model assembler. Turns a parsed instrument TOML into a Comrade
-# `InstrumentModel` by selecting a gain/leakage scheme (schemes.jl), building one
+# `InstrumentModel` by looking the gain/leakage scheme names up in GAIN_SCHEMES /
+# LEAKAGE_SCHEMES (populated at the definition sites in parameterizations.jl), building one
 # `ArrayPrior` per required parameter from its prior table, and composing the Jones
 # matrices. This replaces the ~20 hand-written builders with a single declarative path.
 
@@ -21,7 +22,7 @@ end
 
 function _segmentation(name)
     haskey(SEGMENTATIONS, name) ||
-        error("unknown segmentation '$name'. Allowed: $(sort(collect(keys(SEGMENTATIONS))))")
+        error("unknown segmentation '$name'. Allowed: $(_allowed(SEGMENTATIONS))")
     return SEGMENTATIONS[name]
 end
 
@@ -77,12 +78,12 @@ function assemble_instrument(cfg::AbstractDict)
 
     gname = String(get(cfg["gain"], "scheme", ""))
     haskey(GAIN_SCHEMES, gname) ||
-        error("unknown gain scheme '$gname'. Allowed: $(sort(collect(keys(GAIN_SCHEMES))))")
+        error("unknown gain scheme '$gname'. Allowed: $(_allowed(GAIN_SCHEMES))")
     gsch = GAIN_SCHEMES[gname]
 
     lname = haskey(cfg, "leakage") ? String(get(cfg["leakage"], "scheme", "none")) : "none"
     haskey(LEAKAGE_SCHEMES, lname) ||
-        error("unknown leakage scheme '$lname'. Allowed: $(sort(collect(keys(LEAKAGE_SCHEMES))))")
+        error("unknown leakage scheme '$lname'. Allowed: $(_allowed(LEAKAGE_SCHEMES))")
     lsch = LEAKAGE_SCHEMES[lname]
 
     frcal = Bool(get(cfg, "frcal", false))
