@@ -209,7 +209,7 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     else
         @info "Using a centroid regularization"
         msky = ImagingModel(polrep, mmodel, g, ftotpr; addgauss = addg, base = base, order = order, center = false)
-        imgdata = (Comrade.ImgNormalData(rad2μas ∘ centroid, SVector(0.0, 0.0), 1.0),)
+        imgdata = (Comrade.ImgNormalData(rad2μas ∘ SVector ∘ centroid, SVector(0.0, 0.0), 1.0),)
     end
 
     pr = skyprior(msky; beamsize = corr_beam, overrides = overrides)
