@@ -27,8 +27,12 @@ function image_from_toml(
     strategy = build_fitting_config(fitcfg)
     intm = build_instrument_config(intcfg)
     # `base_dir` lets `[paths] path_mode = "toml"` resolve relative file/array paths against
-    # the data TOML's own directory (so a config dir is portable).
-    dcoh = build_data_config(datacfg; base_dir = dirname(abspath(data)))
+    # the data TOML's own directory (so a config dir is portable). `polrep` (from the image
+    # config) selects the data product: TotalIntensity fits complex visibilities, polarized
+    # models fit coherencies.
+    dcoh = build_data_config(
+        datacfg; base_dir = dirname(abspath(data)), polrep = sky_polrep(skycfg)
+    )
     # Build the sky AFTER the data so the random-field correlation length and the mean-Gaussian
     # width are set from the observation beam (`beamsize(dcoh)`) rather than hand-tuned.
     (skym, imgdata) = build_sky_config(skycfg; beam = Comrade.beamsize(dcoh))

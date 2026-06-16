@@ -1,7 +1,7 @@
-# Parse the data TOML: load coherencies (uvfits or dlist) and apply the flag table. The TOML
-# is organized into three sections — `[paths]` (file/array + path resolution), `[data]`
-# (format/averaging/noise + a load-time keep window), and `[flags]` (post-load flagging; see
-# flagtable.jl for the schema).
+# Parse the data TOML: load the data (uvfits or dlist) and apply the flag table. The TOML
+# is organized into three sections — `[paths]` (file + optional array + path resolution),
+# `[data]` (format/averaging/noise + a load-time keep window), and `[flags]` (post-load
+# flagging; see flagtable.jl for the schema).
 
 function _infer_format(file::AbstractString)
     if endswith(file, ".uvfits") || endswith(file, ".uvf")
@@ -14,13 +14,18 @@ function _infer_format(file::AbstractString)
 end
 
 """
-    build_data_config(cfg::AbstractDict; base_dir=pwd()) -> EHTObservationTable
+    build_data_config(cfg::AbstractDict; base_dir=pwd(), polrep=PolExp()) -> EHTObservationTable
 
-Load and flag the coherency data described by a parsed data TOML. Sections:
+Load and flag the data described by a parsed data TOML. `polrep` (the sky model's
+polarization representation) selects the Comrade data product: `TotalIntensity` extracts
+complex visibilities, any polarized representation extracts coherency matrices (the
+default). Sections:
 
-- `[paths]` — `file`, `array`, and `path_mode` (`"toml"` resolves relative `file`/`array`
-  against `base_dir` — the TOML's own directory when called via the driver — and `"cwd"`
-  leaves them relative to the launch directory; absolute paths are used as-is either way).
+- `[paths]` — `file`, optional `array`, and `path_mode` (`"toml"` resolves relative
+  `file`/`array` against `base_dir` — the TOML's own directory when called via the driver —
+  and `"cwd"` leaves them relative to the launch directory; absolute paths are used as-is
+  either way). `array` supplies feed-rotation/mount overrides; omit it for uvfits to keep the
+  data file's own mount metadata. dlist requires it (it builds the antenna table from it).
 - `[data]` — `format` (`"auto"`/`"uvfits"`/`"dlist"`), `avg`, `ferr`, `IF` (1-based single
   intermediate-frequency selection for a multi-IF UVFITS file; omit it for the frequency-
   averaged band), and `keep_trange` (a single `[lo, hi]` UT-hour window the data is restricted
@@ -28,13 +33,14 @@ Load and flag the coherency data described by a parsed data TOML. Sections:
 - `[flags]` — the flag-table keys consumed by [`parse_flagtable`](@ref), including
   `drop_tranges` (UT-hour windows to remove). `keep_trange` selects; `drop_tranges` removes.
 """
-function build_data_config(cfg::AbstractDict; base_dir::AbstractString = pwd())
+function build_data_config(
+        cfg::AbstractDict; base_dir::AbstractString = pwd(), polrep::PolRep = PolExp()
+    )
     check_config_keys(cfg, ("paths", "data", "flags"), "the data config (top level)")
-    haskey(cfg, "paths") || error("data config needs a [paths] section with 'file' and 'array'")
+    haskey(cfg, "paths") || error("data config needs a [paths] section with a 'file'")
     paths = cfg["paths"]
     check_config_keys(paths, ("file", "array", "path_mode"), "[paths]")
     haskey(paths, "file") || error("data config [paths] needs a 'file'")
-    haskey(paths, "array") || error("data config [paths] needs an 'array'")
 
     path_mode = String(get(paths, "path_mode", "toml"))
     path_mode in ("toml", "cwd") || error(
@@ -43,7 +49,9 @@ function build_data_config(cfg::AbstractDict; base_dir::AbstractString = pwd())
     )
     _resolve(p) = (path_mode == "toml" && !isabspath(p)) ? abspath(joinpath(base_dir, p)) : p
     file = _resolve(String(paths["file"]))
-    array = _resolve(String(paths["array"]))
+    # `array` is optional (feed-rotation/mount overrides): omit it for uvfits to keep the
+    # data file's own mount metadata. dlist still requires it (build_data_dlist enforces this).
+    array = haskey(paths, "array") ? _resolve(String(paths["array"])) : nothing
 
     dat = get(cfg, "data", Dict{String, Any}())
     check_config_keys(dat, ("format", "avg", "ferr", "IF", "keep_trange"), "[data]")
@@ -59,10 +67,10 @@ function build_data_config(cfg::AbstractDict; base_dir::AbstractString = pwd())
 
     @info "Loading $fmt data: $file"
     if fmt == "uvfits"
-        dcoh = build_data_uvfits(file, array; avg, ferr, trange = keep_trange, IF)
+        dcoh = build_data_uvfits(file, array; avg, ferr, trange = keep_trange, IF, polrep)
     elseif fmt == "dlist"
         isnothing(IF) || @warn "data.IF is set but dlist files have no IFs; ignoring."
-        dcoh = build_data_dlist(file, array; avg, ferr, trange = keep_trange)
+        dcoh = build_data_dlist(file, array; avg, ferr, trange = keep_trange, polrep)
     else
         error("unknown data format '$fmt'. Allowed: uvfits, dlist (or 'auto')")
     end

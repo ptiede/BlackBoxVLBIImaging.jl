@@ -59,6 +59,16 @@ function _parse_polrep(s::AbstractString)
     error("unknown polrep '$s'. Allowed: PolExp, Poincare, TotalIntensity")
 end
 
+"""
+    sky_polrep(cfg::AbstractDict) -> PolRep
+
+Parse the polarization representation from a parsed image/sky TOML (`[model] polrep`,
+default `PolExp`). This is the single parse point shared by `build_sky_config` and the data
+loader (which derives its data product — coherencies vs complex visibilities — from it).
+"""
+sky_polrep(cfg::AbstractDict) =
+    _parse_polrep(String(get(get(cfg, "model", Dict{String, Any}()), "polrep", "PolExp")))
+
 function _parse_ftot(ftot)
     fs = Float64.(ftot)
     if length(fs) == 1
@@ -166,7 +176,7 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     nx, ny = snap_grid_size(base, order, nx, ny)
     @info "Number of pixels: ($nx, $ny)"
 
-    polrep = _parse_polrep(String(get(model, "polrep", "PolExp")))
+    polrep = sky_polrep(cfg)
     addg = Bool(get(model, "addgauss", false))
     creg = Bool(get(model, "creg", false))
 

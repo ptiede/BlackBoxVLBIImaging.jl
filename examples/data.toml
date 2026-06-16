@@ -2,6 +2,8 @@
 
 [paths]
 file = "/home/ptiede/Harvard University Dropbox/Paul Tiede/CHWorkshop/data/3809/hops_3809_M87.apriori.uvfits"
+# `array` is optional for uvfits — it only supplies feed-rotation/mount overrides. Omit it to
+# keep the data file's own mount metadata (fine for Stokes I). dlist files require it.
 array = "/home/ptiede/Harvard University Dropbox/Paul Tiede/CHWorkshop/data/array.txt"
 # Resolve relative file/array paths against "toml" (this file's dir) or "cwd" (launch dir).
 # Absolute paths (as above) are used as-is either way.

@@ -1,12 +1,19 @@
-# Coherency-data loaders for the two supported file formats. Both apply scan/fixed-interval
-# averaging, optional time-range selection, and fractional-noise inflation.
+# Data loaders for the two supported file formats. Both apply scan/fixed-interval averaging,
+# optional time-range selection, and fractional-noise inflation. The Comrade data product is
+# chosen from the sky model's polarization representation (`polrep`): a Stokes-I-only sky
+# (`TotalIntensity`) fits complex visibilities, while a polarized sky fits coherency matrices.
+
+# Map a polarization representation to the Comrade data-product type to extract.
+data_product(::TotalIntensity) = Visibilities
+data_product(::PolRep) = Coherencies
 
 function build_data_uvfits(
-        file::String, array::String;
+        file::String, array::Union{String, Nothing} = nothing;
         avg = "scan",
         ferr::Float64 = 0.005,
         trange = nothing,
         IF = nothing,
+        polrep::PolRep = PolExp(),
     )
 
     uvd = VLBIFiles.load(VLBIFiles.UVData, file)
@@ -17,39 +24,62 @@ function build_data_uvfits(
         tavg = VLBI.FixedTimeIntervals(parse(Float64, avg) * VLBIFiles.Unitful.u"s")
     end
 
-    # The array file describes the antenna feed-rotation parameters; we apply it via
-    # `reset_mounts!` after extracting the coherency table.
+    # The array file describes the antenna feed-rotation parameters; when given we apply it
+    # via `reset_mounts!` after extracting the data table. It is optional: without it the
+    # feed-rotation/mount metadata already in the data file is kept (fine for Stokes I; for
+    # polarized fits supply an array file if the data-file mounts are wrong).
     #
     # `IF` selects a single intermediate frequency (1-based index into the sorted unique
     # frequencies). When set we keep the IFs separate (`frequency_average = false`) and filter
     # to the requested one; otherwise the default frequency-averaged band is extracted.
-    dcoh = extract_table(
-        uvd, Coherencies(;
+    product = data_product(polrep)
+    dvis = extract_table(
+        uvd, product(;
             time_average = tavg,
             frequency_average = isnothing(IF),
         )
     )
     if !isnothing(IF)
-        ifs = sort(unique(dcoh.config.datatable.Fr))
+        ifs = sort(unique(dvis.config.datatable.Fr))
         (IF isa Integer && 1 <= IF <= length(ifs)) ||
             error("IF=$IF is invalid; IF is 1-based and the data has $(length(ifs)) IF(s) (use 1..$(length(ifs))).")
-        dcoh = filter(d -> d.baseline.Fr == ifs[IF], dcoh)
+        dvis = filter(d -> d.baseline.Fr == ifs[IF], dvis)
         @info "Selected IF $IF/$(length(ifs)) (frequency = $(ifs[IF] / 1.0e9) GHz)"
     end
     if !isnothing(trange)
-        dcoh = filter(d -> d.baseline.Ti ∈ trange, dcoh)
+        dvis = filter(d -> d.baseline.Ti ∈ trange, dvis)
     end
-    reset_mounts!(dcoh, array)
+    if isnothing(array)
+        @info "No array file specified; keeping the feed-rotation/mount metadata from the data file as-is."
+    else
+        reset_mounts!(dvis, array)
+    end
 
-    dcoh = add_fractional_noise(dcoh, ferr)
-    return dcoh
+    dvis = add_fractional_noise(dvis, ferr)
+    return dvis
 end
 
 function build_data_dlist(
-        file::String, array::String;
+        file::String, array::Union{String, Nothing} = nothing;
         avg = "scan",
         ferr::Float64 = 0.005,
         trange = nothing,
+        polrep::PolRep = PolExp(),
+    )
+
+    # Unlike uvfits, the array file is required for dlist: it provides the antenna table used
+    # to construct the array configuration (the dlist itself carries no array metadata).
+    isnothing(array) && error(
+        "dlist files require an 'array' file (it provides the antenna table used to build " *
+            "the array configuration)."
+    )
+
+    # dlist files are mixed-polarization coherency matrices by construction; there is no
+    # Stokes-I-visibility extraction path for them.
+    polrep isa TotalIntensity && error(
+        "dlist files are polarized coherencies; TotalIntensity (complex-visibility) fitting " *
+            "is not supported for dlist. Use a polarized polrep (PolExp/Poincare) or convert " *
+            "the data to uvfits."
     )
 
     avg != "scan" && @warn "Only 'scan' averaging is supported for dlist files. Ignoring the --avg flag."

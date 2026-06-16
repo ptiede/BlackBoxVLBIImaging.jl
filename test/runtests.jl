@@ -116,6 +116,49 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test BlackBoxVLBIImaging.snap_grid_size(GMRF, 1, 23, 23) == (24, 24)
     end
 
+    @testset "data product from polrep" begin
+        # Stokes-I sky models fit complex visibilities; polarized models fit coherencies.
+        @test BlackBoxVLBIImaging.data_product(TotalIntensity()) === Visibilities
+        @test BlackBoxVLBIImaging.data_product(PolExp()) === Coherencies
+        @test BlackBoxVLBIImaging.data_product(Poincare()) === Coherencies
+        # sky_polrep is the single parse point shared by the sky and data paths.
+        @test BlackBoxVLBIImaging.sky_polrep(
+            Dict("model" => Dict("polrep" => "TotalIntensity"))
+        ) isa TotalIntensity
+        @test BlackBoxVLBIImaging.sky_polrep(Dict{String, Any}()) isa PolExp  # default
+        # dlist is polarized coherencies by construction; TotalIntensity is unsupported and
+        # must error (before/independent of touching a real file).
+        @test_throws ErrorException build_data_dlist(
+            "nope.dlist", "nope.array"; polrep = TotalIntensity()
+        )
+    end
+
+    @testset "optional array file" begin
+        # dlist builds its antenna table from the array file, so it is required: omitting it
+        # (array = nothing) errors.
+        @test_throws ErrorException build_data_dlist("nope.dlist", nothing)
+        dcfg_dl = Dict{String, Any}(
+            "paths" => Dict{String, Any}("file" => "nope.dlist", "path_mode" => "cwd"),
+            "data" => Dict{String, Any}("format" => "dlist"),
+        )
+        @test_throws ErrorException build_data_config(dcfg_dl)
+        # uvfits does not need an array (it is only used for feed-rotation overrides). A config
+        # with no array must get PAST path validation and fail only when the data file is
+        # loaded — proving 'array' is optional rather than required up front.
+        dcfg_uv = Dict{String, Any}(
+            "paths" => Dict{String, Any}("file" => "definitely_missing.uvfits", "path_mode" => "cwd"),
+            "data" => Dict{String, Any}("format" => "uvfits"),
+        )
+        err = try
+            build_data_config(dcfg_uv)
+            nothing
+        catch e
+            e
+        end
+        @test err !== nothing
+        @test !occursin("array", sprint(showerror, err))
+    end
+
     # Integration smoke test — runs only if the workshop test data is present.
     datafile = "/home/ptiede/Harvard University Dropbox/Paul Tiede/CHWorkshop/data/3809/hops_3809_M87.apriori.uvfits"
     arrayfile = "/home/ptiede/Harvard University Dropbox/Paul Tiede/CHWorkshop/data/array.txt"
