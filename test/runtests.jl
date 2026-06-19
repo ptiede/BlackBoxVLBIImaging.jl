@@ -70,7 +70,7 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         intm = @test_logs (:warn, r"unused") match_mode = :any build_instrument_config(c)
         @test intm isa InstrumentModel
         # the sky, fitting, data, and flag configs reject unknown keys too
-        s = exconfig("image_smoke.toml")
+        s = exconfig("image.toml")
         s["grid"]["fox"] = 100.0
         @test_throws ErrorException build_sky_config(s)
         f = exconfig("fitting.toml")
@@ -103,7 +103,7 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
     end
 
     @testset "sky config + grid snapping" begin
-        skym, imgdata = build_sky_config(exconfig("image_smoke.toml"))
+        skym, imgdata = build_sky_config(exconfig("image.toml"))
         @test skym isa SkyModel
         @test isnothing(imgdata)
         # the documented template builds too (order 2 → NonCenteredMRF, snapped grid)
@@ -169,7 +169,7 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                 "data" => Dict{String, Any}("format" => "uvfits", "ferr" => 0.01),
             )
             dcoh = build_data_config(dcfg)
-            skym, imgdata = build_sky_config(exconfig("image_smoke.toml"))
+            skym, imgdata = build_sky_config(exconfig("image.toml"))
             intm = build_instrument_config(exconfig("instrument_mixed.toml"))
             post = VLBIPosterior(skym, intm, dcoh; imgdata)
             x0 = prior_sample(Random.default_rng(), post)
