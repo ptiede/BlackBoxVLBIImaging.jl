@@ -171,14 +171,17 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase)
             @info "sampling batch $(info.round)/$(info.nrounds): n_divergences=$ndiv (checkpoint saved)"
             return (; info.round, n_divergences = ndiv)
         end
-        # Warmup is a single fused call that bypasses the DiskStore, so its callback fires
-        # once after warmup completes. The fused-warmup `info` carries `num_warmup`/`step_size`/
-        # `params` (host-side) — NOT the old per-round `phase`/`round`/`nrounds` fields.
+        # Warmup now runs in chunks of the same `stride`, and its callback fires after EVERY
+        # chunk (not once, as with the old fused warmup): render the current draw so warmup
+        # progress is watchable, while Comrade checkpoints the adaptation state to disk each
+        # chunk (making warmup itself resumable via `restart`). The warmup `info` carries
+        # `step`/`total` (steps done / n_adapts) plus host-side `step_size`/`params` — NOT the
+        # sampling `round`/`nrounds` fields.
         wcb = function (info)
             params = Comrade.Adapt.adapt(Array, info.params)
-            save_checkpoint(post_cpu, params, gimg, imgbase, "warmup_final")
-            @info "warmup complete: num_warmup=$(info.num_warmup) step_size=$(info.step_size) (checkpoint saved)"
-            return (; info.num_warmup, info.step_size)
+            save_checkpoint(post_cpu, params, gimg, imgbase, "warmup_step$(info.step)")
+            @info "warmup $(info.step)/$(info.total): step_size=$(info.step_size) (checkpoint saved)"
+            return (; info.step, info.total, info.step_size)
         end
         disk = DiskStore(; name = mkpath(out), stride = stride, callback = cb)
         trace = sample(

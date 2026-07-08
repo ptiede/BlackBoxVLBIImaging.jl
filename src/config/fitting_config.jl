@@ -37,8 +37,10 @@ Base.@kwdef struct FittingStrategy
     # device models that silently produce garbage fits).
     verify_reactant::Bool = false
     start::Union{Nothing, String} = nothing
-    # Reactant sampling checkpointing (FITS + PNG + residuals): render every
-    # `sample_checkpoint` samples (this is also the sampling DiskStore stride). 0 disables it.
+    # Reactant checkpointing (FITS + PNG + residuals): render every `sample_checkpoint`
+    # samples (this is also the sampling DiskStore stride). Warmup runs in chunks of the same
+    # stride and is checkpointed too — the adaptation state is saved every chunk (so warmup is
+    # resumable via `restart`) and the current draw is rendered. 0 disables it.
     # Optimization is deliberately NOT checkpointed — rendering on the host each step is far
     # slower than the device step.
     sample_checkpoint::Int = 0
