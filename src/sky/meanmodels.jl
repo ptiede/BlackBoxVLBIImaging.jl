@@ -2,8 +2,26 @@
 # mean image given hyperparameters θ) and `genmeanprior(model)` (the priors over those
 # hyperparameters). `centerfix(::Type)` declares whether an `ImagingModel` using this
 # mean should re-center the image by default.
+#
+# Each `register_mean_model!` call below binds the TOML name (`mean.type` in the image
+# TOML) to a builder `(meancfg, grid, beam) -> model` that constructs the mean from the
+# parsed `[mean]` table, the image grid, and the observation beam.
 
 const fwhmfac = 2 * sqrt(2 * log(2))
+
+# Mean Gaussian FWHM in radians. Data-driven by default: `fwhm_beams` × the observation beam
+# (default 1× beam, matching MixedPolPaper's `Stretch(beamsize(dcoh)/fwhmfac)`). An explicit
+# `fwhm` (μas) overrides. `default_μas` is only used when the sky is built without a beam
+# (standalone/no data).
+function _mean_fwhm_rad(meancfg::AbstractDict, beam, default_μas)
+    if haskey(meancfg, "fwhm")
+        return μas2rad(Float64(meancfg["fwhm"]))
+    elseif !isnothing(beam)
+        return Float64(get(meancfg, "fwhm_beams", 1.0)) * beam
+    else
+        return μas2rad(default_μas)
+    end
+end
 
 # --- Fixed mean image ------------------------------------------------------------------
 function make_mean(mimg::IntensityMap, grid, θ)
@@ -40,6 +58,13 @@ function genmeanprior(::MimgPlusBkg)
     return Dict(:fb => VLBITruncated(VLBIExponential(0.1); lower = 0.0, upper = 1.0))
 end
 
+register_mean_model!("Bkgd") do meancfg, g, beam
+    fwhm = _mean_fwhm_rad(meancfg, beam, 50.0)
+    @info "Using a background mean for the sky model (Gaussian FWHM = $(round(rad2μas(fwhm), digits = 1)) μas)"
+    mimg = intensitymap(modify(Gaussian(), Stretch(fwhm / fwhmfac)), g)
+    return MimgPlusBkg(mimg ./ sum(mimg))
+end
+
 # --- Gaussian mean ---------------------------------------------------------------------
 struct GaussMean end
 centerfix(::Type{<:GaussMean}) = true
@@ -57,6 +82,11 @@ function genmeanprior(::GaussMean)
     return Dict(
         :fwhm => VLBITruncated(VLBIGaussian(μas2rad(50.0), μas2rad(20.0)); lower = μas2rad(2.0), upper = μas2rad(100.0)),
     )
+end
+
+register_mean_model!("Gauss") do meancfg, g, beam
+    @info "Using a Gaussian mean for the sky model"
+    return GaussMean()
 end
 
 # --- Double power-law ring mean --------------------------------------------------------
@@ -78,6 +108,11 @@ function genmeanprior(::DblRingMean)
         :ain => VLBIUniform(0.0, 10.0),
         :aout => VLBIUniform(1.0, 10.0)
     )
+end
+
+register_mean_model!("Ring") do meancfg, g, beam
+    @info "Using a ring mean for the sky model"
+    return DblRingMean()
 end
 
 # --- Double power-law ring with background --------------------------------------------
@@ -103,6 +138,11 @@ function genmeanprior(::DblRingWBkgd)
     )
 end
 
+register_mean_model!("RingBkgd") do meancfg, g, beam
+    @info "Using a ring+background mean for the sky model"
+    return DblRingWBkgd()
+end
+
 # --- Student-t blob mean ---------------------------------------------------------------
 struct TBlobMean end
 centerfix(::Type{<:TBlobMean}) = true
@@ -121,6 +161,11 @@ function genmeanprior(::TBlobMean)
         :fwhm => VLBITruncated(VLBIGaussian(μas2rad(50.0), μas2rad(20.0)); lower = μas2rad(10.0), upper = μas2rad(100.0)),
         :s => VLBIUniform(1.0, 10.0)
     )
+end
+
+register_mean_model!("TBlob") do meancfg, g, beam
+    @info "Using a Student-t blob mean for the sky model"
+    return TBlobMean()
 end
 
 # --- Core image plus a jet Gaussian ----------------------------------------------------
@@ -153,6 +198,13 @@ function genmeanprior(m::JetGauss)
     )
 end
 
+register_mean_model!("JetGauss") do meancfg, g, beam
+    fwhm = _mean_fwhm_rad(meancfg, beam, 30.0)
+    @info "Using a jet+Gaussian mean for the sky model (Gaussian FWHM = $(round(rad2μas(fwhm), digits = 1)) μas)"
+    mimg = intensitymap(modify(Gaussian(), Stretch(fwhm / fwhmfac)), g)
+    return JetGauss(mimg ./ sum(mimg))
+end
+
 # --- Gaussian blended with a disk background ------------------------------------------
 struct GaussBkgdMean{M}
     bkgd::M
@@ -181,4 +233,9 @@ function genmeanprior(::GaussBkgdMean)
         :fwhm => VLBITruncated(VLBIGaussian(μas2rad(50.0), μas2rad(20.0)); lower = μas2rad(20.0), upper = μas2rad(100.0)),
         :fb => VLBIUniform(0.0, 1.0)
     )
+end
+
+register_mean_model!("GaussBkgd") do meancfg, g, beam
+    @info "Using a Gaussian background mean for the sky model"
+    return GaussBkgdMean(g)
 end

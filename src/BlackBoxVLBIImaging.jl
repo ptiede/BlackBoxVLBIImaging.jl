@@ -36,13 +36,16 @@ using BenchmarkTools
 # many `VLBISkyModels.foo` references in the sky-model code resolve.
 const VLBISkyModels = Comrade.VLBISkyModels
 
+# --- TOML-name registries (populated at each component's definition site) ---------------
+include("registries.jl")
+
 # --- sky models ------------------------------------------------------------------------
 include("sky/polreps.jl")
 include("sky/imagingmodel.jl")
 include("sky/meanmodels.jl")
 include("sky/skyprior.jl")
 
-# --- instrument parameterizations (needed by the scheme registry) ----------------------
+# --- instrument parameterizations (register themselves in GAIN_/LEAKAGE_SCHEMES) -------
 include("instrument/parameterizations.jl")
 
 # --- data layer ------------------------------------------------------------------------
@@ -53,7 +56,6 @@ include("data/flagtable.jl")
 include("data/dataloader.jl")
 
 # --- generic instrument assembler ------------------------------------------------------
-include("instrument/schemes.jl")
 include("instrument/distspec.jl")
 include("instrument/assemble.jl")
 
