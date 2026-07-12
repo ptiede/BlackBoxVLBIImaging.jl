@@ -1,8 +1,8 @@
-# Polarization representations and random-field base markers used by `ImagingModel`.
+# Polarization representations and random-field base markers.
 #
-# These small marker types select, via dispatch, how the stochastic image fluctuations
-# are represented (`make_image` in imagingmodel.jl) and which priors are generated
-# (`genimgprior` in skyprior.jl).
+# These small marker types select, via dispatch, which `@sky` model constructor is used
+# (`sky_constructor` in skymodels.jl) and how the config layer prepares the random-field
+# transform/plan (`prepare_base`).
 
 abstract type PolRep end
 abstract type PolModel <: PolRep end

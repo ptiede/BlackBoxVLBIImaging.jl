@@ -5,13 +5,15 @@
 
 const fwhmfac = 2 * sqrt(2 * log(2))
 
+centerfix(::Type{<:Any}) = true
+
 # --- Fixed mean image ------------------------------------------------------------------
 function make_mean(mimg::IntensityMap, grid, θ)
     return mimg
 end
 
 function genmeanprior(::IntensityMap)
-    return Dict()
+    return NamedTuple()
 end
 
 # --- Fixed mean image blended with a disk background -----------------------------------
@@ -37,7 +39,7 @@ function genmeanprior(::MimgPlusBkg)
     # `lower = 0.0` must be explicit: VLBITruncated's flat transform is built from the
     # truncation bounds only, so a one-sided `upper` maps ℝ → (-∞, 1) and lets the
     # optimizer/sampler walk into fb < 0 (negative background flux) where logpdf = -Inf.
-    return Dict(:fb => VLBITruncated(VLBIExponential(0.1); lower = 0.0, upper = 1.0))
+    return (fb = VLBITruncated(VLBIExponential(0.1); lower = 0.0, upper = 1.0),)
 end
 
 # --- Gaussian mean ---------------------------------------------------------------------
@@ -54,8 +56,8 @@ function make_mean(::GaussMean, grid, θ)
 end
 
 function genmeanprior(::GaussMean)
-    return Dict(
-        :fwhm => VLBITruncated(VLBIGaussian(μas2rad(50.0), μas2rad(20.0)); lower = μas2rad(2.0), upper = μas2rad(100.0)),
+    return (
+        fwhm = VLBITruncated(VLBIGaussian(μas2rad(50.0), μas2rad(20.0)); lower = μas2rad(2.0), upper = μas2rad(100.0)),
     )
 end
 
@@ -73,10 +75,10 @@ function make_mean(::DblRingMean, grid, θ)
 end
 
 function genmeanprior(::DblRingMean)
-    return Dict(
-        :r0 => VLBIUniform(μas2rad(0.1), μas2rad(25.0)),
-        :ain => VLBIUniform(0.0, 10.0),
-        :aout => VLBIUniform(1.0, 10.0)
+    return (
+        r0 = VLBIUniform(μas2rad(0.1), μas2rad(25.0)),
+        ain = VLBIUniform(0.0, 10.0),
+        aout = VLBIUniform(1.0, 10.0),
     )
 end
 
@@ -95,11 +97,11 @@ function make_mean(::DblRingWBkgd, grid, θ)
 end
 
 function genmeanprior(::DblRingWBkgd)
-    return Dict(
-        :r0 => VLBIUniform(μas2rad(10.0), μas2rad(25.0)),
-        :ain => VLBIExponential(5.0),
-        :aout => VLBIExponential(5.0),
-        :fb => VLBITruncated(VLBIExponential(0.1); lower = 0.0, upper = 1.0)
+    return (
+        r0 = VLBIUniform(μas2rad(10.0), μas2rad(25.0)),
+        ain = VLBIExponential(5.0),
+        aout = VLBIExponential(5.0),
+        fb = VLBITruncated(VLBIExponential(0.1); lower = 0.0, upper = 1.0),
     )
 end
 
@@ -117,9 +119,9 @@ function make_mean(::TBlobMean, grid, θ)
 end
 
 function genmeanprior(::TBlobMean)
-    return Dict(
-        :fwhm => VLBITruncated(VLBIGaussian(μas2rad(50.0), μas2rad(20.0)); lower = μas2rad(10.0), upper = μas2rad(100.0)),
-        :s => VLBIUniform(1.0, 10.0)
+    return (
+        fwhm = VLBITruncated(VLBIGaussian(μas2rad(50.0), μas2rad(20.0)); lower = μas2rad(10.0), upper = μas2rad(100.0)),
+        s = VLBIUniform(1.0, 10.0),
     )
 end
 
@@ -143,13 +145,13 @@ function genmeanprior(m::JetGauss)
     fovx, fovy = fieldofview(m.core)
     x0, y0 = phasecenter(m.core)
     dx, dy = pixelsizes(m.core)
-    return Dict(
-        :r => VLBIUniform(dx * 4, min(fovx, fovy) / 3),
-        :τ => VLBIUniform(0.0, 10.0),
-        :ξτ => DiagonalVonMises(0.0, inv(π^2)),
-        :x => VLBIUniform(-fovx / 4 - x0, fovx / 4 - x0),
-        :y => VLBIUniform(-fovy / 4 - y0, fovy / 4 - y0),
-        :fj => VLBITruncated(VLBIExponential(0.1); lower = 0.0, upper = 1.0)
+    return (
+        r = VLBIUniform(dx * 4, min(fovx, fovy) / 3),
+        τ = VLBIUniform(0.0, 10.0),
+        ξτ = DiagonalVonMises(0.0, inv(π^2)),
+        x = VLBIUniform(-fovx / 4 - x0, fovx / 4 - x0),
+        y = VLBIUniform(-fovy / 4 - y0, fovy / 4 - y0),
+        fj = VLBITruncated(VLBIExponential(0.1); lower = 0.0, upper = 1.0),
     )
 end
 
@@ -177,8 +179,8 @@ function make_mean(p::GaussBkgdMean, grid, θ)
 end
 
 function genmeanprior(::GaussBkgdMean)
-    return Dict(
-        :fwhm => VLBITruncated(VLBIGaussian(μas2rad(50.0), μas2rad(20.0)); lower = μas2rad(20.0), upper = μas2rad(100.0)),
-        :fb => VLBIUniform(0.0, 1.0)
+    return (
+        fwhm = VLBITruncated(VLBIGaussian(μas2rad(50.0), μas2rad(20.0)); lower = μas2rad(20.0), upper = μas2rad(100.0)),
+        fb = VLBIUniform(0.0, 1.0),
     )
 end

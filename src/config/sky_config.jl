@@ -213,16 +213,30 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     ftotpr = _parse_ftot(get(get(cfg, "flux", Dict{String, Any}()), "ftot", [1.0]))
     overrides = _parse_sky_overrides(get(cfg, "overrides", Dict{String, Any}()))
 
+    gaussp = addg ? gengaussprior(polrep) : NamedTuple()
     if !creg
-        msky = ImagingModel(polrep, mmodel, g, ftotpr; addgauss = addg, base = base, order = order)
+        docenter = centerfix(typeof(mmodel))
         imgdata = nothing
     else
         @info "Using a centroid regularization"
-        msky = ImagingModel(polrep, mmodel, g, ftotpr; addgauss = addg, base = base, order = order, center = false)
+        docenter = false
         imgdata = (Comrade.ImgNormalData(rad2μas ∘ SVector ∘ centroid, SVector(0.0, 0.0), 1.0),)
     end
 
-    pr = skyprior(msky; beamsize = corr_beam, overrides = overrides)
-    skym = SkyModel(msky, pr, g; algorithm = FINUFFTAlg(; threads = Threads.nthreads()))
+    ctor = sky_constructor(polrep, base)
+    skym = if base === GMRF
+        ctor(
+            g; meanmodel = mmodel, ftot = ftotpr, beamsize = corr_beam, order = order,
+            gaussprior = gaussp, center = Val(docenter)
+        )
+    else
+        ctor(
+            g; base = prepare_base(base, g, order), meanmodel = mmodel, ftot = ftotpr,
+            beamsize = corr_beam, gaussprior = gaussp, center = Val(docenter)
+        )
+    end
+    skym = @set skym.prior = apply_sky_overrides(skym.prior, overrides)
+    # The @sky constructor cannot pass a Fourier algorithm, so swap in the threaded NUFFT.
+    skym = @set skym.algorithm = FINUFFTAlg(; threads = Threads.nthreads())
     return (skym, imgdata)
 end

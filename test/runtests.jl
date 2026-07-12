@@ -13,8 +13,9 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         # VLBI* constructors return AffineDistribution-wrapped Std* distributions.
         @test occursin("StdNormal", string(typeof(parse_dist(Dict("dist" => "Normal", "args" => [0.0, 0.4])))))
         @test occursin("StdExponential", string(typeof(parse_dist(Dict("dist" => "Exponential", "args" => [0.2])))))
+        # VLBITruncated builds a ProbabilityTransports.Truncated since Comrade 0.11.33
         d = parse_dist(Dict("dist" => "Normal", "args" => [0.0, 1.0], "lower" => 0.0))
-        @test occursin("VLBITruncated", string(typeof(d)))
+        @test occursin("Truncated", string(typeof(d)))
         @test parse_dist(Dict("dist" => "DiagonalVonMises", "args" => [0.0, 3.14159])) isa DiagonalVonMises
         @test_throws ErrorException parse_dist(Dict("dist" => "Nonsense", "args" => [1.0]))
         @test_throws ErrorException parse_dist(Dict("args" => [1.0]))               # missing 'dist'
@@ -22,12 +23,15 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
     end
 
     @testset "scheme registry" begin
-        for (k, v) in BlackBoxVLBIImaging.GAIN_SCHEMES
-            @test !isempty(v.params)
-            @test v.kind in (:jones, :single)
+        # required params are probed from the @instrument definitions themselves
+        for (k, ctor) in BlackBoxVLBIImaging.GAIN_SCHEMES
+            @test !isempty(BlackBoxVLBIImaging.required_params(ctor))
         end
-        @test BlackBoxVLBIImaging.LEAKAGE_SCHEMES["none"].params == ()
-        @test !isempty(BlackBoxVLBIImaging.LEAKAGE_SCHEMES["leakage_simple"].params)
+        @test BlackBoxVLBIImaging.required_params(BlackBoxVLBIImaging.LEAKAGE_SCHEMES["none"]) == ()
+        @test BlackBoxVLBIImaging.required_params(BlackBoxVLBIImaging.GAIN_SCHEMES["gain"]) ==
+            (:lg1, :gp1, :lgratμ, :lgratσ, :lgrat, :gprat, :gpratμ)
+        @test BlackBoxVLBIImaging.required_params(BlackBoxVLBIImaging.LEAKAGE_SCHEMES["leakage_simple"]) ==
+            (:d1re, :d1im, :d2re, :d2im)
     end
 
     @testset "instrument assembler" begin
@@ -106,6 +110,11 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         skym, imgdata = build_sky_config(exconfig("image.toml"))
         @test skym isa SkyModel
         @test isnothing(imgdata)
+        # the @sky model evaluates: draw from the prior and render the map
+        x = rand(Random.default_rng(), Comrade.NamedDist(skym.prior))
+        m = skym.f(x, skym.metadata)
+        img = intensitymap(m, skym.grid)
+        @test all(isfinite, stokes(img, :I))
         # the documented template builds too (order 2 → NonCenteredMRF, snapped grid)
         skym2, _ = build_sky_config(exconfig("image.toml"))
         @test skym2 isa SkyModel

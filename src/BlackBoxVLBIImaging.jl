@@ -38,12 +38,8 @@ const VLBISkyModels = Comrade.VLBISkyModels
 
 # --- sky models ------------------------------------------------------------------------
 include("sky/polreps.jl")
-include("sky/imagingmodel.jl")
 include("sky/meanmodels.jl")
-include("sky/skyprior.jl")
-
-# --- instrument parameterizations (needed by the scheme registry) ----------------------
-include("instrument/parameterizations.jl")
+include("sky/skymodels.jl")
 
 # --- data layer ------------------------------------------------------------------------
 include("data/arraytable.jl")
@@ -52,8 +48,8 @@ include("data/corrpol.jl")
 include("data/flagtable.jl")
 include("data/dataloader.jl")
 
-# --- generic instrument assembler ------------------------------------------------------
-include("instrument/schemes.jl")
+# --- instrument models + generic assembler ---------------------------------------------
+include("instrument/instruments.jl")
 include("instrument/distspec.jl")
 include("instrument/assemble.jl")
 
@@ -76,8 +72,12 @@ function __init__()
     return nothing
 end
 
-# sky models
-export ImagingModel, skyprior, centroid
+# sky models (one @sky constructor per polrep × random-field base)
+export centroid
+export stokesi_gmrf, stokesi_ncmrf, stokesi_matern, stokesi_markovrf
+export poincare_gmrf, poincare_matern
+export polexp_gmrf, polexp_ncmrf, polexp_matern, polexp_markovrf
+export sky_constructor, genmeanprior, gengaussprior, apply_sky_overrides
 export Poincare, PolExp, TotalIntensity, Matern, MarkovRF, NonCenteredMRF
 export GaussMean, DblRingMean, DblRingWBkgd, TBlobMean, JetGauss, GaussBkgdMean, MimgPlusBkg
 # data layer

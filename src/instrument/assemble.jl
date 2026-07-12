@@ -1,7 +1,7 @@
 # The generic instrument-model assembler. Turns a parsed instrument TOML into a Comrade
-# `InstrumentModel` by selecting a gain/leakage scheme (schemes.jl), building one
-# `ArrayPrior` per required parameter from its prior table, and composing the Jones
-# matrices. This replaces the ~20 hand-written builders with a single declarative path.
+# `InstrumentModel` by selecting a gain/leakage `@instrument` scheme (instruments.jl),
+# building one `ArrayPrior` per required parameter from its prior table, and composing the
+# gain and leakage pieces into a `JonesSandwich` when leakage is requested.
 
 function _parse_refant(spec)
     isnothing(spec) && return NoReference()
@@ -78,16 +78,16 @@ function assemble_instrument(cfg::AbstractDict)
     gname = String(get(cfg["gain"], "scheme", ""))
     haskey(GAIN_SCHEMES, gname) ||
         error("unknown gain scheme '$gname'. Allowed: $(sort(collect(keys(GAIN_SCHEMES))))")
-    gsch = GAIN_SCHEMES[gname]
+    gctor = GAIN_SCHEMES[gname]
 
     lname = haskey(cfg, "leakage") ? String(get(cfg["leakage"], "scheme", "none")) : "none"
     haskey(LEAKAGE_SCHEMES, lname) ||
         error("unknown leakage scheme '$lname'. Allowed: $(sort(collect(keys(LEAKAGE_SCHEMES))))")
-    lsch = LEAKAGE_SCHEMES[lname]
+    lctor = LEAKAGE_SCHEMES[lname]
 
     frcal = Bool(get(cfg, "frcal", false))
 
-    required = Symbol[gsch.params..., lsch.params...]
+    required = Symbol[required_params(gctor)..., required_params(lctor)...]
     priors = get(cfg, "priors", Dict{String, Any}())
     missing_params = filter(p -> !haskey(priors, String(p)), required)
     isempty(missing_params) ||
@@ -101,17 +101,15 @@ function assemble_instrument(cfg::AbstractDict)
 
     intprior = NamedTuple([p => _build_array_prior(priors[String(p)], String(p)) for p in required])
 
-    G = gsch.kind === :single ? SingleStokesGain(gsch.parameterization) : JonesG(gsch.parameterization)
-
-    if lname == "none"
-        J = G
-    else
-        D = JonesD(lsch.parameterization)
-        R = JonesR(; add_fr = true)
-        sw = frcal ? sandwich_withfrcal : sandwich
-        J = JonesSandwich(sw, G, D, R)
-    end
-
     @info "Instrument: gain=$gname leakage=$lname frcal=$frcal nparams=$(length(required))"
-    return InstrumentModel(J, intprior)
+
+    gm = gctor(; priors = intprior)
+    lctor === nothing && return gm
+
+    # Compose the gain and leakage pieces (each an InstrumentModel over its own tilde
+    # parameters) into G*D*R with the feed-rotation term, merging their priors.
+    dm = lctor(; priors = intprior)
+    sw = frcal ? sandwich_withfrcal : sandwich
+    J = JonesSandwich(sw, gm.jones, dm.jones, JonesR(; add_fr = true))
+    return InstrumentModel(J, merge(gm.prior, dm.prior); refbasis = gm.refbasis)
 end
