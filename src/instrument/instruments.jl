@@ -51,6 +51,30 @@ end
     end
 end
 
+#     gain_scanjitter(; priors)
+#
+# Like [`gain`](@ref) but the feed-1 phase is split into a scan-segmented anchor (`gp1`,
+# typically flat) plus a tightly-priored integration-level jitter (`gpj`). The tight jitter
+# prior keeps intra-scan visibility-phase evolution informative about the sky (per-integ
+# free phases reduce the phase information to closure-only, leaving smooth sky modes on a
+# near-degenerate ridge with the gains), while still absorbing residual post-fringe-fit
+# phase drift within a scan.
+@instrument function gain_scanjitter(; priors)
+    return @jones begin
+        lg1 ~ priors.lg1
+        gp1 ~ priors.gp1
+        gpj ~ priors.gpj
+        lgratμ ~ priors.lgratμ
+        lgratσ ~ priors.lgratσ
+        lgrat ~ priors.lgrat
+        gprat ~ priors.gprat
+        gpratμ ~ priors.gpratμ
+        g1 = exp(lg1 + 1im * (gp1 + gpj))
+        g2 = g1 * exp((lgratμ + lgratσ * lgrat) + 1im * (gprat + gpratμ))
+        return JonesG((g1, g2))
+    end
+end
+
 #     gain_hier(; priors)
 #
 # Hierarchical gain model: the feed-1 amplitude and the feed-2 gain ratio are each given by a
@@ -141,6 +165,7 @@ end
 # TOML scheme name → @instrument constructor. `nothing` means no leakage.
 const GAIN_SCHEMES = Dict{String, Any}(
     "gain" => gain,
+    "gain_scanjitter" => gain_scanjitter,
     "gain_centered" => gain_centered,
     "gain_hier" => gain_hier,
     "gain_noratio" => gain_noratio,

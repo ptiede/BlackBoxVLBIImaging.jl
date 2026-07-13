@@ -76,5 +76,9 @@ function build_data_config(
     end
 
     dcoh = apply_flagtable(dcoh, parse_flagtable(get(cfg, "flags", Dict{String, Any}())))
+    # After averaging + flagging, make sure every timestamp is covered by a scan; otherwise
+    # any scan-segmented instrument parameter fails its segment lookup in `set_array`.
+    # TODO upsteam to VLBIFiles?
+    dcoh = repair_scan_coverage(dcoh)
     return dcoh
 end

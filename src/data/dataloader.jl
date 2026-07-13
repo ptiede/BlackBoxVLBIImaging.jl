@@ -59,6 +59,41 @@ function build_data_uvfits(
     return dvis
 end
 
+"""
+    repair_scan_coverage(dvis) -> dvis
+
+Fixed-interval time averaging can put a bin-center timestamp outside the scan boundaries
+recorded in the data file (data taken just before the nominal scan start average to a
+center ahead of it). Scan-segmented instrument parameters look segments up with the
+half-open interval `start ≤ t < stop`, so such orphan timestamps make `set_array` throw
+"not found in SiteArray". Stretch the nearest scan edge to cover each orphan time.
+"""
+function repair_scan_coverage(dvis)
+    arr = arrayconfig(dvis)
+    sc = arr.scans
+    start = copy(sc.start)
+    stop = copy(sc.stop)
+    orphans = eltype(start)[]
+    for t in unique(arr[:Ti])
+        any(i -> start[i] <= t < stop[i], eachindex(start, stop)) && continue
+        push!(orphans, t)
+        dist(i) = t < start[i] ? start[i] - t : t - stop[i]
+        i = argmin(dist, eachindex(start, stop))
+        if t < start[i]
+            start[i] = t
+        else
+            # half-open upper edge: nudge past t so `t < stop` holds
+            stop[i] = nextfloat(t)
+        end
+    end
+    isempty(orphans) && return dvis
+    @warn "$(length(orphans)) averaged timestamp(s) fell outside the scan table; " *
+        "stretched the nearest scan edges to cover them." orphans
+    newscans = StructArray((start = start, stop = stop))
+    newarr = @set arr.scans = newscans
+    return @set dvis.config = newarr
+end
+
 function build_data_dlist(
         file::String, array::Union{String, Nothing} = nothing;
         avg = "scan",
