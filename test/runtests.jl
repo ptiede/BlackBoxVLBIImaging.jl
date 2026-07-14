@@ -47,6 +47,59 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws ErrorException assemble_instrument(cfg2)
     end
 
+    @testset "gauss-markov instrument priors" begin
+        # parse_process: fixed hyperparameters vs fitted (distribution-spec) hyperparameters
+        pf = parse_process(Dict("kind" => "OrnsteinUhlenbeck", "sigma" => 0.1, "tau" => 2.0))
+        @test pf isa OrnsteinUhlenbeck
+        @test isempty(Comrade.hyperprior(pf))            # all fixed -> no fitted hyperparams
+        pfit = parse_process(Dict(
+            "kind" => "ou",
+            "sigma" => Dict("dist" => "Exponential", "args" => [0.1]),
+            "tau" => Dict("dist" => "InverseGamma", "args" => [3.0, 6.0]),
+        ))
+        @test keys(Comrade.hyperprior(pfit)) == (:σ, :τ)
+        @test_throws ErrorException parse_process(Dict("kind" => "Nope", "sigma" => 1.0, "tau" => 1.0))
+        @test_throws ErrorException parse_process(Dict("kind" => "ou", "tau" => 1.0))       # missing sigma
+        @test_throws ErrorException parse_process(Dict("kind" => "ou", "sigma" => 1.0, "tau" => 1.0, "mu" => Dict()))
+
+        # a gaussmarkov default (fitted hyperparams) with an iid per-site override still builds
+        cfg = exconfig("instrument_mixed.toml")
+        cfg["priors"]["lg1"] = Dict{String, Any}(
+            "kind" => "gaussmarkov", "seg" => "integ",
+            "process" => Dict{String, Any}(
+                "kind" => "OrnsteinUhlenbeck",
+                "sigma" => Dict{String, Any}("dist" => "Exponential", "args" => [0.4]),
+                "tau" => 2.0,
+            ),
+            "overrides" => Dict{String, Any}("SM" => Dict{String, Any}(
+                "kind" => "iid", "seg" => "integ",
+                "dist" => Dict{String, Any}("dist" => "Normal", "args" => [0.0, 0.5]),
+            )),
+        )
+        cfg["priors"]["lgrat"] = Dict{String, Any}(
+            "kind" => "gaussmarkov", "seg" => "scan", "centered" => true,
+            "process" => Dict{String, Any}("kind" => "ou", "sigma" => 0.5, "tau" => 4.0),
+        )
+        @test build_instrument_config(cfg) isa InstrumentModel
+
+        # the shipped gauss-markov example TOML is valid
+        @test build_instrument_config(exconfig("instrument_gaussmarkov.toml")) isa InstrumentModel
+
+        # phase = true is incompatible with a gaussmarkov site prior
+        cfgp = exconfig("instrument_mixed.toml")
+        cfgp["priors"]["gp1"]["kind"] = "gaussmarkov"
+        cfgp["priors"]["gp1"]["process"] = Dict{String, Any}("kind" => "ou", "sigma" => 0.1, "tau" => 2.0)
+        @test_throws ErrorException assemble_instrument(cfgp)
+
+        # unknown site-prior kind, and a gaussmarkov entry missing its process, both error
+        cfgk = exconfig("instrument_mixed.toml")
+        cfgk["priors"]["lg1"]["kind"] = "bogus"
+        @test_throws ErrorException assemble_instrument(cfgk)
+        cfgm = exconfig("instrument_mixed.toml")
+        cfgm["priors"]["lg1"]["kind"] = "gaussmarkov"      # has dist but no process
+        @test_throws ErrorException assemble_instrument(cfgm)
+    end
+
     @testset "config key validation" begin
         # the original footgun: frcal placed below a [section] header nests under it
         cfg = exconfig("instrument_mixed.toml")
