@@ -27,9 +27,10 @@ end
 
 # A single site prior, either the default `IIDSitePrior` (temporally independent, `dist`) or
 # the temporally correlated `GaussMarkovSitePrior` (a Gauss-Markov `process` + optional
-# `centered` flag). The kind is selected by `kind = "iid"` (default) / `"gaussmarkov"`; both
-# are accepted by `ArrayPrior` as the default or as a per-site override, so this one builder
-# serves both call sites.
+# `centered`/`anchored` flags). The kind is selected by `kind = "iid"` (default) /
+# `"gaussmarkov"`; both are accepted by `ArrayPrior` as the default or as a per-site
+# override, so this one builder serves both call sites. `anchored = true` pins each site's
+# chain to zero at its first time (the phase-fluctuation-plus-circular-offset idiom).
 function _site_prior(t::AbstractDict, where_::AbstractString)
     haskey(t, "seg") || error("$where_ is missing 'seg': $t")
     seg = _segmentation(String(t["seg"]))
@@ -47,7 +48,10 @@ function _site_prior(t::AbstractDict, where_::AbstractString)
                 "(integ/scan/track), got seg=\"$(t["seg"])\""
         )
         centered = Bool(get(t, "centered", false))
-        return GaussMarkovSitePrior(seg, parse_process(t["process"]); centered = centered)
+        anchored = Bool(get(t, "anchored", false))
+        return GaussMarkovSitePrior(
+            seg, parse_process(t["process"]); centered = centered, anchored = anchored
+        )
     else
         error("$where_ has unknown site-prior kind '$kind'. Allowed: iid, gaussmarkov")
     end
@@ -56,7 +60,7 @@ end
 function _build_array_prior(pcfg::AbstractDict, name::AbstractString)
     check_config_keys(
         pcfg,
-        ("kind", "seg", "dist", "process", "centered", "phase", "refant", "overrides"),
+        ("kind", "seg", "dist", "process", "centered", "anchored", "phase", "refant", "overrides"),
         "[priors.$name]",
     )
     default = _site_prior(pcfg, "[priors.$name]")
@@ -68,7 +72,7 @@ function _build_array_prior(pcfg::AbstractDict, name::AbstractString)
     # — they live on the parameter-level entry. Each override may itself be iid or gaussmarkov.
     ovr_pairs = map(collect(overrides)) do (site, scfg)
         check_config_keys(
-            scfg, ("kind", "seg", "dist", "process", "centered"),
+            scfg, ("kind", "seg", "dist", "process", "centered", "anchored"),
             "[priors.$name.overrides.$site]",
         )
         return Symbol(site) => _site_prior(scfg, "[priors.$name.overrides.$site]")
