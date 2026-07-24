@@ -139,6 +139,22 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws ErrorException parse_flagtable(Dict{String, Any}("site" => ["AA"]))
     end
 
+    @testset "polarization-basis corrections" begin
+        flags = parse_flagtable(Dict{String, Any}("corr_polbasis" => Any[
+            Dict("site" => "AA", "R" => "Y", "L" => "X"),
+            Dict("site" => "LM", "X" => "L", "Y" => "R"),
+            "HAY",
+        ]))
+        @test flags.corr_polbasis[1] == (; site = :AA, mapping = Pair{Any, Any}[RPol() => YPol(), LPol() => XPol()])
+        @test flags.corr_polbasis[2] == (; site = :LM, mapping = Pair{Any, Any}[XPol() => LPol(), YPol() => RPol()])
+        @test flags.corr_polbasis[3] == (; site = :HAY, mapping = Pair{Any, Any}[RPol() => YPol(), LPol() => XPol()])
+        @test corpol(RPol(), flags.corr_polbasis[1].mapping) == YPol()
+        @test_throws ErrorException corpol(XPol(), flags.corr_polbasis[1].mapping)
+        @test_throws ErrorException parse_flagtable(Dict("corr_polbasis" => Any[
+            Dict("site" => "AA", "R" => "Y", "L" => "linear"),
+        ]))
+    end
+
     @testset "fitting config" begin
         s = build_fitting_config(exconfig("fitting.toml"))
         @test s isa FittingStrategy
