@@ -25,28 +25,68 @@ function _segmentation(name)
     return SEGMENTATIONS[name]
 end
 
-function _iid_site_prior(t::AbstractDict, where_::AbstractString)
+# A single site prior, either the default `IIDSitePrior` (temporally independent, `dist`) or
+# the temporally correlated `GaussMarkovSitePrior` (a Gauss-Markov `process` + optional
+# `centered`/`anchored` flags). The kind is selected by `kind = "iid"` (default) /
+# `"gaussmarkov"`; both are accepted by `ArrayPrior` as the default or as a per-site
+# override, so this one builder serves both call sites. `anchored = true` pins each site's
+# chain to zero at its first time (the phase-fluctuation-plus-circular-offset idiom).
+function _site_prior(t::AbstractDict, where_::AbstractString)
     haskey(t, "seg") || error("$where_ is missing 'seg': $t")
-    haskey(t, "dist") || error("$where_ is missing 'dist': $t")
-    return IIDSitePrior(_segmentation(String(t["seg"])), parse_dist(t["dist"]))
+    seg = _segmentation(String(t["seg"]))
+    kind = String(get(t, "kind", "iid"))
+    if kind == "iid"
+        haskey(t, "dist") || error("$where_ is missing 'dist': $t")
+        return IIDSitePrior(seg, parse_dist(t["dist"]))
+    elseif kind == "gaussmarkov"
+        haskey(t, "process") ||
+            error("$where_ has kind=\"gaussmarkov\" but is missing 'process': $t")
+        # GaussMarkovSitePrior requires a time segmentation; every registered segmentation
+        # is one, but keep the invariant explicit for when a non-time seg is added.
+        seg isa Comrade.TimeSegmentation || error(
+            "$where_ uses kind=\"gaussmarkov\", which needs a time segmentation " *
+                "(integ/scan/track), got seg=\"$(t["seg"])\""
+        )
+        centered = Bool(get(t, "centered", false))
+        anchored = Bool(get(t, "anchored", false))
+        return GaussMarkovSitePrior(
+            seg, parse_process(t["process"]); centered = centered, anchored = anchored
+        )
+    else
+        error("$where_ has unknown site-prior kind '$kind'. Allowed: iid, gaussmarkov")
+    end
 end
 
 function _build_array_prior(pcfg::AbstractDict, name::AbstractString)
     check_config_keys(
-        pcfg, ("seg", "dist", "phase", "refant", "overrides"), "[priors.$name]"
+        pcfg,
+        ("kind", "seg", "dist", "process", "centered", "anchored", "phase", "refant", "overrides"),
+        "[priors.$name]",
     )
-    default = _iid_site_prior(pcfg, "[priors.$name]")
+    default = _site_prior(pcfg, "[priors.$name]")
     phase = Bool(get(pcfg, "phase", false))
     refant = _parse_refant(get(pcfg, "refant", nothing))
 
     overrides = get(pcfg, "overrides", Dict{String, Any}())
-    # Site overrides replace only the IIDSitePrior, so `phase`/`refant` are not accepted
-    # here — they live on the parameter-level entry.
+    # Site overrides replace only the site prior, so `phase`/`refant` are not accepted here
+    # — they live on the parameter-level entry. Each override may itself be iid or gaussmarkov.
     ovr_pairs = map(collect(overrides)) do (site, scfg)
-        check_config_keys(scfg, ("seg", "dist"), "[priors.$name.overrides.$site]")
-        return Symbol(site) => _iid_site_prior(scfg, "[priors.$name.overrides.$site]")
+        check_config_keys(
+            scfg, ("kind", "seg", "dist", "process", "centered", "anchored"),
+            "[priors.$name.overrides.$site]",
+        )
+        return Symbol(site) => _site_prior(scfg, "[priors.$name.overrides.$site]")
     end
     ovr = NamedTuple(ovr_pairs)
+
+    # GaussMarkov site priors are incompatible with a phase-wrapped ArrayPrior; catch it
+    # here with a parameter-named error rather than letting ArrayPrior throw generically.
+    if phase && any(Base.Fix2(isa, GaussMarkovSitePrior), (default, values(ovr)...))
+        error(
+            "[priors.$name] combines phase=true with a GaussMarkov site prior, which " *
+                "ArrayPrior does not support — use kind=\"iid\" for phase parameters."
+        )
+    end
 
     return ArrayPrior(default; refant = refant, phase = phase, ovr...)
 end

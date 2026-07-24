@@ -84,7 +84,7 @@ export GaussMean, DblRingMean, DblRingWBkgd, TBlobMean, JetGauss, GaussBkgdMean,
 export read_flagtable, parse_flagtable, apply_flagtable, corr_polbasis
 export read_dlist, read_array_table, build_data_uvfits, build_data_dlist
 # instrument assembler
-export assemble_instrument, parse_dist
+export assemble_instrument, parse_dist, parse_process
 # config layer
 export build_sky_config, build_instrument_config, build_data_config, build_fitting_config
 export FittingStrategy

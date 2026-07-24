@@ -75,6 +75,73 @@ end
     end
 end
 
+#     gain_2timescale(; priors)
+#
+# Multi-timescale feed-1 gain. The log-amplitude is the sum of an across-scan term (`lgs`) and
+# a subscan term (`lg1`). The phase is the sum of THREE terms: a wrapped absolute offset
+# (`gp0`, a circular/von-Mises prior that carries the full-circle level), plus zero-mean
+# across-scan (`gps`) and subscan (`gpj`) fluctuations. The phase needs the separate wrapped
+# offset because the likelihood only sees `exp(iφ)`: giving the full-circle level a proper
+# wrapped prior avoids the 2π multimodality that a plain (unwrapped) Gauss-Markov level would
+# create, while the `gps`/`gpj` terms stay small, anchored, and hence effectively unwrapped.
+# The amplitude has no periodicity, so `lgs` can carry its own level directly (no offset term).
+# Terms are identifiable by well-separated correlation times (fix the subscan τ short) and by
+# segmentation. Gain-ratio terms (`lgrat*`, `gprat*`) are single-timescale. Priors/segmentation
+# for each term are set in the instrument TOML; this scheme only fixes how they combine.
+@instrument function gain_2timescale(; priors)
+    return @jones begin
+        lgs ~ priors.lgs       # amplitude: across-scan (level + slow drift)
+        lg1 ~ priors.lg1       # amplitude: subscan (fast within-scan)
+        gp0 ~ priors.gp0       # phase: wrapped absolute offset (von Mises)
+        gps ~ priors.gps       # phase: across-scan drift (anchored, zero-mean)
+        gpj ~ priors.gpj       # phase: subscan drift (anchored, zero-mean)
+        lgratμ ~ priors.lgratμ
+        lgratσ ~ priors.lgratσ
+        lgrat ~ priors.lgrat
+        gprat ~ priors.gprat
+        gpratμ ~ priors.gpratμ
+        g1 = exp((lgs + lg1) + 1im * (gp0 + gps + gpj))
+        g2 = g1 * exp((lgratμ + lgratσ * lgrat) + 1im * (gprat + gpratμ))
+        return JonesG((g1, g2))
+    end
+end
+
+#     gain_gaussmarkov(; priors)
+#
+# Single-timescale (scan-level) Gauss-Markov gain, for SCAN-AVERAGED data where there is no
+# subscan structure to model — the across-scan half of `gain_2timescale` with the subscan
+# terms (`lg1` subscan / `gpj`) removed. Feed-1 gains are:
+#   amplitude:  lg1μ (per-station constant offset/mean, TrackSeg) + lg1 (scan-segmented,
+#               anchored, zero-mean Gauss-Markov drift). The anchored drift pins scan 1 = 0 so
+#               lg1μ unambiguously owns the per-station level — i.e. we fit one constant
+#               amplitude offset per station plus a smooth scan-to-scan drift about it.
+#   phase:      gp0 (WRAPPED von Mises absolute offset, TrackSeg) + gps (scan-segmented,
+#               anchored, zero-mean Gauss-Markov drift). The phase needs the separate wrapped
+#               offset because the likelihood only sees exp(iφ): a proper wrapped prior on the
+#               full-circle level avoids the 2π multimodality a plain unwrapped level would
+#               create, while the anchored gps stays small and effectively unwrapped.
+# Gain-ratio terms are single-timescale: a TrackSeg mean (`lgratμ`, `gpratμ`) plus a scan-level
+# Gauss-Markov deviation (`lgrat`, `gprat`). Unlike `gain_2timescale`, the amplitude ratio has
+# NO separate hierarchical scale (`lgratσ`) — the Gauss-Markov `lgrat` already carries its own
+# (fitted) marginal σ, so a `lgratσ` factor would double-count the scatter.
+# Priors/segmentation for each term are set in the instrument TOML; this scheme only fixes
+# how they combine.
+@instrument function gain_gaussmarkov(; priors)
+    return @jones begin
+        lg1μ ~ priors.lg1μ     # amplitude: per-station constant offset/mean (track)
+        lg1 ~ priors.lg1       # amplitude: scan-segmented drift (anchored, zero-mean)
+        gp0 ~ priors.gp0       # phase: wrapped absolute offset (von Mises, track)
+        gps ~ priors.gps       # phase: scan-segmented drift (anchored, zero-mean)
+        lgratμ ~ priors.lgratμ
+        lgrat ~ priors.lgrat
+        gprat ~ priors.gprat
+        gpratμ ~ priors.gpratμ
+        g1 = exp((lg1μ + lg1) + 1im * (gp0 + gps))
+        g2 = g1 * exp((lgratμ + lgrat) + 1im * (gprat + gpratμ))
+        return JonesG((g1, g2))
+    end
+end
+
 #     gain_hier(; priors)
 #
 # Hierarchical gain model: the feed-1 amplitude and the feed-2 gain ratio are each given by a
@@ -166,6 +233,8 @@ end
 const GAIN_SCHEMES = Dict{String, Any}(
     "gain" => gain,
     "gain_scanjitter" => gain_scanjitter,
+    "gain_2timescale" => gain_2timescale,
+    "gain_gaussmarkov" => gain_gaussmarkov,
     "gain_centered" => gain_centered,
     "gain_hier" => gain_hier,
     "gain_noratio" => gain_noratio,

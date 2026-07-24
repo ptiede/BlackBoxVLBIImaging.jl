@@ -50,3 +50,44 @@ function parse_dist(spec::AbstractDict)
     end
     return d
 end
+
+# --- Gauss-Markov process specs ----------------------------------------------------------
+# A `GaussMarkovSitePrior` (temporally correlated instrument prior) is parameterized by a
+# continuous-time Gauss-Markov process instead of a single per-time distribution. The
+# process spec is an (inline) table `{ kind = "OrnsteinUhlenbeck", sigma = ..., tau = ...,
+# mu = 0.0 }`. Each hyperparameter (`sigma`, `tau`) is either a fixed `Real` or a *fitted*
+# hyperparameter given by a distribution spec (parsed with `parse_dist`, so the same
+# Reactant-friendly `VLBI*` variants are used — they are `<: Distributions.Distribution`,
+# which is how `hyperprior` recognizes a field as fitted). Like `parse_dist`, this is a
+# closed allowlist: only `OrnsteinUhlenbeck` is constructible.
+
+# A hyperparameter is a fixed number or a fitted distribution (a distribution spec table).
+_parse_hyper(x::Real) = Float64(x)
+_parse_hyper(x::AbstractDict) = parse_dist(x)
+_parse_hyper(x) = error(
+    "process hyperparameter must be a number or a distribution spec table, got: $(repr(x))"
+)
+
+"""
+    parse_process(spec::AbstractDict) -> AbstractGaussMarkovProcess
+
+Parse a TOML process spec into a Gauss-Markov process for a [`GaussMarkovSitePrior`],
+restricted to the closed allowlist (currently only `OrnsteinUhlenbeck`). `sigma`/`tau` are
+each a number (fixed) or a distribution spec (fitted hyperparameter); `mu` is an optional
+fixed number (default `0.0`, not fittable). Throws on an unknown process name or a missing
+`sigma`/`tau`.
+"""
+function parse_process(spec::AbstractDict)
+    check_config_keys(spec, ("kind", "sigma", "tau", "mu"), "a process spec")
+    haskey(spec, "kind") || error("process spec is missing the 'kind' key: $spec")
+    name = String(spec["kind"])
+    name in ("OrnsteinUhlenbeck", "ou") ||
+        error("unknown process '$name'. Allowed: OrnsteinUhlenbeck")
+    haskey(spec, "sigma") || error("process spec is missing 'sigma': $spec")
+    haskey(spec, "tau") || error("process spec is missing 'tau': $spec")
+    σ = _parse_hyper(spec["sigma"])
+    τ = _parse_hyper(spec["tau"])
+    μraw = get(spec, "mu", 0.0)
+    μraw isa Real || error("process 'mu' must be a fixed number (it is not fittable), got: $(repr(μraw))")
+    return OrnsteinUhlenbeck(; σ = σ, τ = τ, μ = Float64(μraw))
+end

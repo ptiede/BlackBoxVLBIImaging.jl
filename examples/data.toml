@@ -17,7 +17,7 @@ keep_trange = []     # [] = all; or [lo, hi] UT decimal hours to restrict to at 
 
 # --- flagging (closed schema; see src/data/flagtable.jl) ------------------------------
 [flags]
-corr_polbasis = []   # e.g. ["HAY"] to flip a site's feed basis
+corr_polbasis = []   # e.g. [{site = "HAY", R = "Y", L = "X"}]
 sites = []           # e.g. ["AP"] to drop all baselines to a site
 baselines = []       # e.g. [["AA", "LM"]]
 drop_tranges = []    # e.g. [[4.5, 5.2]] UT decimal-hour windows to drop

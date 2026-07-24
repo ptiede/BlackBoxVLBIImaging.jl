@@ -1,0 +1,79 @@
+# Instrument model demonstrating temporally correlated (Gauss-Markov) gain-amplitude priors.
+# It mirrors `instrument_mixed.toml` (gain-ratio scheme + simple leakage) but replaces the
+# per-integration *iid* amplitude priors with an Ornstein-Uhlenbeck process in time, so the
+# log-amplitudes are smooth over a station's track instead of independent per integration.
+#
+# A site-prior entry now carries a `kind`:
+#   kind = "iid"         (the default; a per-time distribution via `dist`)
+#   kind = "gaussmarkov" (a Gauss-Markov `process` in time)
+# The two can be mixed freely, including inside per-site [overrides]. Gauss-Markov priors need
+# a time segmentation (integ/scan/track) and CANNOT be used with `phase = true`, so the gain
+# *phases* (gp1, gprat) stay iid below.
+
+frcal = false
+
+[gain]
+scheme = "gain"          # lg1, gp1, lgratμ, lgratσ, lgrat, gprat, gpratμ
+
+[leakage]
+scheme = "leakage_simple"   # d1re, d1im, d2re, d2im
+
+# --- gain amplitudes (temporally correlated) -------------------------------------------
+# Reference-feed log-amplitude as an OU process. `sigma` (marginal std) and `tau`
+# (correlation time, in hours) are FITTED hyperparameters here — pass a number instead of a
+# {dist=...} table to fix either one. LM gets a looser iid override (large, uncorrelated).
+[priors.lg1]
+kind = "gaussmarkov"
+seg = "integ"
+process = { kind = "OrnsteinUhlenbeck", sigma = { dist = "Exponential", args = [0.4] }, tau = { dist = "InverseGamma", args = [3.0, 6.0] } }
+  [priors.lg1.overrides.LM]
+  kind = "iid"
+  seg = "integ"
+  dist = { dist = "Normal", args = [0.0, 2.0] }
+
+# Log gain-ratio as an OU process with FIXED hyperparameters (sigma = 1, tau = 2 hr).
+[priors.lgrat]
+kind = "gaussmarkov"
+seg = "integ"
+process = { kind = "ou", sigma = 1.0, tau = 2.0 }
+
+[priors."lgratμ"]
+seg = "track"
+dist = { dist = "Normal", args = [0.0, 0.2] }
+
+[priors."lgratσ"]
+seg = "track"
+dist = { dist = "Exponential", args = [0.2] }
+
+# --- gain phases (iid: phase parameters cannot be gaussmarkov) --------------------------
+[priors.gp1]
+seg = "integ"
+phase = true
+dist = { dist = "DiagonalVonMises", args = [0.0, 3.141592653589793] }
+refant = { kind = "SEFD", val = 0.0 }
+
+[priors.gprat]
+seg = "integ"
+phase = true
+dist = { dist = "DiagonalVonMises", args = [0.0, 0.1] }
+
+[priors."gpratμ"]
+seg = "track"
+dist = { dist = "DiagonalVonMises", args = [0.0, 3.141592653589793] }
+
+# --- leakage (d-terms) -----------------------------------------------------------------
+[priors.d1re]
+seg = "track"
+dist = { dist = "Normal", args = [0.0, 0.2] }
+
+[priors.d1im]
+seg = "track"
+dist = { dist = "Normal", args = [0.0, 0.2] }
+
+[priors.d2re]
+seg = "track"
+dist = { dist = "Normal", args = [0.0, 0.2] }
+
+[priors.d2im]
+seg = "track"
+dist = { dist = "Normal", args = [0.0, 0.2] }
