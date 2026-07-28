@@ -225,6 +225,12 @@ function comrade_imager(
     post = VLBIPosterior(skym, intm, data...; imgdata)
     tpost = asflat(post)
 
+    # The posterior is a property of the run, not of the optimizer, so it gets its own file
+    # rather than riding along in `_optimum_allres.jls` (which is rewritten per optimization
+    # stage and is only about `xopt`). Written up front — before optimization — so anything
+    # reloading the run has it from the moment the job starts, including mid-warmup.
+    serialize(out * "_posterior.jls", post)
+
     # On the Reactant path, verify the device posterior reproduces the CPU/Enzyme
     # log-density AND gradient before fitting — a broken device model silently yields garbage
     # fits (e.g. blown-up leakage). `post` here carries the Enzyme AD mode needed for the
@@ -253,13 +259,13 @@ function comrade_imager(
         save_optimal(imgbase, post, xopt, gimg; label = "start")
         plot_residuals_png(imgbase * "_residuals_map.png", post, xopt)
         write_caltables(caltabbase, xopt)
-        serialize(out * "_optimum_allres.jls", Dict(:xopt => xopt, :post => post))
+        serialize(out * "_optimum_allres.jls", Dict(:xopt => xopt))
     else
         xopt = _optimize_tempered(imgbase, skym, intm, data, imgdata, strategy, opt, rng)
         save_optimal(imgbase, post, xopt, gimg; label = "optimal")
         plot_residuals_png(imgbase * "_residuals_final_map.png", post, xopt)
         write_caltables(caltabbase, xopt)
-        serialize(out * "_optimum_allres.jls", Dict(:xopt => xopt, :post => post))
+        serialize(out * "_optimum_allres.jls", Dict(:xopt => xopt))
     end
 
     # ---- sampling --------------------------------------------------------------------

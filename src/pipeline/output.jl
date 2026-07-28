@@ -181,14 +181,62 @@ end
 
 # --- Analysis helpers (ported from the original utils.jl) ------------------------------
 """
-    load_chain_and_post(file, nsamples=:) -> (chain, post)
+    load_posterior(file) -> post
 
-Reload a saved chain and its posterior (from `<file>_optimum_allres.jls`).
+Reload the posterior for a run from `<file>_posterior.jls`, which holds the posterior
+directly (no wrapper).
+
+Runs written before the posterior was split into its own file bundled it into
+`<file>_optimum_allres.jls` alongside `:xopt`; those are still read, so old output
+directories keep working.
 """
-function load_chain_and_post(file, nsamples = Base.Colon())
-    chain = load_samples(file, nsamples)
-    post = deserialize(file * "_optimum_allres.jls")[:post]
-    return chain, post
+function load_posterior(file)
+    pf = file * "_posterior.jls"
+    isfile(pf) && return deserialize(pf)
+    # Legacy layout: posterior bundled into the optimum file.
+    legacy = file * "_optimum_allres.jls"
+    if isfile(legacy)
+        d = deserialize(legacy)
+        haskey(d, :post) && return d[:post]
+    end
+    return error(
+        "no posterior for $file: expected $pf" *
+            (isfile(legacy) ? " (and $legacy has no `:post` entry)" : "")
+    )
+end
+
+"""
+    load_chain_and_post(file, nsamples=:; warmup=false) -> (chain, post)
+
+Reload a saved chain and its posterior (see [`load_posterior`](@ref)).
+
+`warmup=true` loads the warmup (adaptation) chain from `<file>/warmup` instead of the
+posterior chain. The ReactantNUTS sampler writes that log as warmup runs — one draw per
+warmup chunk — so it is readable *while the run is still warming up*, before `<file>/
+parameters.jls` (and hence the ordinary chain) exists:
+
+```julia
+chain, post = load_chain_and_post(out; warmup = true)
+Comrade.samplerstats(chain).step_size   # adaptation trace so far
+```
+
+The posterior is resolved from `file` either way, so pass the same run base in both cases.
+"""
+function load_chain_and_post(file, nsamples = Base.Colon(); warmup::Bool = false)
+    dir = warmup ? joinpath(file, "warmup") : file
+    if !isfile(joinpath(abspath(dir), "parameters.jls"))
+        # The usual cause is calling this mid-warmup: the sampling chain has not been
+        # written yet, but the warmup log next to it probably has.
+        hint = if !warmup && isfile(joinpath(abspath(file), "warmup", "parameters.jls"))
+            "\nThe run appears to still be in warmup. Pass `warmup = true` to load the " *
+                "warmup chain from $(joinpath(file, "warmup"))."
+        else
+            ""
+        end
+        error("no chain at $dir (missing parameters.jls)." * hint)
+    end
+    chain = load_samples(dir, nsamples)
+    return chain, load_posterior(file)
 end
 
 function saveimgs(imgs, outpath)

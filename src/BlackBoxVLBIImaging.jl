@@ -89,6 +89,6 @@ export assemble_instrument, parse_dist, parse_process
 export build_sky_config, build_instrument_config, build_data_config, build_fitting_config
 export FittingStrategy
 # pipeline
-export comrade_imager, best_image, reactant_opt, load_chain_and_post, saveimgs, image_from_toml
+export comrade_imager, best_image, reactant_opt, load_chain_and_post, load_posterior, saveimgs, image_from_toml
 
 end
