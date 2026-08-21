@@ -143,8 +143,8 @@ end
         lgrat ~ priors.lgrat
         gprat ~ priors.gprat
         gpratμ ~ priors.gpratμ
-        g1 = exp((lg1μ + lg1) + 1im * (gp0 + gps))
-        g2 = g1 * exp((lgratμ + lgrat) + 1im * (gprat + gpratμ))
+        g1 = exp(complex((lg1μ + lg1), (gp0 + gps)))
+        g2 = g1 * exp(complex((lgratμ + lgrat), (gprat + gpratμ)))
         return JonesG((g1, g2))
     end
 end
