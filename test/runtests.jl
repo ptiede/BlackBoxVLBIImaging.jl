@@ -62,6 +62,32 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws ErrorException parse_process(Dict("kind" => "ou", "tau" => 1.0))       # missing sigma
         @test_throws ErrorException parse_process(Dict("kind" => "ou", "sigma" => 1.0, "tau" => 1.0, "mu" => Dict()))
 
+        # WrappedBrownian: the circular process for phases, with a fixed or fitted diffusion D
+        wb = parse_process(Dict("kind" => "WrappedBrownian", "D" => 2.0))
+        @test wb isa WrappedBrownian
+        @test isempty(Comrade.hyperprior(wb))
+        wbfit = parse_process(Dict("kind" => "wb", "D" => Dict("dist" => "Exponential", "args" => [10.0])))
+        @test keys(Comrade.hyperprior(wbfit)) == (:D,)
+        @test_throws ErrorException parse_process(Dict("kind" => "wb"))                       # missing D
+        @test_throws ErrorException parse_process(Dict("kind" => "wb", "D" => 1.0, "tau" => 1.0))  # OU key
+        @test_throws ErrorException parse_process(Dict("kind" => "ou", "sigma" => 1.0, "tau" => 1.0, "D" => 1.0))
+
+        # initial priors: the default is each process's own stationary law (uniform on the
+        # circle for a wrapped process), and the other kinds come from a string or a table
+        @test parse_init(nothing, wb, "test") isa UniformInit
+        @test parse_init(nothing, pf, "test") isa StationaryInit
+        @test parse_init("uniform", wb, "test") isa UniformInit
+        @test parse_init(Dict("kind" => "fixed", "value" => 0.0), wb, "test") == FixedInit(0.0)
+        @test parse_init(Dict("kind" => "gaussian", "mu" => 1.0, "sigma" => 2.0), pf, "test") ==
+            GaussianInit(1.0, 2.0)
+        @test_throws ErrorException parse_init("bogus", wb, "test")
+        @test_throws ErrorException parse_init("fixed", wb, "test")               # needs a value
+        @test_throws ErrorException parse_init(Dict("value" => 0.0), wb, "test")  # missing kind
+        @test_throws ErrorException parse_init(Dict("kind" => "fixed", "val" => 0.0), wb, "test")
+        @test_throws ErrorException parse_init(0.0, wb, "test")
+        # Comrade rejects the (init, process) combinations that do not exist
+        @test_throws ArgumentError GaussMarkovSitePrior(IntegSeg(), wb; init = parse_init("stationary", wb, "test"))
+
         # a gaussmarkov default (fitted hyperparams) with an iid per-site override still builds
         cfg = exconfig("instrument_mixed.toml")
         cfg["priors"]["lg1"] = Dict{String, Any}(
@@ -82,8 +108,37 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         )
         @test build_instrument_config(cfg) isa InstrumentModel
 
-        # the shipped gauss-markov example TOML is valid
+        # a WrappedBrownian phase chain (the correlated replacement for the iid phase = true
+        # cumulative walk), with a per-site override that carries its own init
+        cfgw = exconfig("instrument_mixed.toml")
+        cfgw["priors"]["gp1"] = Dict{String, Any}(
+            "kind" => "gaussmarkov", "seg" => "integ",
+            "process" => Dict{String, Any}(
+                "kind" => "WrappedBrownian",
+                "D" => Dict{String, Any}("dist" => "Exponential", "args" => [10.0]),
+            ),
+            "refant" => Dict{String, Any}("kind" => "SEFD", "val" => 0.0),
+        )
+        cfgw["priors"]["gprat"] = Dict{String, Any}(
+            "kind" => "gaussmarkov", "seg" => "integ",
+            "process" => Dict{String, Any}("kind" => "WrappedBrownian", "D" => 0.1),
+            "init" => Dict{String, Any}("kind" => "fixed", "value" => 0.0),
+            "overrides" => Dict{String, Any}("SM" => Dict{String, Any}(
+                "kind" => "gaussmarkov", "seg" => "integ",
+                "process" => Dict{String, Any}("kind" => "wb", "D" => 1.0e-4),
+                "init" => Dict{String, Any}("kind" => "fixed", "value" => 0.0),
+            )),
+        )
+        @test build_instrument_config(cfgw) isa InstrumentModel
+
+        # the shipped example TOMLs are valid (instrument_gaussmarkov.toml plus the
+        # per-observation configs, whose phases are WrappedBrownian chains)
         @test build_instrument_config(exconfig("instrument_gaussmarkov.toml")) isa InstrumentModel
+        for dir in filter(isdir, readdir(EXDIR; join = true))
+            f = joinpath(dir, "instrument.toml")
+            isfile(f) || continue
+            @test build_instrument_config(TOML.parsefile(f)) isa InstrumentModel
+        end
 
         # phase = true is incompatible with a gaussmarkov site prior
         cfgp = exconfig("instrument_mixed.toml")
@@ -148,8 +203,9 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test flags.corr_polbasis[1] == (; site = :AA, mapping = Pair{Any, Any}[RPol() => YPol(), LPol() => XPol()])
         @test flags.corr_polbasis[2] == (; site = :LM, mapping = Pair{Any, Any}[XPol() => LPol(), YPol() => RPol()])
         @test flags.corr_polbasis[3] == (; site = :HAY, mapping = Pair{Any, Any}[RPol() => YPol(), LPol() => XPol()])
-        @test corpol(RPol(), flags.corr_polbasis[1].mapping) == YPol()
-        @test_throws ErrorException corpol(XPol(), flags.corr_polbasis[1].mapping)
+        # `corpol` (the per-feed relabeler) is internal; only `corr_polbasis` is exported
+        @test BlackBoxVLBIImaging.corpol(RPol(), flags.corr_polbasis[1].mapping) == YPol()
+        @test_throws ErrorException BlackBoxVLBIImaging.corpol(XPol(), flags.corr_polbasis[1].mapping)
         @test_throws ErrorException parse_flagtable(Dict("corr_polbasis" => Any[
             Dict("site" => "AA", "R" => "Y", "L" => "linear"),
         ]))

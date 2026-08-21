@@ -1,14 +1,29 @@
-# Instrument model demonstrating temporally correlated (Gauss-Markov) gain-amplitude priors.
-# It mirrors `instrument_mixed.toml` (gain-ratio scheme + simple leakage) but replaces the
-# per-integration *iid* amplitude priors with an Ornstein-Uhlenbeck process in time, so the
-# log-amplitudes are smooth over a station's track instead of independent per integration.
+# Instrument model demonstrating temporally correlated (Gauss-Markov) gain priors. It mirrors
+# `instrument_mixed.toml` (gain-ratio scheme + simple leakage) but replaces the
+# per-integration *iid* priors with continuous-time processes, so the gains are smooth over a
+# station's track instead of independent per integration.
 #
-# A site-prior entry now carries a `kind`:
+# A site-prior entry carries a `kind`:
 #   kind = "iid"         (the default; a per-time distribution via `dist`)
 #   kind = "gaussmarkov" (a Gauss-Markov `process` in time)
 # The two can be mixed freely, including inside per-site [overrides]. Gauss-Markov priors need
-# a time segmentation (integ/scan/track) and CANNOT be used with `phase = true`, so the gain
-# *phases* (gp1, gprat) stay iid below.
+# a time segmentation (integ/scan/track).
+#
+# Two processes are available, one per geometry:
+#   { kind = "OrnsteinUhlenbeck", sigma = ..., tau = ... }   real line — log-amplitudes
+#   { kind = "WrappedBrownian",   D = ... }                  circle — phases
+# `WrappedBrownian` is the right prior for a *phase*: its wrapped-normal increments make the
+# prior exactly 2π-periodic, so the 2π-shifted modes an unwrapped (Gaussian) phase prior
+# produces are all equivalent and the fitted diffusion is unbiased by phase wraps. `D` is in
+# rad²/hr and `2/D` is the phase coherence time in hours. It replaces the old iid
+# `phase = true` cumulative-von-Mises walk, and `phase = true` may NOT be combined with it.
+#
+# `init` fixes how each chain's FIRST time stamp is treated, and defaults to the process's own
+# stationary law — uniform on the circle for `WrappedBrownian`, the Gaussian stationary
+# marginal for `OrnsteinUhlenbeck`. A uniform start lets a phase chain absorb the per-track
+# phase offset itself; `init = { kind = "fixed", value = 0.0 }` instead pins the chain at its
+# first time, which is what you want when a separate term (here `gpratμ`) already carries the
+# level. Each per-site override is a complete site prior, so it needs its own `init`.
 
 frcal = false
 
@@ -45,17 +60,26 @@ dist = { dist = "Normal", args = [0.0, 0.2] }
 seg = "track"
 dist = { dist = "Exponential", args = [0.2] }
 
-# --- gain phases (iid: phase parameters cannot be gaussmarkov) --------------------------
+# --- gain phases (temporally correlated, on the circle) ---------------------------------
+# Reference-feed phase as a wrapped random walk. `D` is a FITTED hyperparameter, so each site
+# gets its own phase coherence time (2/D hours) — the exponential prior has mean 10 rad²/hr
+# (~12 min) but a heavy tail, so a station with fast tropospheric phase can diffuse much
+# faster. The chain starts uniform on the circle (the default for a wrapped process), which
+# absorbs the per-track phase offset; the SEFD reference still pins the array phase.
 [priors.gp1]
+kind = "gaussmarkov"
 seg = "integ"
-phase = true
-dist = { dist = "DiagonalVonMises", args = [0.0, 3.141592653589793] }
+process = { kind = "WrappedBrownian", D = { dist = "Exponential", args = [10.0] } }
 refant = { kind = "SEFD", val = 0.0 }
 
+# The R/L phase ratio drifts slowly (small D). `gpratμ` below carries the per-track level, so
+# this chain is pinned to zero at its first time — without that, a uniform start would make
+# the chain level and `gpratμ` redundant.
 [priors.gprat]
+kind = "gaussmarkov"
 seg = "integ"
-phase = true
-dist = { dist = "DiagonalVonMises", args = [0.0, 0.1] }
+process = { kind = "WrappedBrownian", D = { dist = "Exponential", args = [0.1] } }
+init = { kind = "fixed", value = 0.0 }
 
 [priors."gpratμ"]
 seg = "track"

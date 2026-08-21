@@ -26,11 +26,10 @@ function _segmentation(name)
 end
 
 # A single site prior, either the default `IIDSitePrior` (temporally independent, `dist`) or
-# the temporally correlated `GaussMarkovSitePrior` (a Gauss-Markov `process` + optional
-# `centered`/`anchored` flags). The kind is selected by `kind = "iid"` (default) /
-# `"gaussmarkov"`; both are accepted by `ArrayPrior` as the default or as a per-site
-# override, so this one builder serves both call sites. `anchored = true` pins each site's
-# chain to zero at its first time (the phase-fluctuation-plus-circular-offset idiom).
+# the temporally correlated `GaussMarkovSitePrior` (a Gauss-Markov `process`, an optional
+# `init` for the chain's first time stamp, and an optional `centered` flag). The kind is
+# selected by `kind = "iid"` (default) / `"gaussmarkov"`; both are accepted by `ArrayPrior`
+# as the default or as a per-site override, so this one builder serves both call sites.
 function _site_prior(t::AbstractDict, where_::AbstractString)
     haskey(t, "seg") || error("$where_ is missing 'seg': $t")
     seg = _segmentation(String(t["seg"]))
@@ -48,10 +47,9 @@ function _site_prior(t::AbstractDict, where_::AbstractString)
                 "(integ/scan/track), got seg=\"$(t["seg"])\""
         )
         centered = Bool(get(t, "centered", false))
-        anchored = Bool(get(t, "anchored", false))
-        return GaussMarkovSitePrior(
-            seg, parse_process(t["process"]); centered = centered, anchored = anchored
-        )
+        process = parse_process(t["process"])
+        init = parse_init(get(t, "init", nothing), process, where_)
+        return GaussMarkovSitePrior(seg, process; centered = centered, init = init)
     else
         error("$where_ has unknown site-prior kind '$kind'. Allowed: iid, gaussmarkov")
     end
@@ -60,7 +58,7 @@ end
 function _build_array_prior(pcfg::AbstractDict, name::AbstractString)
     check_config_keys(
         pcfg,
-        ("kind", "seg", "dist", "process", "centered", "anchored", "phase", "refant", "overrides"),
+        ("kind", "seg", "dist", "process", "init", "centered", "phase", "refant", "overrides"),
         "[priors.$name]",
     )
     default = _site_prior(pcfg, "[priors.$name]")
@@ -72,7 +70,7 @@ function _build_array_prior(pcfg::AbstractDict, name::AbstractString)
     # — they live on the parameter-level entry. Each override may itself be iid or gaussmarkov.
     ovr_pairs = map(collect(overrides)) do (site, scfg)
         check_config_keys(
-            scfg, ("kind", "seg", "dist", "process", "centered", "anchored"),
+            scfg, ("kind", "seg", "dist", "process", "init", "centered"),
             "[priors.$name.overrides.$site]",
         )
         return Symbol(site) => _site_prior(scfg, "[priors.$name.overrides.$site]")
@@ -81,10 +79,15 @@ function _build_array_prior(pcfg::AbstractDict, name::AbstractString)
 
     # GaussMarkov site priors are incompatible with a phase-wrapped ArrayPrior; catch it
     # here with a parameter-named error rather than letting ArrayPrior throw generically.
+    # `phase = true` is the *iid* way to build a phase random walk (a cumulative sum of
+    # wrapped increments); the GaussMarkov way is the WrappedBrownian process itself, which
+    # already carries the wrapping — the two are alternatives, never combined.
     if phase && any(Base.Fix2(isa, GaussMarkovSitePrior), (default, values(ovr)...))
         error(
             "[priors.$name] combines phase=true with a GaussMarkov site prior, which " *
-                "ArrayPrior does not support — use kind=\"iid\" for phase parameters."
+                "ArrayPrior does not support — drop phase=true and use " *
+                "process = { kind = \"WrappedBrownian\", D = ... } (the correlated wrapped " *
+                "random walk), or keep phase=true with kind=\"iid\"."
         )
     end
 

@@ -37,6 +37,10 @@ seg = "track"
 dist = { dist = "Exponential", args = [0.2] }
 
 # --- gain phases (phase = true, referenced) --------------------------------------------
+# This file is the all-iid baseline: the phases are a cumulative walk of per-integration von
+# Mises increments (`phase = true`). The temporally correlated alternative — a `WrappedBrownian`
+# process, which is the same walk in continuous time with a fitted coherence time — is what the
+# science configs use; see `instrument_gaussmarkov.toml`.
 [priors.gp1]
 seg = "integ"
 phase = true

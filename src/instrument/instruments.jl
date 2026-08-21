@@ -83,7 +83,10 @@ end
 # across-scan (`gps`) and subscan (`gpj`) fluctuations. The phase needs the separate wrapped
 # offset because the likelihood only sees `exp(iφ)`: giving the full-circle level a proper
 # wrapped prior avoids the 2π multimodality that a plain (unwrapped) Gauss-Markov level would
-# create, while the `gps`/`gpj` terms stay small, anchored, and hence effectively unwrapped.
+# create, while the `gps`/`gpj` terms stay small and hence effectively unwrapped — give them
+# `init = { kind = "fixed", value = 0.0 }` in the TOML so their level does not trade off
+# against `gp0`. (A `WrappedBrownian` `gps` started uniform absorbs the offset itself, which
+# makes `gp0` redundant; use a tight `gp0` prior if you go that way.)
 # The amplitude has no periodicity, so `lgs` can carry its own level directly (no offset term).
 # Terms are identifiable by well-separated correlation times (fix the subscan τ short) and by
 # segmentation. Gain-ratio terms (`lgrat*`, `gprat*`) are single-timescale. Priors/segmentation
@@ -93,8 +96,8 @@ end
         lgs ~ priors.lgs       # amplitude: across-scan (level + slow drift)
         lg1 ~ priors.lg1       # amplitude: subscan (fast within-scan)
         gp0 ~ priors.gp0       # phase: wrapped absolute offset (von Mises)
-        gps ~ priors.gps       # phase: across-scan drift (anchored, zero-mean)
-        gpj ~ priors.gpj       # phase: subscan drift (anchored, zero-mean)
+        gps ~ priors.gps       # phase: across-scan drift (zero-mean, pinned at scan 1)
+        gpj ~ priors.gpj       # phase: subscan drift (zero-mean, pinned at its first time)
         lgratμ ~ priors.lgratμ
         lgratσ ~ priors.lgratσ
         lgrat ~ priors.lgrat
@@ -112,14 +115,18 @@ end
 # subscan structure to model — the across-scan half of `gain_2timescale` with the subscan
 # terms (`lg1` subscan / `gpj`) removed. Feed-1 gains are:
 #   amplitude:  lg1μ (per-station constant offset/mean, TrackSeg) + lg1 (scan-segmented,
-#               anchored, zero-mean Gauss-Markov drift). The anchored drift pins scan 1 = 0 so
-#               lg1μ unambiguously owns the per-station level — i.e. we fit one constant
-#               amplitude offset per station plus a smooth scan-to-scan drift about it.
+#               zero-mean Gauss-Markov drift, given `init = { kind = "fixed", value = 0.0 }`
+#               in the TOML). Pinning scan 1 = 0 lets lg1μ unambiguously own the per-station
+#               level — i.e. we fit one constant amplitude offset per station plus a smooth
+#               scan-to-scan drift about it.
 #   phase:      gp0 (WRAPPED von Mises absolute offset, TrackSeg) + gps (scan-segmented,
-#               anchored, zero-mean Gauss-Markov drift). The phase needs the separate wrapped
-#               offset because the likelihood only sees exp(iφ): a proper wrapped prior on the
-#               full-circle level avoids the 2π multimodality a plain unwrapped level would
-#               create, while the anchored gps stays small and effectively unwrapped.
+#               zero-mean Gauss-Markov drift, likewise pinned at its first scan). The phase
+#               needs the separate wrapped offset because the likelihood only sees exp(iφ): a
+#               proper wrapped prior on the full-circle level avoids the 2π multimodality a
+#               plain unwrapped level would create, while the pinned gps stays small and
+#               effectively unwrapped. A `WrappedBrownian` gps started uniform is the modern
+#               alternative — it is wrapped itself and absorbs the offset, making gp0
+#               redundant.
 # Gain-ratio terms are single-timescale: a TrackSeg mean (`lgratμ`, `gpratμ`) plus a scan-level
 # Gauss-Markov deviation (`lgrat`, `gprat`). Unlike `gain_2timescale`, the amplitude ratio has
 # NO separate hierarchical scale (`lgratσ`) — the Gauss-Markov `lgrat` already carries its own
@@ -129,9 +136,9 @@ end
 @instrument function gain_gaussmarkov(; priors)
     return @jones begin
         lg1μ ~ priors.lg1μ     # amplitude: per-station constant offset/mean (track)
-        lg1 ~ priors.lg1       # amplitude: scan-segmented drift (anchored, zero-mean)
+        lg1 ~ priors.lg1       # amplitude: scan-segmented drift (zero-mean, pinned at scan 1)
         gp0 ~ priors.gp0       # phase: wrapped absolute offset (von Mises, track)
-        gps ~ priors.gps       # phase: scan-segmented drift (anchored, zero-mean)
+        gps ~ priors.gps       # phase: scan-segmented drift (zero-mean, pinned at scan 1)
         lgratμ ~ priors.lgratμ
         lgrat ~ priors.lgrat
         gprat ~ priors.gprat
