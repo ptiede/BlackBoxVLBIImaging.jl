@@ -62,15 +62,41 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws ErrorException parse_process(Dict("kind" => "ou", "tau" => 1.0))       # missing sigma
         @test_throws ErrorException parse_process(Dict("kind" => "ou", "sigma" => 1.0, "tau" => 1.0, "mu" => Dict()))
 
-        # WrappedBrownian: the circular process for phases, with a fixed or fitted diffusion D
-        wb = parse_process(Dict("kind" => "WrappedBrownian", "D" => 2.0))
+        # WrappedBrownian: the circular process for phases, parameterized by the coherence
+        # time tau (hours), fixed or fitted.
+        wb = parse_process(Dict("kind" => "WrappedBrownian", "tau" => 1.0))
         @test wb isa WrappedBrownian
         @test isempty(Comrade.hyperprior(wb))
-        wbfit = parse_process(Dict("kind" => "wb", "D" => Dict("dist" => "Exponential", "args" => [10.0])))
-        @test keys(Comrade.hyperprior(wbfit)) == (:D,)
-        @test_throws ErrorException parse_process(Dict("kind" => "wb"))                       # missing D
-        @test_throws ErrorException parse_process(Dict("kind" => "wb", "D" => 1.0, "tau" => 1.0))  # OU key
-        @test_throws ErrorException parse_process(Dict("kind" => "ou", "sigma" => 1.0, "tau" => 1.0, "D" => 1.0))
+        wbfit = parse_process(Dict("kind" => "wb", "tau" => Dict("dist" => "InverseGamma", "args" => [1.0, 0.2])))
+        @test keys(Comrade.hyperprior(wbfit)) == (:τ,)
+        @test_throws ErrorException parse_process(Dict("kind" => "wb"))                     # missing tau
+        @test_throws ErrorException parse_process(Dict("kind" => "wb", "tau" => 1.0, "sigma" => 1.0))  # OU key
+        # `D` was the pre-tau spelling: rejected with a conversion hint, not silently accepted
+        @test_throws ErrorException parse_process(Dict("kind" => "wb", "D" => 2.0))
+
+        # WrappedOrnsteinUhlenbeck: circular AND stationary (the mean-reverting phase prior)
+        wou = parse_process(Dict("kind" => "WrappedOrnsteinUhlenbeck", "sigma" => 0.3, "tau" => 12.0))
+        @test wou isa WrappedOrnsteinUhlenbeck
+        @test Comrade.is_wrapped(wou) && Comrade.isstationary(wou)
+        @test isempty(Comrade.hyperprior(wou))
+        woufit = parse_process(
+            Dict(
+                "kind" => "wou",
+                "sigma" => Dict("dist" => "Exponential", "args" => [0.3]),
+                "tau" => Dict("dist" => "InverseGamma", "args" => [2.0, 24.0]),
+            )
+        )
+        @test keys(Comrade.hyperprior(woufit)) == (:σ, :τ)
+        @test_throws ErrorException parse_process(Dict("kind" => "wou", "tau" => 1.0))   # no sigma
+        @test_throws ErrorException parse_process(Dict("kind" => "wou", "sigma" => 0.3, "tau" => 1.0, "mu" => Dict()))
+
+        # init default keys off STATIONARITY, not wrappedness: a stationary wrapped process
+        # starts in its own WN(μ, σ²) marginal, and only the unbounded wrapped walk starts
+        # uniform. Comrade accepts UniformInit for either, so a wrongly-defaulted init here
+        # would be silent rather than an error.
+        @test parse_init(nothing, wou, "test") isa StationaryInit
+        @test parse_init(nothing, wb, "test") isa UniformInit
+        @test parse_init(nothing, parse_process(Dict("kind" => "ou", "sigma" => 1.0, "tau" => 1.0)), "test") isa StationaryInit
 
         # initial priors: the default is each process's own stationary law (uniform on the
         # circle for a wrapped process), and the other kinds come from a string or a table
@@ -115,21 +141,48 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
             "kind" => "gaussmarkov", "seg" => "integ",
             "process" => Dict{String, Any}(
                 "kind" => "WrappedBrownian",
-                "D" => Dict{String, Any}("dist" => "Exponential", "args" => [10.0]),
+                "tau" => Dict{String, Any}("dist" => "InverseGamma", "args" => [1.0, 0.2]),
             ),
             "refant" => Dict{String, Any}("kind" => "SEFD", "val" => 0.0),
         )
         cfgw["priors"]["gprat"] = Dict{String, Any}(
             "kind" => "gaussmarkov", "seg" => "integ",
-            "process" => Dict{String, Any}("kind" => "WrappedBrownian", "D" => 0.1),
+            "process" => Dict{String, Any}("kind" => "WrappedBrownian", "tau" => 20.0),
             "init" => Dict{String, Any}("kind" => "fixed", "value" => 0.0),
             "overrides" => Dict{String, Any}("SM" => Dict{String, Any}(
                 "kind" => "gaussmarkov", "seg" => "integ",
-                "process" => Dict{String, Any}("kind" => "wb", "D" => 1.0e-4),
+                "process" => Dict{String, Any}("kind" => "wb", "tau" => 2.0e4),
                 "init" => Dict{String, Any}("kind" => "fixed", "value" => 0.0),
             )),
         )
         @test build_instrument_config(cfgw) isa InstrumentModel
+
+        # a VonMisesProcess ratio-phase chain: the smooth-drift circular process takes
+        # Comrade's NonCentered default when the TOML has no `centered`, and the shorthand
+        # still selects Centered
+        cfgv = exconfig("instrument_mixed.toml")
+        cfgv["priors"]["gprat"] = Dict{String, Any}(
+            "kind" => "gaussmarkov", "seg" => "scan",
+            "process" => Dict{String, Any}(
+                "kind" => "VonMisesProcess",
+                "sigma" => Dict{String, Any}("dist" => "Exponential", "args" => [0.3]),
+                "tau" => 24.0,
+            ),
+            "init" => Dict{String, Any}("kind" => "fixed", "value" => 0.0),
+        )
+        imv = build_instrument_config(cfgv)
+        @test imv isa InstrumentModel
+        let d = imv.prior.gprat.default_dist
+            @test d.process isa BlackBoxVLBIImaging.Comrade.VonMisesProcess
+            @test d.param isa BlackBoxVLBIImaging.Comrade.NonCentered
+        end
+        cfgv["priors"]["gprat"]["centered"] = true
+        @test build_instrument_config(cfgv).prior.gprat.default_dist.param isa
+            BlackBoxVLBIImaging.Comrade.Centered
+        # ... while the shortest-arc process rejects the non-centered shorthand
+        cfgv["priors"]["gprat"]["centered"] = false
+        cfgv["priors"]["gprat"]["process"]["kind"] = "wou"
+        @test_throws ArgumentError build_instrument_config(cfgv)
 
         # the shipped example TOMLs are valid (instrument_gaussmarkov.toml plus the
         # per-observation configs, whose phases are WrappedBrownian chains)

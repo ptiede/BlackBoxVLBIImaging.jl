@@ -58,13 +58,15 @@ end
 # are that process's hyperparameters:
 #
 #   { kind = "OrnsteinUhlenbeck", sigma = ..., tau = ..., mu = 0.0 }   (real line)
-#   { kind = "WrappedBrownian",   D = ... }                            (circle, for phases)
+#   { kind = "WrappedBrownian",   tau = ... }                          (circle, unbounded)
+#   { kind = "WrappedOrnsteinUhlenbeck", sigma = ..., tau = ..., mu = 0.0 }  (circle, pinned)
 #
 # Each hyperparameter is either a fixed `Real` or a *fitted* hyperparameter given by a
 # distribution spec (parsed with `parse_dist`, so the same Reactant-friendly `VLBI*`
 # variants are used — they are `<: Distributions.Distribution`, which is how `hyperprior`
 # recognizes a field as fitted). Like `parse_dist`, this is a closed allowlist: only
-# `OrnsteinUhlenbeck` and `WrappedBrownian` are constructible.
+# `OrnsteinUhlenbeck`, `WrappedBrownian`, `WrappedOrnsteinUhlenbeck`, and
+# `VonMisesProcess` are constructible.
 
 # A hyperparameter is a fixed number or a fitted distribution (a distribution spec table).
 _parse_hyper(x::Real) = Float64(x)
@@ -86,8 +88,19 @@ restricted to the closed allowlist:
   - `kind = "WrappedBrownian"` (alias `"wb"`): Brownian motion on the circle, the process
     to use for gain *phases* — its wrapped-normal transitions make the prior exactly
     `2π`-periodic, so the `2π`-shifted modes a real-line phase prior produces are all
-    equivalent. `D` is the phase diffusion coefficient in rad²/hr (`2/D` is the phase
-    coherence time in hours), again either a number or a distribution spec.
+    equivalent. `tau` is the phase coherence time in **hours** — the gap over which the
+    visibility-domain coherence `E[exp(iΔθ)]` falls by `1/e` — in the same units as the
+    `OrnsteinUhlenbeck` `tau`. Again either a number or a distribution spec.
+  - `kind = "WrappedOrnsteinUhlenbeck"` (alias `"wou"`): the mean-reverting process on
+    the circle (shortest-arc drift), for a phase pinned near a level — e.g. a gain-ratio
+    phase drifting about a separate offset term. `sigma` is the circular marginal spread
+    in radians, `tau` the reversion time in hours, `mu` an optional fixed circular mean.
+    Centered coordinates only.
+  - `kind = "VonMisesProcess"` (alias `"vm"`): the same mean-reverting circular process
+    with the shortest-arc drift replaced by the smooth sine drift, which additionally
+    supports the non-centered (whitened) coordinates — Comrade's default for it. Same
+    `sigma`/`tau`/`mu` as `WrappedOrnsteinUhlenbeck`, and a drop-in replacement for it in
+    its `σ ≪ π` regime of validity.
 
 Throws on an unknown process name or a missing hyperparameter.
 """
@@ -105,14 +118,50 @@ function parse_process(spec::AbstractDict)
             error("process 'mu' must be a fixed number (it is not fittable), got: $(repr(μraw))")
         return OrnsteinUhlenbeck(; σ = σ, τ = τ, μ = Float64(μraw))
     elseif name in ("WrappedBrownian", "wb")
-        check_config_keys(spec, ("kind", "D"), "a WrappedBrownian process spec")
-        haskey(spec, "D") || error(
-            "WrappedBrownian process spec is missing 'D', the phase diffusion coefficient " *
-                "in rad^2/hr (2/D is the coherence time in hours): $spec"
+        # `D` was the old (pre-tau) spelling; catch it with a conversion hint rather than
+        # letting check_config_keys report it as a generic unknown key.
+        haskey(spec, "D") && error(
+            "WrappedBrownian is parameterized by 'tau' (the coherence time in hours), not " *
+                "'D'. Convert with tau = 2/D — and note the truncation bounds inverting: " *
+                "an upper bound on D is a LOWER bound on tau. Got: $spec"
         )
-        return WrappedBrownian(; D = _parse_hyper(spec["D"]))
+        check_config_keys(spec, ("kind", "tau"), "a WrappedBrownian process spec")
+        haskey(spec, "tau") || error(
+            "WrappedBrownian process spec is missing 'tau', the phase coherence time in " *
+                "hours: $spec"
+        )
+        return WrappedBrownian(; τ = _parse_hyper(spec["tau"]))
+    elseif name in ("WrappedOrnsteinUhlenbeck", "wou")
+        check_config_keys(
+            spec, ("kind", "sigma", "tau", "mu"), "a WrappedOrnsteinUhlenbeck process spec"
+        )
+        haskey(spec, "sigma") || error("process spec is missing 'sigma': $spec")
+        haskey(spec, "tau") || error("process spec is missing 'tau': $spec")
+        μraw = get(spec, "mu", 0.0)
+        μraw isa Real || error(
+            "process 'mu' must be a fixed number (it is not fittable), got: $(repr(μraw))"
+        )
+        return WrappedOrnsteinUhlenbeck(;
+            σ = _parse_hyper(spec["sigma"]), τ = _parse_hyper(spec["tau"]), μ = Float64(μraw)
+        )
+    elseif name in ("VonMisesProcess", "vm")
+        check_config_keys(
+            spec, ("kind", "sigma", "tau", "mu"), "a VonMisesProcess process spec"
+        )
+        haskey(spec, "sigma") || error("process spec is missing 'sigma': $spec")
+        haskey(spec, "tau") || error("process spec is missing 'tau': $spec")
+        μraw = get(spec, "mu", 0.0)
+        μraw isa Real || error(
+            "process 'mu' must be a fixed number (it is not fittable), got: $(repr(μraw))"
+        )
+        return VonMisesProcess(;
+            σ = _parse_hyper(spec["sigma"]), τ = _parse_hyper(spec["tau"]), μ = Float64(μraw)
+        )
     else
-        error("unknown process '$name'. Allowed: OrnsteinUhlenbeck, WrappedBrownian")
+        error(
+            "unknown process '$name'. Allowed: OrnsteinUhlenbeck, " *
+                "WrappedBrownian, WrappedOrnsteinUhlenbeck, VonMisesProcess"
+        )
     end
 end
 
@@ -143,7 +192,15 @@ combinations that do not exist (e.g. `"stationary"` for a wrapped process).
 function parse_init(spec, process, where_::AbstractString)
     # `is_wrapped` is the trait Comrade dispatches its own init checks on, so a new circular
     # process picks up the right default here without touching this function.
-    isnothing(spec) && return Comrade.is_wrapped(process) ? UniformInit() : StationaryInit()
+    # A stationary process starts in its own stationary marginal whether or not it is
+    # wrapped — for `WrappedOrnsteinUhlenbeck` that is the wrapped normal WN(μ, σ²), NOT
+    # uniform. UniformInit is the stationary circular law only of an unbounded wrapped
+    # process (`WrappedBrownian`), and Comrade's `_check_init` accepts it for any wrapped
+    # process, so defaulting on `is_wrapped` alone would silently pick the wrong start.
+    if isnothing(spec)
+        Comrade.isstationary(process) && return StationaryInit()
+        return Comrade.is_wrapped(process) ? UniformInit() : StationaryInit()
+    end
     if spec isa AbstractString
         return _init_from_kind(String(spec), Dict{String, Any}(), where_)
     elseif spec isa AbstractDict

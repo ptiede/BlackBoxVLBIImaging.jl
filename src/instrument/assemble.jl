@@ -46,10 +46,14 @@ function _site_prior(t::AbstractDict, where_::AbstractString)
             "$where_ uses kind=\"gaussmarkov\", which needs a time segmentation " *
                 "(integ/scan/track), got seg=\"$(t["seg"])\""
         )
-        centered = Bool(get(t, "centered", false))
         process = parse_process(t["process"])
+        # Pass `centered` through only when the TOML sets it; otherwise Comrade's
+        # process-aware default applies — NonCentered (whitened) for every process that
+        # supports it, Centered for WrappedOrnsteinUhlenbeck, whose shortest-arc drift
+        # admits no running-sum form.
+        centered = haskey(t, "centered") ? Bool(t["centered"]) : nothing
         init = parse_init(get(t, "init", nothing), process, where_)
-        return GaussMarkovSitePrior(seg, process; centered = centered, init = init)
+        return GaussMarkovSitePrior(seg, process; centered, init)
     else
         error("$where_ has unknown site-prior kind '$kind'. Allowed: iid, gaussmarkov")
     end
