@@ -19,11 +19,15 @@ function _select_optimizer(strategy::FittingStrategy)
     end
 end
 
-function _run_benchmarks(post, strategy)
+# Benchmarks run in the latent space actually sampled: with a preconditioner configured,
+# `maybe_transport` composes it in front of the flat transform, so its per-eval cost (and,
+# on the Reactant path, its traceability) is measured here rather than discovered at
+# sampling time.
+function _run_benchmarks(post, strategy, transport_method)
     if strategy.use_reactant
-        return _run_reactant_benchmarks(post)
+        return _run_reactant_benchmarks(post, transport_method)
     end
-    tpost = asflat(post)
+    tpost = Comrade.maybe_transport(post, transport_method)
     x0 = randn(dimension(tpost))
     @info "Forward pass benchmark"
     show(IOContext(stdout), MIME("text/plain"), @benchmark logdensityof($tpost, $x0))
@@ -37,9 +41,9 @@ end
 # Benchmark the device forward pass and the Enzyme value+gradient used by `reactant_opt`.
 # The compiled programs execute synchronously and return concrete arrays, so `@benchmark`
 # of the call measures full device execution (compilation happens once, up front).
-function _run_reactant_benchmarks(post)
+function _run_reactant_benchmarks(post, transport_method)
     dpost = Comrade.prepare_device(post, Comrade.ComradeBase.ReactantEx())
-    tpost = asflat(dpost)
+    tpost = Comrade.maybe_transport(dpost, transport_method)
     xr = Reactant.to_rarray(Comrade.inverse(tpost, prior_sample(Random.default_rng(), dpost)))
     fwd = Reactant.@compile sync = true logdensityof(tpost, xr)
     vg = Reactant.@compile sync = true _reactant_value_and_grad(tpost, xr)
@@ -47,9 +51,12 @@ function _run_reactant_benchmarks(post)
     show(IOContext(stdout), MIME("text/plain"), @benchmark $fwd($tpost, $xr))
     println()
     @info "Reverse pass benchmark (Reactant)"
-    show(IOContext(stdout), MIME("text/plain"), @benchmark $vg($tpost, $xr))
+    brev = @benchmark $vg($tpost, $xr)
+    show(IOContext(stdout), MIME("text/plain"), brev)
     println()
-    return nothing
+    # median seconds per value+gradient: the leapfrog unit cost, used by the sampling
+    # callbacks to convert wall time per draw into leapfrogs (and thus tree depth)
+    return median(brev.times) * 1e-9
 end
 
 """
@@ -127,7 +134,21 @@ function _optimize_tempered(imgbase, skym, intm, data, imgdata, strategy, opt, r
     return xprev
 end
 
-function _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart)
+# `start` accepts either a serialized parameter file — a raw NamedTuple, or a run's
+# `_optimum_allres.jls` Dict carrying it under :xopt — or a MCMC DiskStore directory,
+# from which the LAST stored draw is used: a posterior sample lies in the typical set,
+# which a high-dimensional MAP does not.
+function _load_start(path)
+    if isdir(path)
+        ntot = deserialize(joinpath(path, "parameters.jls")).params.nsamples
+        return only(Comrade.postsamples(load_samples(path, ntot:ntot)))
+    end
+    x = deserialize(path)
+    x isa AbstractDict && return x[:xopt]
+    return x
+end
+
+function _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart, transport_method)
     integrator = Leapfrog(strategy.step_size)
     metric = DiagEuclideanMetric(dimension(tpost))
     kernel = HMCKernel(Trajectory{MultinomialTS}(integrator, GeneralisedNoUTurn()))
@@ -142,12 +163,12 @@ function _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart)
     trace = sample(
         rng, post, smplr, total;
         saveto = DiskStore(mkpath(out), 25), n_adapts = strategy.nadapt,
-        initial_params = xopt, restart = restart
+        initial_params = xopt, restart = restart, transport_method = transport_method
     )
     return trace, (strategy.nadapt + 1):10:total
 end
 
-function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase)
+function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, transport_method, tgrad = nothing)
     @info "Building Reactant device posterior for sampling"
     # Reuse the already-built posterior, just dropping the Enzyme AD mode: `prepare_device`
     # iterates every field and would try to `to_rarray` the admode, and the device computes
@@ -156,7 +177,8 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase)
     rpost = Comrade.prepare_device(post_cpu, Comrade.ComradeBase.ReactantEx())
     smplr = Comrade.ReactantNUTS(;
         n_adapts = strategy.nadapt, init_step_size = strategy.step_size,
-        max_tree_depth = strategy.max_tree_depth
+        max_tree_depth = strategy.max_tree_depth,
+        adapt_mass_matrix = strategy.adapt_mass_matrix
     )
 
     # `sample_checkpoint` sets the sampling DiskStore stride (= batch / checkpoint frequency,
@@ -164,11 +186,24 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase)
     stride = strategy.sample_checkpoint > 0 ? strategy.sample_checkpoint : strategy.chunk_size
     if strategy.sample_checkpoint > 0
         # Post-warmup per-batch checkpoint: render the latest draw and save FITS+PNG+resid.
+        # Tree depth is not exposed by the ProbProg backend (its diagnostics carry only
+        # the divergence flag), but wall time per draw divided by the benchmarked
+        # gradient time is the leapfrog count, and log2 of that is the depth. The first
+        # callback after a (re)compile is skipped — it includes compile time.
+        tlast = Ref(NaN)
+        depth_note = function (nsteps)
+            t = time()
+            dt = t - tlast[]
+            tlast[] = t
+            (isnan(dt) || isnothing(tgrad) || nsteps <= 0) && return ""
+            lf = dt / nsteps / tgrad
+            return " ~lf/step=$(round(Int, lf)) (depth≈$(round(log2(max(lf, 1)); digits = 1)))"
+        end
         cb = function (info)
             params = Comrade.Adapt.adapt(Array, info.params)
             save_checkpoint(post_cpu, params, gimg, imgbase, "sample_round$(info.round)")
             ndiv = count(info.numerical_error)
-            @info "sampling batch $(info.round)/$(info.nrounds): n_divergences=$ndiv (checkpoint saved)"
+            @info "sampling batch $(info.round)/$(info.nrounds): n_divergences=$ndiv$(depth_note(stride)) (checkpoint saved)"
             return (; info.round, n_divergences = ndiv)
         end
         # Warmup now runs in chunks of the same `stride`, and its callback fires after EVERY
@@ -177,20 +212,136 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase)
         # chunk (making warmup itself resumable via `restart`). The warmup `info` carries
         # `step`/`total` (steps done / n_adapts) plus host-side `step_size`/`params` — NOT the
         # sampling `round`/`nrounds` fields.
+        wstep = Ref(0)
         wcb = function (info)
             params = Comrade.Adapt.adapt(Array, info.params)
             save_checkpoint(post_cpu, params, gimg, imgbase, "warmup_step$(info.step)")
-            @info "warmup $(info.step)/$(info.total): step_size=$(info.step_size) (checkpoint saved)"
+            note = depth_note(info.step - wstep[])
+            wstep[] = info.step
+            @info "warmup $(info.step)/$(info.total): step_size=$(info.step_size)$note (checkpoint saved)"
             return (; info.step, info.total, info.step_size)
+        end
+        # Windowed in-run refits (Stan-style, with the full preconditioner fit as the
+        # window-end action): at each scheduled warmup step, refit from the run's OWN
+        # warmup log (augment carries the current transform; pairs/balance/stiff refit
+        # fresh), persist the new transform for restart safety, and hand the sampler the
+        # new transformed posterior to continue in. The metric freezes from the first
+        # refit on (see `warmup_chunked`).
+        refit_steps = if strategy.precond_refit_schedule == "stan"
+            # Stan-style doubling windows: structural refit at step 100, then refits at
+            # exponentially growing gaps (50, 100, 200, ...) until 85% of warmup. Early
+            # refits are frequent while the metric changes fast; late dual-averaging
+            # segments run uninterrupted for thousands of steps, exactly when step-size
+            # precision matters (each refit restarts dual averaging, so segment length
+            # IS the DA stabilization budget).
+            na = strategy.nadapt
+            steps = Int[100]
+            gap = 5 * stride
+            # Doubling gaps, capped at 30% of warmup: dual averaging converges within a
+            # few hundred steps, so each capped segment still settles the step size,
+            # while the metric keeps getting late refreshes from the richest windows.
+            cap = max(round(Int, 0.3 * na), 10 * stride)
+            while last(steps) + gap <= round(Int, 0.85 * na)
+                push!(steps, last(steps) + gap)
+                gap = min(2 * gap, cap)
+            end
+            steps
+        elseif strategy.precond_refit_schedule == "nutpie"
+            # nutpie's cadence (Seyboldt+ §3): updates from the very start of warmup.
+            # Structural refit at step 100 (~10 stored draws: pair set frozen, device
+            # buffers built, the run's one recompile), then in-place refits every chunk
+            # to 30% of warmup, every 8 chunks to 85%, step-size-only for the tail.
+            na = strategy.nadapt
+            sort!(unique(vcat(
+                collect(100:stride:round(Int, 0.3 * na)),
+                collect(round(Int, 0.3 * na):(8 * stride):round(Int, 0.85 * na)),
+            )))
+        else
+            sort!(unique(round.(Int, strategy.precond_refit_at .* strategy.nadapt)))
+        end
+        devpre = Ref{Any}(nothing)      # live device buffers, created at the first refit
+        devtpost = Ref{Any}(nothing)
+        pairset = Ref{Any}(nothing)     # pair layout frozen at the first refit
+        rankcap = Ref(0)                # current padded low-rank cap; grows as needed
+        rcache = BlackBoxVLBIImaging._new_refit_cache()   # draws/scores/score-fn, shared by all refits
+        refit = if isempty(refit_steps)
+            nothing
+        else
+            function (done, tpost_cur, params)
+                # too few draws to fit from -> skip this window quietly
+                nstored = deserialize(joinpath(out, "warmup", "parameters.jls")).params.nsamples
+                if nstored < 12
+                    @info "warmup refit at step $done skipped ($nstored stored draws)"
+                    return nothing
+                end
+                tlast[] = NaN   # the next chunk may recompile; skip its depth estimate
+                @info "Warmup refit at step $done: fitting preconditioner from the run's own warmup log"
+                # Windowed refits need only the true transient dropped (the run starts
+                # from a near-posterior draw): a few early draws, not a fraction — a
+                # fractional discard would starve the early fit windows.
+                pre = fit_preconditioner(
+                    joinpath(out, "warmup"), post;
+                    rank = strategy.precond_rank, nsamples = strategy.precond_nsamples,
+                    min_scale = strategy.precond_min_scale,
+                    discard = min(0.2, 3 / nstored),
+                    augment = true,   # load the previous transform as carry (fisher accumulates too)
+                    angle_pairs = strategy.precond_angle_pairs,
+                    grad_balance = strategy.precond_grad_balance,
+                    stiff_rank = strategy.precond_stiff_rank, grad_reactant = true,
+                    fisher = strategy.precond_fisher, pair_set = pairset[],
+                    refit_cache = rcache
+                )
+                serialize(joinpath(out, "transport.jls"), pre)
+                # position of the current draw in the new coordinates, via the CPU path.
+                # The callback hands over device-backed constrained params; bring them
+                # to host before running the CPU transform.
+                hostparams = Comrade.Adapt.adapt(Array, params)
+                xnew = Comrade.inverse(Comrade.maybe_transport(post, pre), hostparams)
+                nrank = length((pre isa AnglePairPreconditioner ? pre.pre : pre).s)
+                # Device buffers hold a fixed-shape padded low-rank block so most refits
+                # update in place. When a fit's rank exceeds the current padded cap,
+                # grow the cap 25% past it and rebuild — a structural swap (one
+                # recompile). This makes the cap dynamic rather than a hard ceiling.
+                grow = devpre[] !== nothing && nrank > rankcap[]
+                if devpre[] === nothing || grow
+                    rankcap[] = max(round(Int, 1.25 * nrank), 16)
+                    pre isa AnglePairPreconditioner && (pairset[] = (pre.i1, pre.i2))
+                    devpre[] = BlackBoxVLBIImaging._device_pre(pre; rank_cap = rankcap[])
+                    devtpost[] = Comrade.maybe_transport(rpost, devpre[])
+                    grow && @info "grew low-rank cap to $(rankcap[]) (fit rank $nrank); one recompile"
+                else
+                    BlackBoxVLBIImaging._update_device_pre!(devpre[], pre)
+                end
+                return (devtpost[], xnew)
+            end
+        end
+        # nutpie-style init: with windowed refits configured and no pilot transform,
+        # one score at the start point sets the initial diagonal metric — segment 0
+        # then starts pre-scaled instead of on a unit metric, and the compiled score
+        # program lands in the shared cache for every later refit.
+        if !isempty(refit_steps) && isnothing(transport_method) && !restart && !isnothing(xopt)
+            if !isempty(strategy.precond_seed_transport)
+                @info "Seeding transform from $(strategy.precond_seed_transport)"
+                transport_method = deserialize(strategy.precond_seed_transport)
+            else
+                @info "Initializing transform from the start point's score (nutpie-style)"
+                transport_method = BlackBoxVLBIImaging._score_init_pre(post, xopt, rcache; reactant = true)
+            end
         end
         disk = DiskStore(; name = mkpath(out), stride = stride, callback = cb)
         trace = sample(
             rpost, smplr, strategy.nsample;
-            saveto = disk, initial_params = xopt, restart = restart, warmup_callback = wcb
+            saveto = disk, initial_params = xopt, restart = restart, warmup_callback = wcb,
+            transport_method = transport_method,
+            warmup_refit = refit, warmup_refit_steps = refit_steps
         )
     else
         disk = DiskStore(mkpath(out), stride)
-        trace = sample(rpost, smplr, strategy.nsample; saveto = disk, initial_params = xopt, restart = restart)
+        trace = sample(
+            rpost, smplr, strategy.nsample;
+            saveto = disk, initial_params = xopt, restart = restart,
+            transport_method = transport_method
+        )
     end
     return trace.out, 1:10:strategy.nsample
 end
@@ -240,9 +391,27 @@ function comrade_imager(
         check_reactant_consistency(post, Comrade.prepare_device(post, Comrade.ComradeBase.ReactantEx()); rng = rng)
     end
 
-    if strategy.benchmark
-        _run_benchmarks(post, strategy)
+    # The preconditioner participates in every log-density evaluation, so it is fit
+    # before benchmarking. `sample` persists it to `<out>/transport.jls`; on restart the
+    # stored space wins, so refitting is skipped (a restart with a pilot configured
+    # would otherwise warn and be ignored).
+    transport_method = if isnothing(strategy.precond_pilot) || restart
+        nothing
+    else
+        @info "Fitting latent-space preconditioner from pilot run $(strategy.precond_pilot)"
+        fit_preconditioner(
+            strategy.precond_pilot, post;
+            rank = strategy.precond_rank, nsamples = strategy.precond_nsamples,
+            min_scale = strategy.precond_min_scale, discard = strategy.precond_discard,
+            augment = strategy.precond_augment, angle_pairs = strategy.precond_angle_pairs,
+            grad_balance = strategy.precond_grad_balance,
+            stiff_rank = strategy.precond_stiff_rank, fisher = strategy.precond_fisher,
+            # tune gradients on the same backend the run samples on
+            grad_reactant = strategy.use_reactant
+        )
     end
+
+    tgrad = strategy.benchmark ? _run_benchmarks(post, strategy, transport_method) : nothing
 
     g = post.skymodel.grid.imgdomain
     gimg = refinespatial(g, 2)
@@ -253,7 +422,7 @@ function comrade_imager(
         @info "Restarting from $(out)_optimum_allres.jls"
         xopt = deserialize(out * "_optimum_allres.jls")[:xopt]
     elseif !isnothing(strategy.start)
-        startx = deserialize(strategy.start)
+        startx = _load_start(strategy.start)
         @info "Starting from $(strategy.start); logdensity = $(logdensityof(post, startx))"
         xopt = startx
         save_optimal(imgbase, post, xopt, gimg; label = "start")
@@ -270,9 +439,9 @@ function comrade_imager(
 
     # ---- sampling --------------------------------------------------------------------
     if strategy.use_reactant
-        trace, range = _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase)
+        trace, range = _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, transport_method, tgrad)
     else
-        trace, range = _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart)
+        trace, range = _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart, transport_method)
     end
 
     chain = load_samples(trace, range)

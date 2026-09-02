@@ -85,8 +85,9 @@ end
 # wrapped prior avoids the 2π multimodality that a plain (unwrapped) Gauss-Markov level would
 # create, while the `gps`/`gpj` terms stay small and hence effectively unwrapped — give them
 # `init = { kind = "fixed", value = 0.0 }` in the TOML so their level does not trade off
-# against `gp0`. (A `WrappedBrownian` `gps` started uniform absorbs the offset itself, which
-# makes `gp0` redundant; use a tight `gp0` prior if you go that way.)
+# against `gp0`. (If you want the phases modeled on the circle instead — a `WrappedBrownian`
+# walk started uniform, which absorbs the offset itself and makes `gp0` redundant — use
+# [`gain_wrappedphase`](@ref) rather than bolting it onto this scheme.)
 # The amplitude has no periodicity, so `lgs` can carry its own level directly (no offset term).
 # Terms are identifiable by well-separated correlation times (fix the subscan τ short) and by
 # segmentation. Gain-ratio terms (`lgrat*`, `gprat*`) are single-timescale. Priors/segmentation
@@ -124,9 +125,9 @@ end
 #               needs the separate wrapped offset because the likelihood only sees exp(iφ): a
 #               proper wrapped prior on the full-circle level avoids the 2π multimodality a
 #               plain unwrapped level would create, while the pinned gps stays small and
-#               effectively unwrapped. A `WrappedBrownian` gps started uniform is the modern
-#               alternative — it is wrapped itself and absorbs the offset, making gp0
-#               redundant.
+#               effectively unwrapped. [`gain_wrappedphase`](@ref) is the modern alternative:
+#               one `WrappedBrownian` chain started uniform, wrapped itself, which absorbs
+#               the offset and so drops gp0 entirely.
 # Gain-ratio terms are single-timescale: a TrackSeg mean (`lgratμ`, `gpratμ`) plus a scan-level
 # Gauss-Markov deviation (`lgrat`, `gprat`). Unlike `gain_2timescale`, the amplitude ratio has
 # NO separate hierarchical scale (`lgratσ`) — the Gauss-Markov `lgrat` already carries its own
@@ -145,6 +146,94 @@ end
         gpratμ ~ priors.gpratμ
         g1 = exp(complex((lg1μ + lg1), (gp0 + gps)))
         g2 = g1 * exp(complex((lgratμ + lgrat), (gprat + gpratμ)))
+        return JonesG((g1, g2))
+    end
+end
+
+#     gain_wrappedphase(; priors)
+#
+# Gauss-Markov gain whose PHASES are a single wrapped random walk instead of a sum of
+# real-line terms:
+#   amplitude:  lg1 — ONE Gauss-Markov chain, the whole feed-1 log-amplitude. A stationary
+#               `OrnsteinUhlenbeck` reverts to its own (fixed) mean, so with `μ = 0` the
+#               prior says "gain ≈ nominal, with σ scatter correlated over τ" — which is
+#               exactly what a-priori amplitude calibration asserts. No separate offset term.
+#   phase:      gp1 — ONE chain, meant to be a `WrappedBrownian` process started uniform on
+#               the circle (`init` defaults to that for a wrapped process).
+#   ratio:      lgratμ (per-track mean) + lgrat (Gauss-Markov residual about it, carrying its
+#               own fitted σ, so there is no separate `lgratσ` scale); gpratμ (per-track
+#               gpratμ (per-track WRAPPED offset) + gprat (`WrappedOrnsteinUhlenbeck`).
+# The two phase terms are treated differently ON PURPOSE. gp1 is atmospheric and wanders
+# through many radians, so it must live on the circle: a `WrappedBrownian` started uniform.
+# gprat is instrumental: stable up to slow drift, so it wants a process that is circular AND
+# mean-reverting. A free wrapped walk has no restoring force and can drift to track the smooth
+# e^{2iφ(t)} field-rotation modulation that identifies the leakage terms; a stationary process
+# protects the d-terms in a way a Brownian one cannot. `WrappedOrnsteinUhlenbeck` is both, and
+# its σ — rather than an unbounded walk — sets how far the ratio phase may stray.
+# It does NOT replace `gpratμ`. Its stationary marginal is WN(μ, σ²) with μ fixed at 0 and not
+# fittable, so it pins the ratio phase near zero, whereas each station's R-L offset is an
+# arbitrary constant anywhere on the circle. σ cannot stand in for that: the process is only
+# valid for σ well below π. So gpratμ carries the level (flat, wrapped) and gprat the drift
+# about it — the circular analogue of lgratμ + lgrat, and for the same reason: the process
+# cannot fit its own mean.
+# The ratio keeps a fitted mean where the feed-1 amplitude does not, and the asymmetry is the
+# point: a-priori calibration already puts the feed-1 gain near nominal, so shrinking it
+# toward 0 is right, whereas the R-L offset is a real uncalibrated instrumental constant that
+# needs a free per-station mean. `OrnsteinUhlenbeck` cannot supply one itself — its `mu` is
+# fixed, not fittable — which is why lgratμ is a separate term.
+# This is the phase counterpart of the amplitude logic, and the reason it needs its own
+# scheme: the offset terms `gp0`/`gpratμ` that `gain_2timescale` and `gain_gaussmarkov` carry
+# exist only because an unwrapped (OU) phase chain cannot represent the full-circle level
+# without manufacturing 2π-shifted modes. A `WrappedBrownian` chain is exactly 2π-periodic
+# and its stationary circular law IS uniform, so a uniform start absorbs that level itself —
+# keeping a separate offset would just make the two redundant. For the same reason there is
+# only one phase drift term: Brownian motion has no stationary marginal, so two additive
+# wrapped walks would share one degenerate slow component rather than separating timescales
+# the way two OU chains with well-separated τ do.
+# Priors/segmentation for each term are set in the instrument TOML; this scheme only fixes
+# how they combine.
+@instrument function gain_wrappedphase(; priors)
+    return @jones begin
+        lg1 ~ priors.lg1       # amplitude: single mean-reverting chain (μ = 0 ⇒ nominal gain)
+        gp1 ~ priors.gp1       # phase: single wrapped walk (carries level AND drift)
+        lgratμ ~ priors.lgratμ # ratio amplitude: per-station mean (OU cannot fit its own)
+        lgrat ~ priors.lgrat   # ratio amplitude: residual about that mean
+        gpratμ ~ priors.gpratμ # ratio phase: per-station WRAPPED offset (arbitrary, on circle)
+        gprat ~ priors.gprat   # ratio phase: mean-reverting circular drift about it
+        g1 = exp(complex(lg1, gp1))
+        g2 = g1 * exp(complex((lgratμ + lgrat), (gpratμ + gprat)))
+        return JonesG((g1, g2))
+    end
+end
+
+#     gain_offsetphase(; priors)
+#
+# `gain_wrappedphase` with the feed-1 phase SPLIT into a per-track circular offset and a
+# per-stamp residual, the same decomposition the ratio phase uses (gpratμ + gprat):
+#   amplitude:  lg1 — as in `gain_wrappedphase`.
+#   phase:      gp1μ (per-track WRAPPED offset, one circular value per site) + gp1 (the
+#               per-stamp phase relative to it — typically an iid near-uniform
+#               DiagonalVonMises with `init = { kind = "fixed", value = 0.0 }`).
+#   ratio:      identical to `gain_wrappedphase`.
+# The split targets sampler geometry, not statistics: the posterior's soft direction is a
+# near-common motion of all of a site's phases (trading against image structure), and here
+# that motion is a single circular coordinate per site (gp1μ) instead of a coherent
+# rotation of every per-stamp phase. Identifiability needs two pins, both set in the TOML:
+# gp1's `init` fixes each site's first stamp so the offset cannot trade against a common
+# shift of the residuals, and a refant on gp1μ fixes one site's offset, which anchors the
+# global phase level the likelihood cannot see (a common shift of every site cancels in
+# g_i·conj(g_j) on the parallel hands).
+@instrument function gain_offsetphase(; priors)
+    return @jones begin
+        lg1 ~ priors.lg1       # amplitude: single mean-reverting chain (μ = 0 ⇒ nominal gain)
+        gp1μ ~ priors.gp1μ     # phase: per-station WRAPPED offset (arbitrary, on circle)
+        gp1 ~ priors.gp1       # phase: per-stamp value about it (first stamp pinned via init)
+        lgratμ ~ priors.lgratμ # ratio amplitude: per-station mean (OU cannot fit its own)
+        lgrat ~ priors.lgrat   # ratio amplitude: residual about that mean
+        gpratμ ~ priors.gpratμ # ratio phase: per-station WRAPPED offset (arbitrary, on circle)
+        gprat ~ priors.gprat   # ratio phase: mean-reverting circular drift about it
+        g1 = exp(complex(lg1, gp1μ + gp1))
+        g2 = g1 * exp(complex((lgratμ + lgrat), (gpratμ + gprat)))
         return JonesG((g1, g2))
     end
 end
@@ -242,6 +331,8 @@ const GAIN_SCHEMES = Dict{String, Any}(
     "gain_scanjitter" => gain_scanjitter,
     "gain_2timescale" => gain_2timescale,
     "gain_gaussmarkov" => gain_gaussmarkov,
+    "gain_wrappedphase" => gain_wrappedphase,
+    "gain_offsetphase" => gain_offsetphase,
     "gain_centered" => gain_centered,
     "gain_hier" => gain_hier,
     "gain_noratio" => gain_noratio,

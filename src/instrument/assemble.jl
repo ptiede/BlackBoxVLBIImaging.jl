@@ -36,7 +36,20 @@ function _site_prior(t::AbstractDict, where_::AbstractString)
     kind = String(get(t, "kind", "iid"))
     if kind == "iid"
         haskey(t, "dist") || error("$where_ is missing 'dist': $t")
-        return IIDSitePrior(seg, parse_dist(t["dist"]))
+        # For iid the only meaningful init is a fixed first-stamp pin — there is no chain
+        # whose start a distributional init could describe; see `IIDSitePrior`.
+        init = nothing
+        if haskey(t, "init")
+            ispec = t["init"]
+            ispec isa AbstractDict && String(get(ispec, "kind", "")) == "fixed" || error(
+                "$where_ init for kind=\"iid\" must be { kind = \"fixed\", value = x }, " *
+                    "got: $(t["init"])"
+            )
+            check_config_keys(ispec, ("kind", "value"), "$where_ [init]")
+            haskey(ispec, "value") || error("$where_ init kind=\"fixed\" needs a 'value'")
+            init = FixedInit(Float64(ispec["value"]))
+        end
+        return IIDSitePrior(seg, parse_dist(t["dist"]); init)
     elseif kind == "gaussmarkov"
         haskey(t, "process") ||
             error("$where_ has kind=\"gaussmarkov\" but is missing 'process': $t")

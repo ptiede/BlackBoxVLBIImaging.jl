@@ -2,6 +2,8 @@ using BlackBoxVLBIImaging
 using Test
 using TOML
 using Random
+using LinearAlgebra
+using Statistics: cov
 
 const EXDIR = normpath(joinpath(@__DIR__, "..", "examples"))
 exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
@@ -32,6 +34,8 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
             (:lg1, :gp1, :lgratμ, :lgratσ, :lgrat, :gprat, :gpratμ)
         @test BlackBoxVLBIImaging.required_params(BlackBoxVLBIImaging.LEAKAGE_SCHEMES["leakage_simple"]) ==
             (:d1re, :d1im, :d2re, :d2im)
+        @test BlackBoxVLBIImaging.required_params(BlackBoxVLBIImaging.GAIN_SCHEMES["gain_offsetphase"]) ==
+            (:lg1, :gp1μ, :gp1, :lgratμ, :lgrat, :gpratμ, :gprat)
     end
 
     @testset "instrument assembler" begin
@@ -45,6 +49,34 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         cfg2 = exconfig("instrument_mixed.toml")
         cfg2["gain"]["scheme"] = "nope"
         @test_throws ErrorException assemble_instrument(cfg2)
+    end
+
+    @testset "iid first-stamp pin (init)" begin
+        vm = Dict{String, Any}("dist" => "DiagonalVonMises", "args" => [0.0, 3.14159])
+        sp = BlackBoxVLBIImaging._site_prior(
+            Dict{String, Any}(
+                "seg" => "integ", "dist" => vm,
+                "init" => Dict{String, Any}("kind" => "fixed", "value" => 0.0),
+            ), "test"
+        )
+        @test sp isa IIDSitePrior
+        @test sp.init == FixedInit(0.0)
+        # no init -> nothing (the default, back-compatible path)
+        @test isnothing(
+            BlackBoxVLBIImaging._site_prior(
+                Dict{String, Any}("seg" => "integ", "dist" => vm), "test"
+            ).init
+        )
+        # only a fixed pin is meaningful for iid
+        @test_throws ErrorException BlackBoxVLBIImaging._site_prior(
+            Dict{String, Any}(
+                "seg" => "integ", "dist" => vm,
+                "init" => Dict{String, Any}("kind" => "uniform"),
+            ), "test"
+        )
+        @test_throws ArgumentError IIDSitePrior(
+            ScanSeg(), parse_dist(vm); init = UniformInit()
+        )
     end
 
     @testset "gauss-markov instrument priors" begin
@@ -344,6 +376,181 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         end
         @test err !== nothing
         @test !occursin("array", sprint(showerror, err))
+    end
+
+    @testset "low-rank preconditioner" begin
+        TV = BlackBoxVLBIImaging.TV
+        rng = Random.Xoshiro(42)
+        n, m = 24, 3
+        V = Matrix(qr(randn(rng, n, m)).Q)[:, 1:m]
+        b = randn(rng, n)
+        d = exp.(0.3 .* randn(rng, n))
+        s = [8.0, 4.0, 2.5]
+        p = LowRankPreconditioner(b, d, V, s)
+        A = Diagonal(d) * (I + V * Diagonal(s .- 1) * V')
+
+        z = randn(rng, n)
+        @test BlackBoxVLBIImaging._affine_fwd(p, z) ≈ b .+ A * z
+        @test BlackBoxVLBIImaging._affine_inv(p, BlackBoxVLBIImaging._affine_fwd(p, z)) ≈ z
+        @test BlackBoxVLBIImaging._affine_logdet(p) ≈ first(logabsdet(A))
+
+        @test_throws ArgumentError LowRankPreconditioner(b, d, randn(rng, n, m), s)
+        @test_throws ArgumentError LowRankPreconditioner(b, -d, V, s)
+        @test_throws DimensionMismatch LowRankPreconditioner(b[1:3], d, V, s)
+
+        # rank-0: pure diagonal standardization
+        p0 = LowRankPreconditioner(b, d, zeros(n, 0), Float64[])
+        @test BlackBoxVLBIImaging._affine_fwd(p0, z) ≈ b .+ d .* z
+        @test BlackBoxVLBIImaging._affine_logdet(p0) ≈ sum(log, d)
+
+        # TV node over an identity inner transform: x = b + A z, constant log-Jacobian
+        t = BlackBoxVLBIImaging.PreconditionedFlat(p, TV.as(Array, n))
+        x, ℓ, ix = TV.transform_with(TV.LogJac(), t, z, 1)
+        @test x ≈ b .+ A * z
+        @test ℓ ≈ first(logabsdet(A))
+        @test ix == n + 1
+        @test TV.inverse(t, x) ≈ z
+
+        # bounded inner transform: log-Jacobian is the inner's at (b + A z) plus the constant
+        tb = BlackBoxVLBIImaging.PreconditionedFlat(p, TV.as(Array, TV.as𝕀, n))
+        xb, ℓb, _ = TV.transform_with(TV.LogJac(), tb, z, 1)
+        xi, ℓi, _ = TV.transform_with(TV.LogJac(), TV.as(Array, TV.as𝕀, n), b .+ A * z, 1)
+        @test xb ≈ xi
+        @test ℓb ≈ ℓi + first(logabsdet(A))
+        @test TV.inverse(tb, xb) ≈ z
+
+        # estimation: a planted correlation ridge is found and whitened away
+        nd = 40
+        u = normalize(randn(rng, nd))
+        Σhalf = I + 9.0 * u * u'                       # sd 10 along u, 1 elsewhere
+        Z = Σhalf * randn(rng, nd, 4000)
+        pre = BlackBoxVLBIImaging._lowrank_from_draws(Z; rank = 4)
+        @test length(pre.s) == 1                       # only the planted direction survives
+        us = normalize(u ./ pre.d)                     # the ridge in standardized coordinates
+        @test abs(dot(pre.V[:, 1], us)) > 0.99
+        W = reduce(hcat, [BlackBoxVLBIImaging._affine_inv(pre, c) for c in eachcol(Z)])
+        # The correction removes the SOFT (large-eigenvalue) directions; the standardized
+        # correlation matrix also has genuinely small eigenvalues, which a top-only
+        # correction leaves alone, so assert only the upper end of the spectrum.
+        @test maximum(eigvals(Symmetric(cov(W; dims = 2)))) < 1.5   # planted λ ≈ 20 is gone
+        @test_throws ArgumentError BlackBoxVLBIImaging._lowrank_from_draws(
+            vcat(Z, zeros(1, 4000)); rank = 4
+        )
+
+        # few-draws regime (ndraws ≪ n): the spiked-model shrinkage finds the planted
+        # direction but tempers its scale, and pure noise yields no correction at all.
+        nf, Nf = 2000, 100
+        uf = normalize(randn(rng, nf))
+        Zf = (I + 7.0 * uf * uf') * randn(rng, nf, Nf)   # sd 8 along uf, 1 elsewhere
+        pf = BlackBoxVLBIImaging._lowrank_from_draws(Zf; rank = 8)
+        @test length(pf.s) == 1
+        @test 3.0 < only(pf.s) < 8.0                     # cross-validated below the true scale 8
+        @test abs(dot(pf.V[:, 1], normalize(uf ./ pf.d))) > 0.5
+        pn = @test_logs (:warn, r"diagonal-only") BlackBoxVLBIImaging._lowrank_from_draws(
+            randn(rng, nf, Nf); rank = 8
+        )
+        @test isempty(pn.s)
+
+        # drift guard: a direction the chain trends along (burn-in) is dropped, while a
+        # stationary planted spike in the same draws is kept.
+        ud = normalize(randn(rng, nf))
+        us = normalize(randn(rng, nf)); us .-= dot(us, ud) * ud; normalize!(us)
+        Zd = randn(rng, nf, Nf) .+ 6.0 * us * randn(rng, 1, Nf)
+        Zd .+= 20.0 * ud * collect(range(-1, 1, Nf))'
+        pd = @test_logs (:warn, r"trending") BlackBoxVLBIImaging._lowrank_from_draws(
+            Zd; rank = 8
+        )
+        @test all(abs.(pd.V' * normalize(ud ./ pd.d)) .< 0.3)
+        @test any(abs.(pd.V' * normalize(us ./ pd.d)) .> 0.5)
+
+        # carry (augment): a previous round's directions are kept and deflated out of
+        # detection, so a refit adds new structure instead of replacing what works.
+        uc = normalize(randn(rng, nf))
+        uc2 = normalize(randn(rng, nf)); uc2 .-= dot(uc2, uc) * uc; normalize!(uc2)
+        Zc = (I + 7.0 * uc * uc' + 5.0 * uc2 * uc2') * randn(rng, nf, Nf)
+        pc1 = BlackBoxVLBIImaging._lowrank_from_draws(Zc; rank = 1)
+        Zc2 = (I + 7.0 * uc * uc' + 5.0 * uc2 * uc2') * randn(rng, nf, Nf)
+        pc2 = BlackBoxVLBIImaging._lowrank_from_draws(Zc2; rank = 8, carry = pc1)
+        @test length(pc2.s) >= 2
+        @test opnorm(pc2.V' * pc2.V - I) < 1e-8
+        @test maximum(abs.(pc2.V' * normalize(uc ./ pc2.d))) > 0.5
+        @test maximum(abs.(pc2.V' * normalize(uc2 ./ pc2.d))) > 0.4
+        @test length(BlackBoxVLBIImaging._lowrank_from_draws(Zc2; rank = 1, carry = pc1).s) == 1
+
+        # angle-pair whitening: (sin, cos) pairs are detected from their unit-circle
+        # signature, wedge-aligned and rescaled; near-uniform (ring) pairs are skipped.
+        na = 30
+        Za = randn(rng, na, 400)
+        θa = 0.9 .+ 0.05 .* randn(rng, 400)
+        Za[21, :] .= sin.(θa); Za[22, :] .= cos.(θa)
+        θr = 2π .* rand(rng, 400)
+        Za[25, :] .= sin.(θr); Za[26, :] .= cos.(θr)
+        prea = BlackBoxVLBIImaging._lowrank_from_draws(Za; rank = 2)
+        pa = BlackBoxVLBIImaging._angle_pairs_from_draws(Za, prea)
+        @test pa isa AnglePairPreconditioner
+        @test pa.i1 == [21]                       # ring pair at 25:26 skipped
+        za = randn(rng, na)
+        @test BlackBoxVLBIImaging._affine_inv(pa, BlackBoxVLBIImaging._affine_fwd(pa, za)) ≈ za
+        Aa = reduce(hcat, [
+            BlackBoxVLBIImaging._affine_fwd(pa, Matrix(I, na, na)[:, k]) .-
+                BlackBoxVLBIImaging._affine_fwd(pa, zeros(na)) for k in 1:na
+        ])
+        @test BlackBoxVLBIImaging._affine_logdet(pa) ≈ first(logabsdet(Aa))
+        # true latents (radial jitter restored) whiten to ~unit isotropic in the pair
+        θt = 0.9 .+ 0.05 .* randn(rng, 2000)
+        rt = exp.(0.25 .* randn(rng, 2000))
+        Xt = repeat(BlackBoxVLBIImaging._affine_fwd(pa, zeros(na)), 1, 2000)
+        Xt[21, :] .= rt .* sin.(θt); Xt[22, :] .= rt .* cos.(θt)
+        Zt = reduce(hcat, [BlackBoxVLBIImaging._affine_inv(pa, c) for c in eachcol(Xt)])
+        Ct = cov(Zt[[21, 22], :]')
+        @test 0.5 < Ct[1, 1] < 2.0 && 0.5 < Ct[2, 2] < 2.0
+        @test abs(Ct[1, 2]) / sqrt(Ct[1, 1] * Ct[2, 2]) < 0.3
+
+        # gradient balance: _scale_rows divides the map's response on chosen coordinates
+        # by f — exactly for rows carrying no low-rank mass — through the diagonal for
+        # plain coordinates and through the block rows for angle pairs.
+        fb = ones(na); fb[21] = 5.0; fb[22] = 3.0; fb[15] = 7.0
+        pb = BlackBoxVLBIImaging._scale_rows(pa, fb)
+        Jb = reduce(hcat, [
+            BlackBoxVLBIImaging._affine_fwd(pb, Matrix{Float64}(I, na, na)[:, k]) .-
+                BlackBoxVLBIImaging._affine_fwd(pb, zeros(na)) for k in 1:na
+        ])
+        for i in (21, 22, 15)
+            @test Jb[i, :] ≈ Aa[i, :] ./ fb[i]
+        end
+        @test BlackBoxVLBIImaging._affine_logdet(pb) ≈ first(logabsdet(Jb))
+        @test BlackBoxVLBIImaging._affine_inv(pb, BlackBoxVLBIImaging._affine_fwd(pb, za)) ≈ za
+
+        # Fisher-divergence estimator: exact whitening in the N > d regime, large
+        # condition-number reduction (incl. stiff directions invisible to draw fits)
+        # in the N << d regime.
+        nfd = 12
+        dd = [100.0, 25.0, 9.0, 1e-4, 1e-2, 0.04, 1, 1, 1, 1, 1, 1]
+        Qf = Matrix(qr(randn(rng, nfd, nfd)).Q)
+        Σf = Symmetric(Qf * Diagonal(dd) * Qf')
+        Xf = sqrt(Σf) * randn(rng, nfd, 40) .+ randn(rng, nfd)
+        Gf = -(Σf \ (Xf .- mean(Xf; dims = 2)))
+        pf2 = BlackBoxVLBIImaging._fisher_lowrank(Xf, Gf; rank = 12, cutoff = 1.3)
+        Af = Diagonal(pf2.d) * (I + pf2.V * Diagonal(pf2.s .- 1) * pf2.V')
+        evf = eigvals(Symmetric(Af \ Matrix(Σf) / Af'))
+        @test maximum(evf) / minimum(evf) < 1.5          # exact regime: fully whitened
+        zf = randn(rng, nfd)
+        @test BlackBoxVLBIImaging._affine_inv(pf2, BlackBoxVLBIImaging._affine_fwd(pf2, zf)) ≈ zf
+
+        # fitting-config plumbing
+        strat = build_fitting_config(
+            Dict{String, Any}(
+                "precondition" => Dict{String, Any}("pilot" => "/tmp/pilotrun", "rank" => 8),
+            )
+        )
+        @test strat.precond_pilot == "/tmp/pilotrun"
+        @test strat.precond_rank == 8
+        @test strat.precond_nsamples == 2000
+        @test isnothing(strat.precond_min_scale)
+        @test isnothing(build_fitting_config(Dict{String, Any}()).precond_pilot)
+        @test_throws ErrorException build_fitting_config(
+            Dict{String, Any}("precondition" => Dict{String, Any}("minscale" => 2.0))
+        )
     end
 
     # Integration smoke test — runs only if the workshop test data is present.

@@ -52,6 +52,24 @@ function snap_grid_size(base, order::Int, nx::Int, ny::Int)
     return nx, ny
 end
 
+"""
+    _parse_pulse(s) -> Pulse
+
+Parse `[model] pulse`: the interpolation kernel that turns the pixel raster into a
+continuous sky model. Allowed: `delta` (default), `bspline0`, `bspline1`, `bspline3`,
+`bicubic`, `gaussian`, `raised_cosine`.
+"""
+function _parse_pulse(s::AbstractString)
+    s == "delta" && return DeltaPulse()
+    s == "bspline0" && return BSplinePulse{0}()
+    s == "bspline1" && return BSplinePulse{1}()
+    s == "bspline3" && return BSplinePulse{3}()
+    s == "bicubic" && return BicubicPulse()
+    s == "gaussian" && return Gaussian()
+    s == "raised_cosine" && return RaisedCosinePulse()
+    error("unknown pulse '$s'. Allowed: delta, bspline0, bspline1, bspline3, bicubic, gaussian, raised_cosine")
+end
+
 function _parse_polrep(s::AbstractString)
     s == "PolExp" && return PolExp()
     s == "Poincare" && return Poincare()
@@ -101,8 +119,12 @@ end
 function _build_mean_model(meancfg::AbstractDict, g, beam)
     mtype = String(get(meancfg, "type", "Bkgd"))
     if mtype == "GaussBkgd"
-        @info "Using a Gaussian background mean for the sky model"
-        return GaussBkgdMean(g)
+        fwhm0 = _mean_fwhm_rad(meancfg, beam, 50.0)
+        # Lower bound of the core-size prior comes from the data beam itself, not the
+        # (possibly rescaled) fwhm0; without data, fall back to fwhm0.
+        beam0 = isnothing(beam) ? fwhm0 : beam
+        @info "Using a Gaussian background mean for the sky model (core FWHM prior centered at $(round(rad2μas(fwhm0), digits = 1)) μas, lower bound $(round(rad2μas(0.25 * beam0), digits = 1)) μas)"
+        return GaussBkgdMean(g, fwhm0, beam0)
     elseif mtype == "Bkgd"
         fwhm = _mean_fwhm_rad(meancfg, beam, 50.0)
         @info "Using a background mean for the sky model (Gaussian FWHM = $(round(rad2μas(fwhm), digits = 1)) μas)"
@@ -114,6 +136,12 @@ function _build_mean_model(meancfg::AbstractDict, g, beam)
     elseif mtype == "Ring"
         @info "Using a ring mean for the sky model"
         return DblRingMean()
+    elseif mtype == "LyapunovRing"
+        @info "Using a Lyapunov double-ring mean for the sky model"
+        return LyapunovRingMean()
+    elseif mtype == "LyapunovRingJSU"
+        @info "Using a Lyapunov double-ring mean (JohnsonSU n=0) for the sky model"
+        return LyapunovRingJSUMean()
     elseif mtype == "TBlob"
         @info "Using a Student-t blob mean for the sky model"
         return TBlobMean()
@@ -123,7 +151,7 @@ function _build_mean_model(meancfg::AbstractDict, g, beam)
         mimg = intensitymap(modify(Gaussian(), Stretch(fwhm / fwhmfac)), g)
         return JetGauss(mimg ./ sum(mimg))
     else
-        error("unknown mean type '$mtype'. Allowed: GaussBkgd, Bkgd, Gauss, Ring, TBlob, JetGauss")
+        error("unknown mean type '$mtype'. Allowed: GaussBkgd, Bkgd, Gauss, Ring, LyapunovRing, LyapunovRingJSU, TBlob, JetGauss")
     end
 end
 
@@ -155,7 +183,7 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     model = get(cfg, "model", Dict{String, Any}())
     check_config_keys(grid, ("fovx", "fovy", "nx", "ny", "pa", "x0", "y0"), "[grid]")
     check_config_keys(
-        model, ("polrep", "order", "addgauss", "creg", "beamsize_beams", "beamsize"),
+        model, ("polrep", "order", "addgauss", "creg", "beamsize_beams", "beamsize", "pulse"),
         "[model]"
     )
     check_config_keys(
@@ -179,6 +207,7 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     polrep = sky_polrep(cfg)
     addg = Bool(get(model, "addgauss", false))
     creg = Bool(get(model, "creg", false))
+    pulse = _parse_pulse(String(get(model, "pulse", "delta")))
 
     # Random-field correlation length: from the data beam by default (× `beamsize_beams`),
     # `model.beamsize` (μas) overrides, 20 μas fallback only when no beam is available.
@@ -227,12 +256,12 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     skym = if base === GMRF
         ctor(
             g; meanmodel = mmodel, ftot = ftotpr, beamsize = corr_beam, order = order,
-            gaussprior = gaussp, center = Val(docenter)
+            gaussprior = gaussp, center = Val(docenter), pulse
         )
     else
         ctor(
             g; base = prepare_base(base, g, order), meanmodel = mmodel, ftot = ftotpr,
-            beamsize = corr_beam, gaussprior = gaussp, center = Val(docenter)
+            beamsize = corr_beam, gaussprior = gaussp, center = Val(docenter), pulse
         )
     end
     skym = @set skym.prior = apply_sky_overrides(skym.prior, overrides)

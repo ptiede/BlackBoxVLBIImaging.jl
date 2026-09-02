@@ -29,6 +29,60 @@ Base.@kwdef struct FittingStrategy
     max_tree_depth::Int = 10
     chunk_size::Int = 100
     base_window::Int = 25
+    # Welford diagonal metric adaptation during warmup (Reactant path). Turn OFF for
+    # preconditioned rounds: the metric adapts to marginal variances, which undoes any
+    # transform component that trades marginal against conditional width (gradient
+    # balance); with it off, the fitted preconditioner IS the metric and only the step
+    # size adapts. Keep ON for pilot rounds with no preconditioner.
+    adapt_mass_matrix::Bool = true
+    # preconditioning: before sampling, fit a low-rank affine reparameterization of the
+    # flat latent space from a pilot run's posterior draws (see `fit_preconditioner`),
+    # and sample in the preconditioned coordinates. `precond_pilot` is the pilot's MCMC
+    # DiskStore directory; `nothing` disables preconditioning.
+    precond_pilot::Union{Nothing, String} = nothing
+    precond_rank::Int = 16
+    precond_nsamples::Int = 2000
+    precond_min_scale::Union{Nothing, Float64} = nothing
+    precond_discard::Float64 = 0.0
+    # Carry the pilot's own preconditioner into the fit (see `fit_preconditioner`); set
+    # this whenever the pilot itself sampled preconditioned, so rounds accumulate.
+    precond_augment::Bool = false
+    # Per-pair 2×2 whitening of angle-embedded (sin, cos) latent pairs (see
+    # `_angle_pairs_from_draws`): aligns each well-measured phase's rotated wedge, which
+    # otherwise pins the step size at the tightest tangential width.
+    precond_angle_pairs::Bool = false
+    # Balance marginal vs conditional widths per coordinate using gradient evaluations
+    # at fit time (see `_grad_balance`); lifts the step-size cap set by ridge
+    # coordinates (marginally wide, conditionally pinned). Only effective with
+    # adapt_mass_matrix = false — Welford re-normalizes marginals and undoes it.
+    precond_grad_balance::Bool = false
+    # Stiff-direction corrections fit from the gradient covariance (see
+    # `_stiff_from_grads`); 0 disables. Rotated conditionally-tight directions cap the
+    # step size and are invisible to diagonals and draw fits. Like grad_balance, only
+    # effective with adapt_mass_matrix = false.
+    precond_stiff_rank::Int = 0
+    # In-run windowed refits (Reactant path): fractions of nadapt at which warmup pauses,
+    # refits the preconditioner from the run's own warmup log (augment carries the
+    # current transform), and continues in the new coordinates with the metric frozen.
+    # With this set, no pilot run is needed: launch once, segment 0 adapts Welford-style,
+    # the refits take over. Empty disables.
+    precond_refit_at::Vector{Float64} = Float64[]
+    # Refit schedule: "manual" uses refit_at; "nutpie" refits every chunk to 30% of
+    # warmup then every 8 chunks to 85% (Seyboldt+ §3 cadence); "stan" refits at
+    # doubling gaps from step 100 to 85% — fewer refits, with exponentially longer
+    # uninterrupted dual-averaging segments as warmup progresses (each refit restarts
+    # dual averaging, so late refits must be sparse for the step size to stabilize).
+    precond_refit_schedule::String = "manual"
+    # Fisher-divergence estimator (Seyboldt, Carlson & Carpenter 2026): one joint fit
+    # from draws AND scores, subsuming the wide/stiff/balance stages (angle_pairs still
+    # composes on top). Exact on the sampled subspace, so short refit windows work and
+    # augment is unnecessary. Requires adapt_mass_matrix = false to survive warmup.
+    precond_fisher::Bool = false
+    # Seed the windowed run from an existing transport.jls instead of the score-init
+    # diagonal: the fit then REFINES a known-good transform (e.g. a manual precond run
+    # that already found the wide image ridges) rather than discovering everything from
+    # a stuck chain. "" = score-init as usual.
+    precond_seed_transport::String = ""
     # run
     use_reactant::Bool = false
     benchmark::Bool = true
@@ -55,11 +109,13 @@ Parse a fitting-strategy TOML into a [`FittingStrategy`](@ref). Sections: `[opti
 """
 function build_fitting_config(cfg::AbstractDict)
     check_config_keys(
-        cfg, ("optimizer", "tempering", "sampler", "run"), "the fitting config (top level)"
+        cfg, ("optimizer", "tempering", "sampler", "precondition", "run"),
+        "the fitting config (top level)"
     )
     opt = get(cfg, "optimizer", Dict{String, Any}())
     temp = get(cfg, "tempering", Dict{String, Any}())
     samp = get(cfg, "sampler", Dict{String, Any}())
+    prec = get(cfg, "precondition", Dict{String, Any}())
     run = get(cfg, "run", Dict{String, Any}())
 
     check_config_keys(opt, ("method", "maxiters", "ntrials", "g_tol", "eta"), "[optimizer]")
@@ -69,8 +125,18 @@ function build_fitting_config(cfg::AbstractDict)
         (
             "nsample", "nadapt", "step_size", "target_accept", "init_buffer",
             "term_buffer", "max_tree_depth", "chunk_size", "base_window",
+            "adapt_mass_matrix",
         ),
         "[sampler]"
+    )
+    check_config_keys(
+        prec,
+        (
+            "pilot", "rank", "nsamples", "min_scale", "discard", "augment",
+            "angle_pairs", "grad_balance", "stiff_rank", "refit_at", "fisher",
+            "refit_schedule", "seed_transport",
+        ),
+        "[precondition]"
     )
     check_config_keys(
         run,
@@ -86,6 +152,10 @@ function build_fitting_config(cfg::AbstractDict)
 
     startval = get(run, "start", "")
     start = (startval == "") ? nothing : String(startval)
+
+    pilotval = get(prec, "pilot", "")
+    precond_pilot = (pilotval == "") ? nothing : String(pilotval)
+    precond_min_scale = haskey(prec, "min_scale") ? Float64(prec["min_scale"]) : nothing
 
     return FittingStrategy(
         opt_method = opt_method,
@@ -103,6 +173,20 @@ function build_fitting_config(cfg::AbstractDict)
         max_tree_depth = Int(get(samp, "max_tree_depth", 10)),
         chunk_size = Int(get(samp, "chunk_size", 100)),
         base_window = Int(get(samp, "base_window", 25)),
+        adapt_mass_matrix = Bool(get(samp, "adapt_mass_matrix", true)),
+        precond_pilot = precond_pilot,
+        precond_rank = Int(get(prec, "rank", 16)),
+        precond_nsamples = Int(get(prec, "nsamples", 2000)),
+        precond_min_scale = precond_min_scale,
+        precond_discard = Float64(get(prec, "discard", 0.0)),
+        precond_augment = Bool(get(prec, "augment", false)),
+        precond_angle_pairs = Bool(get(prec, "angle_pairs", false)),
+        precond_grad_balance = Bool(get(prec, "grad_balance", false)),
+        precond_stiff_rank = Int(get(prec, "stiff_rank", 0)),
+        precond_refit_at = Float64.(get(prec, "refit_at", Float64[])),
+        precond_fisher = Bool(get(prec, "fisher", false)),
+        precond_refit_schedule = String(get(prec, "refit_schedule", "manual")),
+        precond_seed_transport = String(get(prec, "seed_transport", "")),
         use_reactant = use_reactant,
         benchmark = Bool(get(run, "benchmark", true)),
         verify_reactant = Bool(get(run, "verify_reactant", false)),
