@@ -94,6 +94,6 @@ export build_sky_config, build_instrument_config, build_data_config, build_fitti
 export FittingStrategy
 # pipeline
 export comrade_imager, best_image, reactant_opt, load_chain_and_post, load_posterior, saveimgs, image_from_toml
-export LowRankPreconditioner, AnglePairPreconditioner, fit_preconditioner
+export LowRankPreconditioner, fit_preconditioner
 
 end

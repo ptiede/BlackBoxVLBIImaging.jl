@@ -213,9 +213,26 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
         # `step`/`total` (steps done / n_adapts) plus host-side `step_size`/`params` — NOT the
         # sampling `round`/`nrounds` fields.
         wstep = Ref(0)
+        # Base-flat draws, captured per warmup draw with their true radius. The sampler
+        # position is pushed through the CURRENT transport into base-flat coordinates —
+        # the same `_affine_fwd` the transform itself applies. The Fisher refit reads
+        # these so it fits the distribution the sampler actually explores; reconstructing
+        # a draw as `inverse(asflat, θ)` instead would collapse every angle pair onto the
+        # unit circle (radius exactly 1), a degenerate direction the chain never samples.
+        # Persisted one file per draw so a restarted warmup keeps the real draws.
+        flatdir = mkpath(joinpath(out, "warmup", "flatdraws"))
+        curpre = Ref{Any}(nothing)
+        nflat = Ref(length(readdir(flatdir)))
         wcb = function (info)
             params = Comrade.Adapt.adapt(Array, info.params)
             save_checkpoint(post_cpu, params, gimg, imgbase, "warmup_step$(info.step)")
+            sp = curpre[]
+            pos = vec(info.position)
+            xbf = isnothing(sp) ? collect(pos) :
+                BlackBoxVLBIImaging._affine_fwd(BlackBoxVLBIImaging._pre_for(sp, pos), pos)
+            nflat[] += 1
+            serialize(joinpath(flatdir, lpad(nflat[], 6, '0') * ".jls"), xbf)
+            rcache.draws[nflat[]] = xbf
             note = depth_note(info.step - wstep[])
             wstep[] = info.step
             @info "warmup $(info.step)/$(info.total): step_size=$(info.step_size)$note (checkpoint saved)"
@@ -261,7 +278,6 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
         end
         devpre = Ref{Any}(nothing)      # live device buffers, created at the first refit
         devtpost = Ref{Any}(nothing)
-        pairset = Ref{Any}(nothing)     # pair layout frozen at the first refit
         rankcap = Ref(0)                # current padded low-rank cap; grows as needed
         rcache = BlackBoxVLBIImaging._new_refit_cache()   # draws/scores/score-fn, shared by all refits
         refit = if isempty(refit_steps)
@@ -282,22 +298,24 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
                 pre = fit_preconditioner(
                     joinpath(out, "warmup"), post;
                     rank = strategy.precond_rank, nsamples = strategy.precond_nsamples,
-                    min_scale = strategy.precond_min_scale,
                     discard = min(0.2, 3 / nstored),
-                    augment = true,   # load the previous transform as carry (fisher accumulates too)
-                    angle_pairs = strategy.precond_angle_pairs,
-                    grad_balance = strategy.precond_grad_balance,
-                    stiff_rank = strategy.precond_stiff_rank, grad_reactant = true,
-                    fisher = strategy.precond_fisher, pair_set = pairset[],
+                    # No carry: the Fisher estimator is exact on each window's sampled
+                    # subspace, so it refits fresh. Carrying accumulates via a monotonic
+                    # max on wide scales, which in the N ≪ n regime locks in sampling
+                    # noise and ratchets the step size down over the run.
+                    augment = false, grad_reactant = true,
                     refit_cache = rcache
                 )
                 serialize(joinpath(out, "transport.jls"), pre)
+                # Draws from the next chunk on live in `pre`'s coordinates; capture their
+                # base-flat images through it.
+                curpre[] = pre
                 # position of the current draw in the new coordinates, via the CPU path.
                 # The callback hands over device-backed constrained params; bring them
                 # to host before running the CPU transform.
                 hostparams = Comrade.Adapt.adapt(Array, params)
                 xnew = Comrade.inverse(Comrade.maybe_transport(post, pre), hostparams)
-                nrank = length((pre isa AnglePairPreconditioner ? pre.pre : pre).s)
+                nrank = length(pre.s)
                 # Device buffers hold a fixed-shape padded low-rank block so most refits
                 # update in place. When a fit's rank exceeds the current padded cap,
                 # grow the cap 25% past it and rebuild — a structural swap (one
@@ -305,7 +323,6 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
                 grow = devpre[] !== nothing && nrank > rankcap[]
                 if devpre[] === nothing || grow
                     rankcap[] = max(round(Int, 1.25 * nrank), 16)
-                    pre isa AnglePairPreconditioner && (pairset[] = (pre.i1, pre.i2))
                     devpre[] = BlackBoxVLBIImaging._device_pre(pre; rank_cap = rankcap[])
                     devtpost[] = Comrade.maybe_transport(rpost, devpre[])
                     grow && @info "grew low-rank cap to $(rankcap[]) (fit rank $nrank); one recompile"
@@ -328,6 +345,7 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
                 transport_method = BlackBoxVLBIImaging._score_init_pre(post, xopt, rcache; reactant = true)
             end
         end
+        curpre[] = transport_method
         disk = DiskStore(; name = mkpath(out), stride = stride, callback = cb)
         trace = sample(
             rpost, smplr, strategy.nsample;
@@ -402,10 +420,7 @@ function comrade_imager(
         fit_preconditioner(
             strategy.precond_pilot, post;
             rank = strategy.precond_rank, nsamples = strategy.precond_nsamples,
-            min_scale = strategy.precond_min_scale, discard = strategy.precond_discard,
-            augment = strategy.precond_augment, angle_pairs = strategy.precond_angle_pairs,
-            grad_balance = strategy.precond_grad_balance,
-            stiff_rank = strategy.precond_stiff_rank, fisher = strategy.precond_fisher,
+            discard = strategy.precond_discard, augment = strategy.precond_augment,
             # tune gradients on the same backend the run samples on
             grad_reactant = strategy.use_reactant
         )

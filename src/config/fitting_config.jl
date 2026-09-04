@@ -42,25 +42,10 @@ Base.@kwdef struct FittingStrategy
     precond_pilot::Union{Nothing, String} = nothing
     precond_rank::Int = 16
     precond_nsamples::Int = 2000
-    precond_min_scale::Union{Nothing, Float64} = nothing
     precond_discard::Float64 = 0.0
     # Carry the pilot's own preconditioner into the fit (see `fit_preconditioner`); set
     # this whenever the pilot itself sampled preconditioned, so rounds accumulate.
     precond_augment::Bool = false
-    # Per-pair 2×2 whitening of angle-embedded (sin, cos) latent pairs (see
-    # `_angle_pairs_from_draws`): aligns each well-measured phase's rotated wedge, which
-    # otherwise pins the step size at the tightest tangential width.
-    precond_angle_pairs::Bool = false
-    # Balance marginal vs conditional widths per coordinate using gradient evaluations
-    # at fit time (see `_grad_balance`); lifts the step-size cap set by ridge
-    # coordinates (marginally wide, conditionally pinned). Only effective with
-    # adapt_mass_matrix = false — Welford re-normalizes marginals and undoes it.
-    precond_grad_balance::Bool = false
-    # Stiff-direction corrections fit from the gradient covariance (see
-    # `_stiff_from_grads`); 0 disables. Rotated conditionally-tight directions cap the
-    # step size and are invisible to diagonals and draw fits. Like grad_balance, only
-    # effective with adapt_mass_matrix = false.
-    precond_stiff_rank::Int = 0
     # In-run windowed refits (Reactant path): fractions of nadapt at which warmup pauses,
     # refits the preconditioner from the run's own warmup log (augment carries the
     # current transform), and continues in the new coordinates with the metric frozen.
@@ -73,11 +58,6 @@ Base.@kwdef struct FittingStrategy
     # uninterrupted dual-averaging segments as warmup progresses (each refit restarts
     # dual averaging, so late refits must be sparse for the step size to stabilize).
     precond_refit_schedule::String = "manual"
-    # Fisher-divergence estimator (Seyboldt, Carlson & Carpenter 2026): one joint fit
-    # from draws AND scores, subsuming the wide/stiff/balance stages (angle_pairs still
-    # composes on top). Exact on the sampled subspace, so short refit windows work and
-    # augment is unnecessary. Requires adapt_mass_matrix = false to survive warmup.
-    precond_fisher::Bool = false
     # Seed the windowed run from an existing transport.jls instead of the score-init
     # diagonal: the fit then REFINES a known-good transform (e.g. a manual precond run
     # that already found the wide image ridges) rather than discovering everything from
@@ -132,9 +112,8 @@ function build_fitting_config(cfg::AbstractDict)
     check_config_keys(
         prec,
         (
-            "pilot", "rank", "nsamples", "min_scale", "discard", "augment",
-            "angle_pairs", "grad_balance", "stiff_rank", "refit_at", "fisher",
-            "refit_schedule", "seed_transport",
+            "pilot", "rank", "nsamples", "discard", "augment",
+            "refit_at", "refit_schedule", "seed_transport",
         ),
         "[precondition]"
     )
@@ -155,7 +134,6 @@ function build_fitting_config(cfg::AbstractDict)
 
     pilotval = get(prec, "pilot", "")
     precond_pilot = (pilotval == "") ? nothing : String(pilotval)
-    precond_min_scale = haskey(prec, "min_scale") ? Float64(prec["min_scale"]) : nothing
 
     return FittingStrategy(
         opt_method = opt_method,
@@ -177,14 +155,9 @@ function build_fitting_config(cfg::AbstractDict)
         precond_pilot = precond_pilot,
         precond_rank = Int(get(prec, "rank", 16)),
         precond_nsamples = Int(get(prec, "nsamples", 2000)),
-        precond_min_scale = precond_min_scale,
         precond_discard = Float64(get(prec, "discard", 0.0)),
         precond_augment = Bool(get(prec, "augment", false)),
-        precond_angle_pairs = Bool(get(prec, "angle_pairs", false)),
-        precond_grad_balance = Bool(get(prec, "grad_balance", false)),
-        precond_stiff_rank = Int(get(prec, "stiff_rank", 0)),
         precond_refit_at = Float64.(get(prec, "refit_at", Float64[])),
-        precond_fisher = Bool(get(prec, "fisher", false)),
         precond_refit_schedule = String(get(prec, "refit_schedule", "manual")),
         precond_seed_transport = String(get(prec, "seed_transport", "")),
         use_reactant = use_reactant,
