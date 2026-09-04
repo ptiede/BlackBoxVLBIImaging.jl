@@ -168,6 +168,26 @@ function _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart, transport_
     return trace, (strategy.nadapt + 1):10:total
 end
 
+# The warmup metric strategy a fitting config asks for. A `[precondition]` refit schedule
+# selects the Fisher low-rank adaptor, which refits the latent space in-run and holds the
+# metric at identity; without one the sampler's own diagonal adaptation runs unless the
+# config turned it off (as it must be when a fitted transform is supplied up front, since
+# diagonal adaptation renormalizes the marginals the transform deliberately set).
+function _metric_adaptor(strategy::FittingStrategy)
+    sched = if strategy.precond_refit_schedule == "stan"
+        :stan
+    elseif strategy.precond_refit_schedule == "nutpie"
+        :nutpie
+    elseif !isempty(strategy.precond_refit_at)
+        strategy.precond_refit_at
+    else
+        nothing
+    end
+    isnothing(sched) && return strategy.adapt_mass_matrix ?
+        Comrade.WelfordDiagonal() : Comrade.FixedMetric()
+    return Comrade.FisherLowRank(; rank = strategy.precond_rank, schedule = sched)
+end
+
 function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, transport_method, tgrad = nothing)
     @info "Building Reactant device posterior for sampling"
     # Reuse the already-built posterior, just dropping the Enzyme AD mode: `prepare_device`
@@ -175,10 +195,11 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
     # its own gradients. This avoids rebuilding the instrument Jones matrices / FFT plans.
     post_cpu = @set post.admode = nothing
     rpost = Comrade.prepare_device(post_cpu, Comrade.ComradeBase.ReactantEx())
+    adaptor = _metric_adaptor(strategy)
     smplr = Comrade.ReactantNUTS(;
         n_adapts = strategy.nadapt, init_step_size = strategy.step_size,
         max_tree_depth = strategy.max_tree_depth,
-        adapt_mass_matrix = strategy.adapt_mass_matrix
+        metric_adaptor = adaptor
     )
 
     # `sample_checkpoint` sets the sampling DiskStore stride (= batch / checkpoint frequency,
@@ -213,145 +234,32 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
         # `step`/`total` (steps done / n_adapts) plus host-side `step_size`/`params` — NOT the
         # sampling `round`/`nrounds` fields.
         wstep = Ref(0)
-        # Base-flat draws, captured per warmup draw with their true radius. The sampler
-        # position is pushed through the CURRENT transport into base-flat coordinates —
-        # the same `_affine_fwd` the transform itself applies. The Fisher refit reads
-        # these so it fits the distribution the sampler actually explores; reconstructing
-        # a draw as `inverse(asflat, θ)` instead would collapse every angle pair onto the
-        # unit circle (radius exactly 1), a degenerate direction the chain never samples.
-        # Persisted one file per draw so a restarted warmup keeps the real draws.
-        flatdir = mkpath(joinpath(out, "warmup", "flatdraws"))
-        curpre = Ref{Any}(nothing)
-        nflat = Ref(length(readdir(flatdir)))
         wcb = function (info)
             params = Comrade.Adapt.adapt(Array, info.params)
             save_checkpoint(post_cpu, params, gimg, imgbase, "warmup_step$(info.step)")
-            sp = curpre[]
-            pos = vec(info.position)
-            xbf = isnothing(sp) ? collect(pos) :
-                BlackBoxVLBIImaging._affine_fwd(BlackBoxVLBIImaging._pre_for(sp, pos), pos)
-            nflat[] += 1
-            serialize(joinpath(flatdir, lpad(nflat[], 6, '0') * ".jls"), xbf)
-            rcache.draws[nflat[]] = xbf
             note = depth_note(info.step - wstep[])
             wstep[] = info.step
             @info "warmup $(info.step)/$(info.total): step_size=$(info.step_size)$note (checkpoint saved)"
             return (; info.step, info.total, info.step_size)
         end
-        # Windowed in-run refits (Stan-style, with the full preconditioner fit as the
-        # window-end action): at each scheduled warmup step, refit from the run's OWN
-        # warmup log (augment carries the current transform; pairs/balance/stiff refit
-        # fresh), persist the new transform for restart safety, and hand the sampler the
-        # new transformed posterior to continue in. The metric freezes from the first
-        # refit on (see `warmup_chunked`).
-        refit_steps = if strategy.precond_refit_schedule == "stan"
-            # Stan-style doubling windows: structural refit at step 100, then refits at
-            # exponentially growing gaps (50, 100, 200, ...) until 85% of warmup. Early
-            # refits are frequent while the metric changes fast; late dual-averaging
-            # segments run uninterrupted for thousands of steps, exactly when step-size
-            # precision matters (each refit restarts dual averaging, so segment length
-            # IS the DA stabilization budget).
-            na = strategy.nadapt
-            steps = Int[100]
-            gap = 5 * stride
-            # Doubling gaps, capped at 30% of warmup: dual averaging converges within a
-            # few hundred steps, so each capped segment still settles the step size,
-            # while the metric keeps getting late refreshes from the richest windows.
-            cap = max(round(Int, 0.3 * na), 10 * stride)
-            while last(steps) + gap <= round(Int, 0.85 * na)
-                push!(steps, last(steps) + gap)
-                gap = min(2 * gap, cap)
-            end
-            steps
-        elseif strategy.precond_refit_schedule == "nutpie"
-            # nutpie's cadence (Seyboldt+ §3): updates from the very start of warmup.
-            # Structural refit at step 100 (~10 stored draws: pair set frozen, device
-            # buffers built, the run's one recompile), then in-place refits every chunk
-            # to 30% of warmup, every 8 chunks to 85%, step-size-only for the tail.
-            na = strategy.nadapt
-            sort!(unique(vcat(
-                collect(100:stride:round(Int, 0.3 * na)),
-                collect(round(Int, 0.3 * na):(8 * stride):round(Int, 0.85 * na)),
-            )))
-        else
-            sort!(unique(round.(Int, strategy.precond_refit_at .* strategy.nadapt)))
-        end
-        devpre = Ref{Any}(nothing)      # live device buffers, created at the first refit
-        devtpost = Ref{Any}(nothing)
-        rankcap = Ref(0)                # current padded low-rank cap; grows as needed
-        rcache = BlackBoxVLBIImaging._new_refit_cache()   # draws/scores/score-fn, shared by all refits
-        refit = if isempty(refit_steps)
-            nothing
-        else
-            function (done, tpost_cur, params)
-                # too few draws to fit from -> skip this window quietly
-                nstored = deserialize(joinpath(out, "warmup", "parameters.jls")).params.nsamples
-                if nstored < 12
-                    @info "warmup refit at step $done skipped ($nstored stored draws)"
-                    return nothing
-                end
-                tlast[] = NaN   # the next chunk may recompile; skip its depth estimate
-                @info "Warmup refit at step $done: fitting preconditioner from the run's own warmup log"
-                # Windowed refits need only the true transient dropped (the run starts
-                # from a near-posterior draw): a few early draws, not a fraction — a
-                # fractional discard would starve the early fit windows.
-                pre = fit_preconditioner(
-                    joinpath(out, "warmup"), post;
-                    rank = strategy.precond_rank, nsamples = strategy.precond_nsamples,
-                    discard = min(0.2, 3 / nstored),
-                    # No carry: the Fisher estimator is exact on each window's sampled
-                    # subspace, so it refits fresh. Carrying accumulates via a monotonic
-                    # max on wide scales, which in the N ≪ n regime locks in sampling
-                    # noise and ratchets the step size down over the run.
-                    augment = false, grad_reactant = true,
-                    refit_cache = rcache
-                )
-                serialize(joinpath(out, "transport.jls"), pre)
-                # Draws from the next chunk on live in `pre`'s coordinates; capture their
-                # base-flat images through it.
-                curpre[] = pre
-                # position of the current draw in the new coordinates, via the CPU path.
-                # The callback hands over device-backed constrained params; bring them
-                # to host before running the CPU transform.
-                hostparams = Comrade.Adapt.adapt(Array, params)
-                xnew = Comrade.inverse(Comrade.maybe_transport(post, pre), hostparams)
-                nrank = length(pre.s)
-                # Device buffers hold a fixed-shape padded low-rank block so most refits
-                # update in place. When a fit's rank exceeds the current padded cap,
-                # grow the cap 25% past it and rebuild — a structural swap (one
-                # recompile). This makes the cap dynamic rather than a hard ceiling.
-                grow = devpre[] !== nothing && nrank > rankcap[]
-                if devpre[] === nothing || grow
-                    rankcap[] = max(round(Int, 1.25 * nrank), 16)
-                    devpre[] = BlackBoxVLBIImaging._device_pre(pre; rank_cap = rankcap[])
-                    devtpost[] = Comrade.maybe_transport(rpost, devpre[])
-                    grow && @info "grew low-rank cap to $(rankcap[]) (fit rank $nrank); one recompile"
-                else
-                    BlackBoxVLBIImaging._update_device_pre!(devpre[], pre)
-                end
-                return (devtpost[], xnew)
-            end
-        end
-        # nutpie-style init: with windowed refits configured and no pilot transform,
-        # one score at the start point sets the initial diagonal metric — segment 0
-        # then starts pre-scaled instead of on a unit metric, and the compiled score
-        # program lands in the shared cache for every later refit.
-        if !isempty(refit_steps) && isnothing(transport_method) && !restart && !isnothing(xopt)
+        # nutpie-style init: with in-run refits configured and no pilot transform, one
+        # score at the start point sets the initial diagonal metric, so warmup's first
+        # segment starts pre-scaled instead of on a unit metric.
+        if adaptor isa Comrade.FisherLowRank && isnothing(transport_method) &&
+                !restart && !isnothing(xopt)
             if !isempty(strategy.precond_seed_transport)
                 @info "Seeding transform from $(strategy.precond_seed_transport)"
                 transport_method = deserialize(strategy.precond_seed_transport)
             else
                 @info "Initializing transform from the start point's score (nutpie-style)"
-                transport_method = BlackBoxVLBIImaging._score_init_pre(post, xopt, rcache; reactant = true)
+                transport_method = Comrade._score_init_pre(post, xopt; reactant = true)
             end
         end
-        curpre[] = transport_method
         disk = DiskStore(; name = mkpath(out), stride = stride, callback = cb)
         trace = sample(
             rpost, smplr, strategy.nsample;
             saveto = disk, initial_params = xopt, restart = restart, warmup_callback = wcb,
-            transport_method = transport_method,
-            warmup_refit = refit, warmup_refit_steps = refit_steps
+            transport_method = transport_method
         )
     else
         disk = DiskStore(mkpath(out), stride)
