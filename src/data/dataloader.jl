@@ -14,9 +14,12 @@ function build_data_uvfits(
         trange = nothing,
         IF = nothing,
         polrep::PolRep = PolExp(),
+        conjugate::Bool = false,
+        ignore_feed_labels::Bool = false,
     )
 
     uvd = VLBIFiles.load(VLBIFiles.UVData, file)
+    ignore_feed_labels && force_circular_feed_labels!(uvd)
 
     if avg == "scan"
         tavg = VLBI.GapBasedScans()
@@ -56,7 +59,49 @@ function build_data_uvfits(
     end
 
     dvis = add_fractional_noise(dvis, ferr)
+    conjugate && (dvis = conjugate_data(dvis))
     return dvis
+end
+
+"""
+    force_circular_feed_labels!(uvd::VLBIFiles.UVData)
+
+Relabel every antenna's feeds as `(:R, :L)` so the file's `RR/LL/RL/LR` slots are read as-is
+for every baseline. Use this when the antenna table (POLTYA/POLTYB) marks some stations
+linear: VLBIFiles then translates their products to mixed labels (e.g. `YR`) that the Comrade
+extractor rejects, and the labels may not even be right. After loading, declare the linear
+stations with `[flags] corr_polbasis` (e.g. `{site = "AA", R = "X", L = "Y"}`), which is the
+single place the feed bookkeeping is meant to live. Only valid for circular-slot files.
+"""
+function force_circular_feed_labels!(uvd)
+    stokes = uvd.header.stokes
+    all(s -> s in (:RR, :LL, :RL, :LR), stokes) || error(
+        "ignore_feed_labels requires a file whose stokes axis is RR/LL/RL/LR; got $stokes"
+    )
+    for arr in uvd.ant_arrays, (id, ant) in pairs(arr.antennas)
+        ant.poltypes == (:R, :L) && continue
+        @info "ignore_feed_labels: $(ant.name) antenna-table feeds $(ant.poltypes) treated as (R, L)"
+        arr.antennas[id] = VLBIFiles.VLBIData.Antenna(;
+            name = ant.name, xyz = ant.xyz, mount_type = ant.mount_type,
+            poltypes = (:R, :L), feed_offsets = ant.feed_offsets,
+        )
+    end
+    return uvd
+end
+
+"""
+    conjugate_data(dvis) -> dvis
+
+Flip the Fourier-phase sign convention of every datum: uvfits written with the opposite
+convention (e.g. FITS-IDI-style phases vs. the AIPS/ehtim convention Comrade assumes) store
+`V(-u,-v)` under the `(u,v)` label, i.e. the Hermitian adjoint of the coherency matrix (the
+complex conjugate for a Stokes I visibility). Also transposes the noise matrix so the
+RL/LR entries follow their measurements. Closure phases change sign under this operation.
+"""
+function conjugate_data(dvis::Comrade.EHTObservationTable{T}) where {T}
+    meas = map(adjoint, dvis.measurement)
+    noise = map(transpose, dvis.noise)
+    return Comrade.EHTObservationTable{T}(meas, noise, dvis.config)
 end
 
 """

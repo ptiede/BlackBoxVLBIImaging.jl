@@ -28,9 +28,18 @@ end
 function _reactant_opt_step!(opt_state, tpost, x)
     grad, val = _reactant_value_and_grad(tpost, x)
     new_state, new_x = Optimisers.update!(opt_state, x, grad)
-    # 4th return: the gradient ∞-norm, used for `comrade_opt`-style `g_tol` early-stopping.
-    return new_state, new_x, val, maximum(abs, grad)
+    # 4th return: the gradient itself. Its ∞-norm (for `comrade_opt`-style `g_tol`
+    # early-stopping) is computed by the separately compiled `_grad_infnorm` — a full
+    # reduction over `grad` fused into THIS program is miscompiled for some parameter
+    # layouts (EHT 2026 epoch 3881, dim 103104: CUDA_ERROR_ILLEGAL_ADDRESS on the first
+    # execution, for `maximum(abs, grad)` and `sum(abs2, grad)` alike, regardless of
+    # donation, command buffers or deterministic ops), while the same reduction over the
+    # returned buffer in its own program is fine.
+    return new_state, new_x, val, grad
 end
+
+# Gradient ∞-norm as its own compiled program (see `_reactant_opt_step!`).
+_grad_infnorm(g) = maximum(abs, g)
 
 """
     check_reactant_consistency(post::VLBIPosterior, dpost; x=nothing, rtol=1e-2,
@@ -123,6 +132,7 @@ function reactant_opt(
     xr = Reactant.to_rarray(Comrade.inverse(tpost, _start()))
     opt_state = Reactant.@jit Optimisers.setup(optimiser, xr)
     step_jit = Reactant.@compile _reactant_opt_step!(opt_state, tpost, xr)
+    gnorm_jit = Reactant.@compile _grad_infnorm(xr)   # grad has x's shape
 
     best_x_flat = nothing
     best_loss = Inf
@@ -132,11 +142,11 @@ function reactant_opt(
             opt_state = Reactant.@jit Optimisers.setup(optimiser, xr)   # fresh optimizer per pass
             loss = nothing
             for i in 1:passmax
-                opt_state, xr, loss, gnorm = step_jit(opt_state, tpost, xr)
+                opt_state, xr, loss, grad = step_jit(opt_state, tpost, xr)
                 # Log and check `g_tol` convergence at the same cadence (both read device
                 # scalars to the host, forcing a sync — so we avoid doing it every iteration).
                 if i == 1 || i % log_stride == 0 || i == passmax
-                    gn = Reactant.@allowscalar Float64(gnorm)
+                    gn = Reactant.@allowscalar Float64(gnorm_jit(grad))
                     @info "reactant_opt trial $t/$nstarts pass $p/$npass iter $i: -logdensity = $(Reactant.@allowscalar Float64(loss)) |g|∞ = $gn"
                     if gn < g_tol
                         @info "reactant_opt trial $t/$nstarts pass $p/$npass converged at iter $i (|g|∞ = $gn < g_tol = $g_tol)"

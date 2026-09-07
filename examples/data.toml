@@ -14,6 +14,12 @@ format = "auto"      # auto | uvfits | dlist (auto infers from the file extensio
 avg = "scan"         # "scan" or a number of seconds (e.g. "60")
 ferr = 0.005         # fractional systematic noise added to the coherencies
 keep_trange = []     # [] = all; or [lo, hi] UT decimal hours to restrict to at load
+# uvfits-only switches for files written with other conventions (both default to false):
+#   conjugate = true          flips the phase-sign convention (e.g. FITS-IDI-style phases);
+#                             closure phases change sign.
+#   ignore_feed_labels = true read RR/LL/RL/LR as circular for every station even when the
+#                             antenna table marks some linear; then declare those stations
+#                             in [flags] corr_polbasis.
 
 # --- flagging (closed schema; see src/data/flagtable.jl) ------------------------------
 [flags]

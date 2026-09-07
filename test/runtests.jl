@@ -378,6 +378,55 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test !occursin("array", sprint(showerror, err))
     end
 
+    @testset "uvfits convention switches" begin
+        # `conjugate` / `ignore_feed_labels` are accepted [data] keys: a config using them must
+        # get past key validation and fail only on the missing file.
+        dcfg = Dict{String, Any}(
+            "paths" => Dict{String, Any}("file" => "definitely_missing.uvfits", "path_mode" => "cwd"),
+            "data" => Dict{String, Any}("format" => "uvfits", "conjugate" => true, "ignore_feed_labels" => true),
+        )
+        err = try
+            build_data_config(dcfg)
+            nothing
+        catch e
+            e
+        end
+        @test err !== nothing
+        @test !occursin("unknown", lowercase(sprint(showerror, err)))
+        @test_throws ErrorException build_data_config(Dict{String, Any}(
+            "paths" => Dict{String, Any}("file" => "x.uvfits", "path_mode" => "cwd"),
+            "data" => Dict{String, Any}("conjugat" => true),
+        ))
+
+        # End-to-end on a mixed-feed, opposite-convention file when it is available locally.
+        domfile = "/mnt/ptiede/Research/EHT2026/data/DomData/calibration/2026-03-13/calibrated_M87_Jy.uvfits"
+        if isfile(domfile)
+            # the raw file marks ALMA linear, which the extractor refuses
+            @test_throws ErrorException build_data_uvfits(domfile, nothing)
+            raw = build_data_uvfits(domfile, nothing; ignore_feed_labels = true)
+            conj_ = build_data_uvfits(domfile, nothing; ignore_feed_labels = true, conjugate = true)
+            @test all(Comrade.measurement(conj_) .== adjoint.(Comrade.measurement(raw)))
+            @test all(Comrade.noise(conj_) .== transpose.(Comrade.noise(raw)))
+            @test all(pb -> pb == (CirBasis(), CirBasis()), datatable(arrayconfig(raw)).polbasis)
+            cfg = Dict{String, Any}(
+                "paths" => Dict{String, Any}("file" => domfile, "path_mode" => "cwd"),
+                "data" => Dict{String, Any}("conjugate" => true, "ignore_feed_labels" => true),
+                "flags" => Dict{String, Any}("corr_polbasis" => Any[Dict("site" => "AA", "R" => "X", "L" => "Y")]),
+            )
+            dcoh = build_data_config(cfg)
+            dt = datatable(arrayconfig(dcoh))
+            for r in dt
+                for (s, pb) in zip(r.sites, r.polbasis)
+                    @test pb == (s == :AA ? PolBasis{XPol, YPol}() : CirBasis())
+                end
+            end
+            # Stokes I path: conjugation is a plain complex conjugate
+            vi = build_data_uvfits(domfile, nothing; ignore_feed_labels = true, polrep = TotalIntensity())
+            vc = build_data_uvfits(domfile, nothing; ignore_feed_labels = true, conjugate = true, polrep = TotalIntensity())
+            @test Comrade.measurement(vc) == conj.(Comrade.measurement(vi))
+        end
+    end
+
     @testset "preconditioner config plumbing" begin
         # The preconditioner itself (transform, Fisher estimator, `fit_preconditioner`)
         # lives in Comrade and is tested there; this covers the TOML -> kwargs mapping.

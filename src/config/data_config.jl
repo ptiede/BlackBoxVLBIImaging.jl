@@ -28,8 +28,12 @@ default). Sections:
   data file's own mount metadata. dlist requires it (it builds the antenna table from it).
 - `[data]` — `format` (`"auto"`/`"uvfits"`/`"dlist"`), `avg`, `ferr`, `IF` (1-based single
   intermediate-frequency selection for a multi-IF UVFITS file; omit it for the frequency-
-  averaged band), and `keep_trange` (a single `[lo, hi]` UT-hour window the data is restricted
-  to at load; `[]` = keep all).
+  averaged band), `keep_trange` (a single `[lo, hi]` UT-hour window the data is restricted
+  to at load; `[]` = keep all), `conjugate` (uvfits only; `true` flips the phase-sign
+  convention of the file, see [`conjugate_data`](@ref)), and `ignore_feed_labels` (uvfits
+  only; `true` reads the RR/LL/RL/LR slots as circular for every station regardless of the
+  antenna table, see [`force_circular_feed_labels!`](@ref); declare linear stations with
+  `[flags] corr_polbasis` instead).
 - `[flags]` — the flag-table keys consumed by [`parse_flagtable`](@ref), including
   `drop_tranges` (UT-hour windows to remove). `keep_trange` selects; `drop_tranges` removes.
 """
@@ -54,7 +58,10 @@ function build_data_config(
     array = haskey(paths, "array") ? _resolve(String(paths["array"])) : nothing
 
     dat = get(cfg, "data", Dict{String, Any}())
-    check_config_keys(dat, ("format", "avg", "ferr", "IF", "keep_trange"), "[data]")
+    check_config_keys(
+        dat, ("format", "avg", "ferr", "IF", "keep_trange", "conjugate", "ignore_feed_labels"),
+        "[data]"
+    )
     fmt = String(get(dat, "format", "auto"))
     fmt = fmt == "auto" ? _infer_format(file) : fmt
     avg = string(get(dat, "avg", "scan"))
@@ -64,12 +71,18 @@ function build_data_config(
     # `IF` (1-based, matching Julia indexing) selects a single intermediate frequency from a
     # multi-IF UVFITS file; omit it to keep the frequency-averaged band. dlist files have no IFs.
     IF = haskey(dat, "IF") ? Int(dat["IF"]) : nothing
+    conjugate = Bool(get(dat, "conjugate", false))
+    ignore_feed_labels = Bool(get(dat, "ignore_feed_labels", false))
 
     @info "Loading $fmt data: $file"
     if fmt == "uvfits"
-        dcoh = build_data_uvfits(file, array; avg, ferr, trange = keep_trange, IF, polrep)
+        dcoh = build_data_uvfits(
+            file, array; avg, ferr, trange = keep_trange, IF, polrep, conjugate, ignore_feed_labels
+        )
     elseif fmt == "dlist"
         isnothing(IF) || @warn "data.IF is set but dlist files have no IFs; ignoring."
+        conjugate && @warn "data.conjugate is set but only supported for uvfits; ignoring."
+        ignore_feed_labels && @warn "data.ignore_feed_labels is set but only applies to uvfits; ignoring."
         dcoh = build_data_dlist(file, array; avg, ferr, trange = keep_trange, polrep)
     else
         error("unknown data format '$fmt'. Allowed: uvfits, dlist (or 'auto')")

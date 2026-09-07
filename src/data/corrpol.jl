@@ -16,7 +16,13 @@ function corpol(::PolBasis{F1, F2}, mapping) where {F1, F2}
     return PolBasis{typeof(corrected1), typeof(corrected2)}()
 end
 
-function corr_polbasis(dcoh, site::Symbol, mapping)
+# Rebuild a datum type with a new baseline-datum type (the polbasis relabel changes it).
+_with_baseline(::Type{Comrade.EHTCoherencyDatum{S, B, M, E}}, ::Type{B2}) where {S, B, M, E, B2} =
+    Comrade.EHTCoherencyDatum{S, B2, M, E}
+_with_baseline(::Type{Comrade.EHTVisibilityDatum{P, S, B}}, ::Type{B2}) where {P, S, B, B2} =
+    Comrade.EHTVisibilityDatum{P, S, B2}
+
+function corr_polbasis(dcoh::Comrade.EHTObservationTable{D}, site::Symbol, mapping) where {D}
     dt = map(datatable(dcoh.config)) do row
         bl = row.sites
         pb = row.polbasis
@@ -34,7 +40,7 @@ function corr_polbasis(dcoh, site::Symbol, mapping)
     dt3 = Comrade.StructArray(dt2, unwrap = (T -> (T <: Tuple || T <: Comrade.AbstractBaselineDatum || T <: Comrade.SArray || T <: NamedTuple)))
     conf2 = Comrade.rebuild(dcoh.config, dt3)
 
-    T = Comrade.EHTCoherencyDatum{eltype(real(dcoh[1].measurement)), eltype(dt3), eltype(dcoh.measurement), eltype(dcoh.noise)}
+    T = _with_baseline(D, eltype(dt3))
     return Comrade.EHTObservationTable{T}(dcoh.measurement, dcoh.noise, conf2)
 end
 

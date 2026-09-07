@@ -85,7 +85,7 @@ export Poincare, PolExp, TotalIntensity, Matern, MarkovRF, NonCenteredMRF
 export GaussMean, DblRingMean, DblRingWBkgd, TBlobMean, JetGauss, GaussBkgdMean, MimgPlusBkg
 # data layer
 export read_flagtable, parse_flagtable, apply_flagtable, corr_polbasis
-export read_dlist, read_array_table, build_data_uvfits, build_data_dlist
+export read_dlist, read_array_table, build_data_uvfits, build_data_dlist, conjugate_data
 # instrument assembler
 export assemble_instrument, parse_dist, parse_process, parse_init
 # config layer
