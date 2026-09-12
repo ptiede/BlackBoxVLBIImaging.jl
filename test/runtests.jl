@@ -166,6 +166,50 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         )
         @test build_instrument_config(cfg) isa InstrumentModel
 
+        # refant kinds: Multi names several sites, for a parameter carrying more than one
+        # gauge freedom
+        @test BlackBoxVLBIImaging._parse_refant(nothing) === NoReference()
+        @test BlackBoxVLBIImaging._parse_refant(Dict{String, Any}("kind" => "SEFD", "val" => 0.0)) isa
+            SEFDReference
+        @test BlackBoxVLBIImaging._parse_refant(
+            Dict{String, Any}("kind" => "Single", "site" => "AA", "val" => 0.0)
+        ) isa SingleReference
+        rm = BlackBoxVLBIImaging._parse_refant(
+            Dict{String, Any}("kind" => "Multi", "sites" => ["AA", "LM"], "val" => 0.0)
+        )
+        @test rm isa MultiReference
+        @test rm.sites == [:AA, :LM]
+        @test rm.value == 0.0
+        @test_throws "requires a 'sites' list" BlackBoxVLBIImaging._parse_refant(
+            Dict{String, Any}("kind" => "Multi")
+        )
+        @test_throws "'sites' to be a list" BlackBoxVLBIImaging._parse_refant(
+            Dict{String, Any}("kind" => "Multi", "sites" => "AA")
+        )
+        @test_throws "None, SEFD, Single, Multi" BlackBoxVLBIImaging._parse_refant(
+            Dict{String, Any}("kind" => "Manny", "sites" => ["AA"])
+        )
+        cfgm = exconfig("instrument_mixed.toml")
+        cfgm["priors"]["gp1"]["refant"] =
+            Dict{String, Any}("kind" => "Multi", "sites" => ["AA", "LM"], "val" => 0.0)
+        @test build_instrument_config(cfgm) isa InstrumentModel
+
+        # gauge = "phase" marks a parameter as one summand of the station phase, and the
+        # top-level gaugefix says what to do when the summands leave it under-determined
+        cfgg = exconfig("instrument_mixed.toml")
+        cfgg["priors"]["gp1"]["gauge"] = "phase"
+        intg = build_instrument_config(cfgg)
+        @test intg isa InstrumentModel
+        @test intg.prior.gp1.gauge === :phase
+        @test intg.gaugefix === :error
+        cfgg["gaugefix"] = "pin"
+        @test build_instrument_config(cfgg).gaugefix === :pin
+        cfgg["gaugefix"] = "ignore"
+        @test_throws "Allowed: error, pin" build_instrument_config(cfgg)
+        delete!(cfgg, "gaugefix")
+        cfgg["priors"]["gp1"]["gauge"] = "amplitude"
+        @test_throws "Allowed: none, phase" build_instrument_config(cfgg)
+
         # a WrappedBrownian phase chain (the correlated replacement for the iid phase = true
         # cumulative walk), with a per-site override that carries its own init
         cfgw = exconfig("instrument_mixed.toml")

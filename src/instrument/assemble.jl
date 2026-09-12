@@ -5,7 +5,7 @@
 
 function _parse_refant(spec)
     isnothing(spec) && return NoReference()
-    check_config_keys(spec, ("kind", "val", "site"), "a refant spec")
+    check_config_keys(spec, ("kind", "val", "site", "sites"), "a refant spec")
     kind = String(get(spec, "kind", "None"))
     if kind == "None"
         return NoReference()
@@ -14,8 +14,14 @@ function _parse_refant(spec)
     elseif kind == "Single"
         haskey(spec, "site") || error("refant kind='Single' requires a 'site'")
         return SingleReference(Symbol(spec["site"]), Float64(get(spec, "val", 0.0)))
+    elseif kind == "Multi"
+        haskey(spec, "sites") || error("refant kind='Multi' requires a 'sites' list")
+        sites = spec["sites"]
+        sites isa AbstractVector ||
+            error("refant kind='Multi' needs 'sites' to be a list, got: $sites")
+        return MultiReference(map(Symbol, sites), Float64(get(spec, "val", 0.0)))
     else
-        error("unknown refant kind '$kind'. Allowed: None, SEFD, Single")
+        error("unknown refant kind '$kind'. Allowed: None, SEFD, Single, Multi")
     end
 end
 
@@ -75,12 +81,21 @@ end
 function _build_array_prior(pcfg::AbstractDict, name::AbstractString)
     check_config_keys(
         pcfg,
-        ("kind", "seg", "dist", "process", "init", "centered", "phase", "refant", "overrides"),
+        (
+            "kind", "seg", "dist", "process", "init", "centered", "phase", "gauge",
+            "refant", "overrides",
+        ),
         "[priors.$name]",
     )
     default = _site_prior(pcfg, "[priors.$name]")
     phase = Bool(get(pcfg, "phase", false))
     refant = _parse_refant(get(pcfg, "refant", nothing))
+    # `gauge = "phase"` declares this parameter one summand of the absolute station phase,
+    # which the top-level `gaugefix` then checks for leftover flat directions.
+    gaugestr = String(get(pcfg, "gauge", "none"))
+    gaugestr in ("none", "phase") ||
+        error("[priors.$name] has unknown gauge '$gaugestr'. Allowed: none, phase")
+    gauge = Symbol(gaugestr)
 
     overrides = get(pcfg, "overrides", Dict{String, Any}())
     # Site overrides replace only the site prior, so `phase`/`refant` are not accepted here
@@ -108,7 +123,7 @@ function _build_array_prior(pcfg::AbstractDict, name::AbstractString)
         )
     end
 
-    return ArrayPrior(default; refant = refant, phase = phase, ovr...)
+    return ArrayPrior(default; refant = refant, phase = phase, gauge, ovr...)
 end
 
 """
@@ -116,12 +131,15 @@ end
 
 Build a Comrade `InstrumentModel` from a parsed instrument TOML. `cfg` must contain a
 `[gain]` section with a `scheme`, an optional `[leakage]` section, an optional
-`frcal` flag, and a `[priors]` table with one entry per parameter required by the
-chosen gain (and leakage) scheme. Throws if any required prior is missing.
+`frcal` flag, an optional `gaugefix` (`"error"` or `"pin"`, what to do when the priors
+declared `gauge = "phase"` leave the station phase under-determined), and a `[priors]`
+table with one entry per parameter required by the chosen gain (and leakage) scheme.
+Throws if any required prior is missing.
 """
 function assemble_instrument(cfg::AbstractDict)
     check_config_keys(
-        cfg, ("gain", "leakage", "frcal", "priors"), "the instrument config (top level)"
+        cfg, ("gain", "leakage", "frcal", "gaugefix", "priors"),
+        "the instrument config (top level)"
     )
 
     haskey(cfg, "gain") || error("instrument config needs a [gain] section")
@@ -147,6 +165,11 @@ function assemble_instrument(cfg::AbstractDict)
 
     frcal = Bool(get(cfg, "frcal", false))
 
+    gaugefixstr = String(get(cfg, "gaugefix", "error"))
+    gaugefixstr in ("error", "pin") ||
+        error("unknown gaugefix '$gaugefixstr' in the instrument config. Allowed: error, pin")
+    gaugefix = Symbol(gaugefixstr)
+
     required = Symbol[required_params(gctor)..., required_params(lctor)...]
     priors = get(cfg, "priors", Dict{String, Any}())
     missing_params = filter(p -> !haskey(priors, String(p)), required)
@@ -164,12 +187,13 @@ function assemble_instrument(cfg::AbstractDict)
     @info "Instrument: gain=$gname leakage=$lname frcal=$frcal nparams=$(length(required))"
 
     gm = gctor(; priors = intprior)
-    lctor === nothing && return gm
+    lctor === nothing &&
+        return InstrumentModel(gm.jones, gm.prior; refbasis = gm.refbasis, gaugefix)
 
     # Compose the gain and leakage pieces (each an InstrumentModel over its own tilde
     # parameters) into G*D*R with the feed-rotation term, merging their priors.
     dm = lctor(; priors = intprior)
     sw = frcal ? sandwich_withfrcal : sandwich
     J = JonesSandwich(sw, gm.jones, dm.jones, JonesR(; add_fr = true))
-    return InstrumentModel(J, merge(gm.prior, dm.prior); refbasis = gm.refbasis)
+    return InstrumentModel(J, merge(gm.prior, dm.prior); refbasis = gm.refbasis, gaugefix)
 end
