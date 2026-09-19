@@ -255,6 +255,10 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
                 transport_method = Comrade._score_init_pre(post, xopt; reactant = true)
             end
         end
+        # The sampling DiskStore records wall time per draw; with the cost of one gradient
+        # stored next to it, leapfrog steps per draw (and so tree depth) can be recovered
+        # from the run directory alone.
+        isnothing(tgrad) || serialize(joinpath(mkpath(out), "gradient_time.jls"), tgrad)
         disk = DiskStore(; name = mkpath(out), stride = stride, callback = cb)
         trace = sample(
             rpost, smplr, strategy.nsample;
