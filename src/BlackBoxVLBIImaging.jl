@@ -82,6 +82,7 @@ export poincare_gmrf, poincare_matern
 export polexp_gmrf, polexp_ncmrf, polexp_matern, polexp_markovrf
 export sky_constructor, genmeanprior, gengaussprior, apply_sky_overrides
 export Poincare, PolExp, TotalIntensity, Matern, MarkovRF, NonCenteredMRF
+export UniformRhoPrior, LogNormalRhoPrior, markov_rho_prior
 export GaussMean, DblRingMean, DblRingWBkgd, TBlobMean, JetGauss, GaussBkgdMean, MimgPlusBkg
 # data layer
 export read_flagtable, parse_flagtable, apply_flagtable, corr_polbasis

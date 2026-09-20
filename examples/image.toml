@@ -25,6 +25,15 @@ polrep = "PolExp"
 # Note: PolExp and TotalIntensity support all of these; "Poincare" supports only order 1 or 0.
 order = 2
 
+# --- correlation-length prior of a Markov RF expansion (order < 0 only) ----------------
+# An order-N Markov RF carries one correlation length ρₙ per term of its amplitude spectrum,
+# in pixels:
+#   "uniform"   – flat on [0.1, max(nx, ny)] for every term (default)
+#   "lognormal" – log-normal, so the sampler's unconstrained coordinate is log ρ with a
+#                 Gaussian prior: term 1 about half the larger grid dimension (log-sd 1.0),
+#                 terms n ≥ 2 about the data beam in pixels (log-sd 0.7)
+# rho_prior = "uniform"
+
 # add an over-resolved Gaussian component (a wide Gaussian fit alongside the raster, for
 # large-scale flux outside the FOV). Enables the g*/p*g override parameters.
 addgauss = false

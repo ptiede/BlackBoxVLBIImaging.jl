@@ -86,6 +86,54 @@ prepare_base(ps::MarkovRF, grid, order) = SRF(ps, StationaryRandomFieldPlan(grid
 
 markov_order(::MarkovRF{N}) where {N} = N
 
+# --- Markov-field correlation-length priors -----------------------------------------------
+# A `MarkovRF` field of order `N` has amplitude spectrum `1/sqrt(1 + Σₙ (ρₙ² k²)ⁿ)`, so each
+# term `n = 1 … N` carries its own correlation length `ρₙ` in pixels. The markers below pick
+# the prior family; `markov_rho_prior` turns one into the `NTuple` of per-term priors the
+# `@sky` bodies sample. `build_sky_config` selects the marker from `[model] rho_prior`.
+
+"""Correlation-length prior that is flat in `ρ` across the grid."""
+struct UniformRhoPrior end
+
+"""
+Log-normal correlation-length prior: the unconstrained (flat) coordinate is `log ρ`, so the
+sampler sees a Gaussian.
+"""
+struct LogNormalRhoPrior end
+
+# `LogNormal(log(med), logsd)`, built as the `exp` pushforward of a `VLBIGaussian` rather than
+# `Distributions.LogNormal`: the pushforward's flat transform is `exp` wrapped around the
+# Gaussian's own (identity) transform, so the unconstrained coordinate is exactly `log ρ`, and
+# both the density and that transform are branchless and trace under Reactant.
+_lognormal(med, logsd) = PT.PushforwardDistribution(exp, VLBIGaussian(log(med), logsd))
+
+"""
+    markov_rho_prior(kind, grid, beamsize, order::Int; kwargs...) -> NTuple{order}
+
+The per-term correlation-length priors of an order-`order` Markov random field on `grid`, in
+pixels. `kind` is the family marker:
+
+  - [`UniformRhoPrior`](@ref): every term is uniform on `[lower, max(size(grid)...)]`.
+  - [`LogNormalRhoPrior`](@ref): term 1 is log-normal with median `median_first` — half the
+    larger grid dimension, the largest structure the field can carry — and log-sd
+    `logsd_first`; terms `n ≥ 2` are log-normal with median `median_rest`, the data beam
+    `beamsize` in pixels, and the tighter log-sd `logsd_rest`. The unconstrained coordinate
+    of every term is `log ρ`.
+"""
+function markov_rho_prior(::UniformRhoPrior, grid, beamsize, order::Int; lower = 0.1)
+    return ntuple(Returns(VLBIUniform(lower, 1.0 * max(size(grid)...))), order)
+end
+
+function markov_rho_prior(
+        ::LogNormalRhoPrior, grid, beamsize, order::Int;
+        median_first = max(size(grid)...) / 2, logsd_first = 1.0,
+        median_rest = beamsize / step(grid.X), logsd_rest = 0.7
+    )
+    return ntuple(order) do n
+        return n == 1 ? _lognormal(median_first, logsd_first) : _lognormal(median_rest, logsd_rest)
+    end
+end
+
 # --- shared image builders (unchanged math) ------------------------------------------------
 @inline function make_stokesi(ftot, mimg, δ)
     stokesi = apply_fluctuations(CenteredLR(), mimg, δ)
@@ -186,10 +234,10 @@ end
 end
 
 # Stokes-I imaging with an order-`N` Markov power-spectrum stationary field (`order < 0`).
-@sky function stokesi_markovrf(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function stokesi_markovrf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
     c ~ VLBIImagePriors.std_dist(base.plan)
     σ ~ VLBITruncated(VLBIGaussian(0.0, 1.0); lower = 0.0)
-    ρs ~ ntuple(Returns(VLBIUniform(0.1, 1.0 * max(size(grid)...))), markov_order(base.ps))
+    ρs ~ markov_rho_prior(rhoprior, grid, beamsize, markov_order(base.ps))
     mean ~ genmeanprior(meanmodel)
     flux ~ _flux_prior(ftot)
     gauss ~ gaussprior
@@ -382,7 +430,7 @@ end
 end
 
 # PolExp polarized imaging with order-`N` Markov power-spectrum stationary fields (`order < 0`).
-@sky function polexp_markovrf(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function polexp_markovrf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
     a ~ VLBIImagePriors.std_dist(base.plan)
     b ~ VLBIImagePriors.std_dist(base.plan)
     c ~ VLBIImagePriors.std_dist(base.plan)
@@ -391,10 +439,10 @@ end
     σb ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
     σc ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
     σd ~ VLBITruncated(VLBIGaussian(0.0, 0.1); lower = 0.0)
-    ρa ~ ntuple(Returns(VLBIUniform(0.1, max(size(grid)...))), markov_order(base.ps))
-    ρb ~ ntuple(Returns(VLBIUniform(0.1, max(size(grid)...))), markov_order(base.ps))
-    ρc ~ ntuple(Returns(VLBIUniform(0.1, max(size(grid)...))), markov_order(base.ps))
-    ρd ~ ntuple(Returns(VLBIUniform(0.1, max(size(grid)...))), markov_order(base.ps))
+    ρa ~ markov_rho_prior(rhoprior, grid, beamsize, markov_order(base.ps))
+    ρb ~ markov_rho_prior(rhoprior, grid, beamsize, markov_order(base.ps))
+    ρc ~ markov_rho_prior(rhoprior, grid, beamsize, markov_order(base.ps))
+    ρd ~ markov_rho_prior(rhoprior, grid, beamsize, markov_order(base.ps))
     mean ~ genmeanprior(meanmodel)
     flux ~ _flux_prior(ftot)
     gauss ~ gaussprior

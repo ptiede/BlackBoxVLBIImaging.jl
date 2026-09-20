@@ -4,6 +4,7 @@ using TOML
 using Random
 using LinearAlgebra
 using Statistics: cov
+using Distributions: LogNormal, logpdf
 
 const EXDIR = normpath(joinpath(@__DIR__, "..", "examples"))
 exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
@@ -377,6 +378,62 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test (nx == 63) && (ny == 63)
         # GMRF order 1 snaps to a product of small primes
         @test BlackBoxVLBIImaging.snap_grid_size(GMRF, 1, 23, 23) == (24, 24)
+    end
+
+    @testset "Markov RF correlation-length prior" begin
+        # A small order-3 Markov RF grid: three correlation lengths per field, nx = ny = 32
+        # already FFT-friendly so the prior bounds are the configured pixel counts.
+        function markovcfg(; kwargs...)
+            cfg = exconfig("image.toml")
+            cfg["grid"]["nx"] = 32
+            cfg["grid"]["ny"] = 32
+            cfg["model"]["order"] = -3
+            for (k, v) in kwargs
+                cfg["model"][String(k)] = v
+            end
+            return cfg
+        end
+
+        # default: uniform on [0.1, max(nx, ny)] pixels for every term
+        skyu, _ = build_sky_config(markovcfg())
+        @test length(skyu.prior.ρa) == 3
+        for ρ in skyu.prior.ρa
+            @test minimum(ρ) == 0.1
+            @test maximum(ρ) == 32.0
+        end
+
+        # lognormal: term 1 about half the larger grid dimension with log-sd 1.0, terms
+        # n ≥ 2 about the data beam in pixels with log-sd 0.7
+        skyl, _ = build_sky_config(markovcfg(rho_prior = "lognormal"))
+        beam_px = μas2rad(20.0) / step(skyl.grid.X)
+        @test logpdf(skyl.prior.ρa[1], 7.0) ≈ logpdf(LogNormal(log(16.0), 1.0), 7.0)
+        for n in 2:3
+            @test logpdf(skyl.prior.ρa[n], 7.0) ≈ logpdf(LogNormal(log(beam_px), 0.7), 7.0)
+        end
+        @test skyl.prior.ρb == skyl.prior.ρc == skyl.prior.ρd == skyl.prior.ρa
+
+        # the Stokes-I Markov constructor takes the same option (its field is `ρs`)
+        skyi, _ = build_sky_config(markovcfg(polrep = "TotalIntensity", rho_prior = "lognormal"))
+        @test logpdf(skyi.prior.ρs[1], 7.0) ≈ logpdf(LogNormal(log(16.0), 1.0), 7.0)
+
+        # the sampler's unconstrained coordinate of a log-normal ρ is log ρ
+        t = BlackBoxVLBIImaging.PT.transport_node(skyl.prior.ρa[1], BlackBoxVLBIImaging.PT.TVFlat())
+        @test BlackBoxVLBIImaging.TV.transform(t, [log(7.0)]) ≈ 7.0
+        @test only(BlackBoxVLBIImaging.TV.inverse(t, 7.0)) ≈ log(7.0)
+
+        # the model still evaluates at a draw from the log-normal prior
+        pr = Comrade.NamedDist(skyl.prior)
+        x = rand(Random.default_rng(), pr)
+        @test isfinite(logpdf(pr, x))
+        @test all(isfinite, stokes(intensitymap(skyl.f(x, skyl.metadata), skyl.grid), :I))
+
+        # an unknown family, and a family set where there is no ρ to put it on
+        @test_throws "unknown rho_prior 'loggaussian'" build_sky_config(
+            markovcfg(rho_prior = "loggaussian")
+        )
+        @test_throws "rho_prior sets the correlation-length prior" build_sky_config(
+            markovcfg(rho_prior = "lognormal", order = 1)
+        )
     end
 
     @testset "data product from polrep" begin

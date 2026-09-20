@@ -70,6 +70,19 @@ function _parse_pulse(s::AbstractString)
     error("unknown pulse '$s'. Allowed: delta, bspline0, bspline1, bspline3, bicubic, gaussian, raised_cosine")
 end
 
+"""
+    _parse_rho_prior(s) -> rho-prior marker
+
+Parse `[model] rho_prior`: the prior family for the correlation lengths of a Markov RF
+expansion (`order < 0`). Allowed: `uniform` (default), `lognormal`. See
+[`markov_rho_prior`](@ref) for what each family is.
+"""
+function _parse_rho_prior(s::AbstractString)
+    s == "uniform" && return UniformRhoPrior()
+    s == "lognormal" && return LogNormalRhoPrior()
+    error("unknown rho_prior '$s'. Allowed: uniform, lognormal")
+end
+
 function _parse_polrep(s::AbstractString)
     s == "PolExp" && return PolExp()
     s == "Poincare" && return Poincare()
@@ -174,6 +187,10 @@ passes it so the random-field correlation length and the mean-Gaussian width are
 data rather than hand-tuned. The random-field correlation length defaults to `model.beamsize_beams`
 × `beam` (1× by default); an explicit `model.beamsize` (μas) overrides. When `beam` is `nothing`
 (building the sky standalone, without data) the legacy 20 μas / `fwhm` defaults are used.
+
+`model.rho_prior` picks the prior family for the per-term correlation lengths of a Markov RF
+expansion (`order < 0`): `"uniform"` (default) or `"lognormal"`. It applies to no other base,
+so setting it alongside a different `order` is an error.
 """
 function build_sky_config(cfg::AbstractDict; beam = nothing)
     check_config_keys(
@@ -183,7 +200,8 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     model = get(cfg, "model", Dict{String, Any}())
     check_config_keys(grid, ("fovx", "fovy", "nx", "ny", "pa", "x0", "y0"), "[grid]")
     check_config_keys(
-        model, ("polrep", "order", "addgauss", "creg", "beamsize_beams", "beamsize", "pulse"),
+        model,
+        ("polrep", "order", "addgauss", "creg", "beamsize_beams", "beamsize", "pulse", "rho_prior"),
         "[model]"
     )
     check_config_keys(
@@ -208,6 +226,18 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     addg = Bool(get(model, "addgauss", false))
     creg = Bool(get(model, "creg", false))
     pulse = _parse_pulse(String(get(model, "pulse", "delta")))
+
+    # `rho_prior` only reaches the Markov-expansion constructors; with any other base it
+    # would be accepted and then silently ignored.
+    if haskey(model, "rho_prior") && !(base isa MarkovRF)
+        error(
+            "[model] rho_prior sets the correlation-length prior of a Markov RF expansion " *
+                "(order < 0), but order = $order selects $base, which has no such parameter"
+        )
+    end
+    rhoprior = _parse_rho_prior(String(get(model, "rho_prior", "uniform")))
+    base isa MarkovRF &&
+        @info "Markov RF correlation-length prior: $(nameof(typeof(rhoprior)))"
 
     # Random-field correlation length: from the data beam by default (× `beamsize_beams`),
     # `model.beamsize` (μas) overrides, 20 μas fallback only when no beam is available.
@@ -257,6 +287,12 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
         ctor(
             g; meanmodel = mmodel, ftot = ftotpr, beamsize = corr_beam, order = order,
             gaussprior = gaussp, center = Val(docenter), pulse
+        )
+    elseif base isa MarkovRF
+        ctor(
+            g; base = prepare_base(base, g, order), meanmodel = mmodel, ftot = ftotpr,
+            beamsize = corr_beam, gaussprior = gaussp, center = Val(docenter), pulse,
+            rhoprior
         )
     else
         ctor(
