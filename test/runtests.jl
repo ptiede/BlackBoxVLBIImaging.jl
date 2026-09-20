@@ -380,6 +380,43 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test BlackBoxVLBIImaging.snap_grid_size(GMRF, 1, 23, 23) == (24, 24)
     end
 
+    @testset "image centering switch" begin
+        # `metadata.center` is the Val the @sky body dispatches its re-centering on. A small
+        # grid keeps the builds cheap; the grid plays no part in the centering choice.
+        function centercfg(; kwargs...)
+            cfg = exconfig("image.toml")
+            cfg["grid"]["nx"] = 24
+            cfg["grid"]["ny"] = 24
+            cfg["model"]["order"] = 1
+            for (k, v) in kwargs
+                cfg["model"][String(k)] = v
+            end
+            return cfg
+        end
+
+        # no `center` key: the Bkgd mean model asks for re-centering
+        skyd, imgdata = build_sky_config(centercfg())
+        @test skyd.metadata.center === Val(true)
+        @test isnothing(imgdata)
+
+        # `center` states the choice outright
+        @test build_sky_config(centercfg(center = false))[1].metadata.center === Val(false)
+        @test build_sky_config(centercfg(center = true))[1].metadata.center === Val(true)
+
+        # the centroid regularization turns re-centering off; `center = false` agrees with it
+        skyc, cregdata = build_sky_config(centercfg(creg = true))
+        @test skyc.metadata.center === Val(false)
+        @test !isnothing(cregdata)
+        skycf, cregdataf = build_sky_config(centercfg(creg = true, center = false))
+        @test skycf.metadata.center === Val(false)
+        @test !isnothing(cregdataf)
+
+        # ...and cannot be combined with re-centering
+        @test_throws "already pins the centroid" build_sky_config(
+            centercfg(creg = true, center = true)
+        )
+    end
+
     @testset "Markov RF correlation-length prior" begin
         # A small order-3 Markov RF grid: three correlation lengths per field, nx = ny = 32
         # already FFT-friendly so the prior bounds are the configured pixel counts.

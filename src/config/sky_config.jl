@@ -191,6 +191,12 @@ data rather than hand-tuned. The random-field correlation length defaults to `mo
 `model.rho_prior` picks the prior family for the per-term correlation lengths of a Markov RF
 expansion (`order < 0`): `"uniform"` (default) or `"lognormal"`. It applies to no other base,
 so setting it alongside a different `order` is an error.
+
+`model.center` sets whether the sky model re-centers its raster on its own centroid. Without
+the key the choice comes from `centerfix` of the mean model, except under
+`model.creg = true`, which turns re-centering off. `center = false` turns it off explicitly
+(with or without `creg`), `center = true` turns it on; `center = true` alongside
+`creg = true` is an error, since both pin the image position.
 """
 function build_sky_config(cfg::AbstractDict; beam = nothing)
     check_config_keys(
@@ -201,7 +207,10 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     check_config_keys(grid, ("fovx", "fovy", "nx", "ny", "pa", "x0", "y0"), "[grid]")
     check_config_keys(
         model,
-        ("polrep", "order", "addgauss", "creg", "beamsize_beams", "beamsize", "pulse", "rho_prior"),
+        (
+            "polrep", "order", "addgauss", "creg", "center", "beamsize_beams", "beamsize",
+            "pulse", "rho_prior",
+        ),
         "[model]"
     )
     check_config_keys(
@@ -273,14 +282,26 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     overrides = _parse_sky_overrides(get(cfg, "overrides", Dict{String, Any}()))
 
     gaussp = addg ? gengaussprior(polrep) : NamedTuple()
-    if !creg
-        docenter = centerfix(typeof(mmodel))
-        imgdata = nothing
-    else
+
+    # The image position is pinned either by re-centering the raster on its centroid or by the
+    # centroid regularizer, never by both. `[model] center` states the choice outright;
+    # otherwise the mean model decides through `centerfix`, and `creg` turns re-centering off.
+    if creg
+        if Bool(get(model, "center", false))
+            error(
+                "[model] center = true re-centers the image on its own centroid, but " *
+                    "creg = true already pins the centroid through a regularization term; " *
+                    "set only one of them"
+            )
+        end
         @info "Using a centroid regularization"
         docenter = false
         imgdata = (Comrade.ImgNormalData(rad2μas ∘ SVector ∘ centroid, SVector(0.0, 0.0), 1.0),)
+    else
+        docenter = Bool(get(model, "center", centerfix(typeof(mmodel))))
+        imgdata = nothing
     end
+    @info docenter ? "Re-centering the image on its centroid" : "Image re-centering is off"
 
     ctor = sky_constructor(polrep, base)
     skym = if base === GMRF
