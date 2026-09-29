@@ -3,8 +3,9 @@ using Test
 using TOML
 using Random
 using LinearAlgebra
-using Statistics: cov
-using Distributions: LogNormal, logpdf
+using Statistics: cov, mean
+using Distributions: LogNormal, Normal, cdf, logpdf, quantile
+import Enzyme
 
 const EXDIR = normpath(joinpath(@__DIR__, "..", "examples"))
 exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
@@ -35,6 +36,11 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
             (:lg1, :gp1, :lgratμ, :lgratσ, :lgrat, :gprat, :gpratμ)
         @test BlackBoxVLBIImaging.required_params(BlackBoxVLBIImaging.LEAKAGE_SCHEMES["leakage_simple"]) ==
             (:d1re, :d1im, :d2re, :d2im)
+        @test BlackBoxVLBIImaging.required_params(BlackBoxVLBIImaging.LEAKAGE_SCHEMES["leakage_disk"]) ==
+            (:d1re, :d1im, :d2re, :d2im)
+        @test BlackBoxVLBIImaging.unitdisk(0.0 + 0.0im) == 0
+        @test abs(BlackBoxVLBIImaging.unitdisk(0.2 + 0.0im)) ≈ 0.2 / sqrt(1.04)
+        @test all(z -> abs(BlackBoxVLBIImaging.unitdisk(z)) < 1, (3.0 + 4.0im, -1.0e3im, 30.0 + 0.0im))
         @test BlackBoxVLBIImaging.required_params(BlackBoxVLBIImaging.GAIN_SCHEMES["gain_offsetphase"]) ==
             (:lg1, :gp1μ, :gp1, :lgratμ, :lgrat, :gpratμ, :gprat)
     end
@@ -359,6 +365,42 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         cfg2 = exconfig("fitting.toml")
         cfg2["optimizer"]["method"] = "SGD"
         @test_throws ErrorException build_fitting_config(cfg2)
+
+        @test isempty(s.fix_scales)
+        cfg3 = exconfig("fitting.toml")
+        cfg3["optimizer"]["fix_scales"] = ["σb", "σc", "σd"]
+        @test build_fitting_config(cfg3).fix_scales == [:σb, :σc, :σd]
+        cfg3["optimizer"]["fix_scales"] = "σb"
+        @test_throws "must be a list of sky parameter names" build_fitting_config(cfg3)
+        cfg3["optimizer"]["fix_scales"] = ["σb", "σb"]
+        @test_throws "lists a name twice" build_fitting_config(cfg3)
+
+        @test isempty(s.moves)
+        cfg4 = exconfig("fitting.toml")
+        cfg4["run"]["use_reactant"] = true
+        cfg4["sampler"]["moves"] = ["flux_gain", "field_scale"]
+        @test build_fitting_config(cfg4).moves == ["flux_gain", "field_scale"]
+        cfg4["sampler"]["moves"] = ["flux_gain", "gain_phase"]
+        @test_throws "unknown sampler.moves [\"gain_phase\"]" build_fitting_config(cfg4)
+        cfg4["sampler"]["moves"] = ["flux_gain", "flux_gain"]
+        @test_throws "lists a move twice" build_fitting_config(cfg4)
+        cfg4["sampler"]["moves"] = "flux_gain"
+        @test_throws "must be a list of move names" build_fitting_config(cfg4)
+        cfg4["sampler"]["moves"] = ["rho_field", "mean_field", "phase_offset"]
+        @test build_fitting_config(cfg4).moves_per_chunk == 1
+        cfg4["sampler"]["moves_per_chunk"] = 10
+        @test build_fitting_config(cfg4).moves_per_chunk == 10
+        for bad in (0, -1, 1.5, "3")
+            cfg4["sampler"]["moves_per_chunk"] = bad
+            @test_throws "sampler.moves_per_chunk must be an integer ≥ 1" build_fitting_config(cfg4)
+        end
+        cfg4["sampler"]["moves_per_chunk"] = 2
+        cfg4["sampler"]["moves"] = String[]
+        @test_throws "moves_per_chunk is set but sampler.moves lists no moves" build_fitting_config(cfg4)
+        delete!(cfg4["sampler"], "moves_per_chunk")
+        cfg4["sampler"]["moves"] = ["field_scale"]
+        cfg4["run"]["use_reactant"] = false
+        @test_throws "needs the Reactant sampler" build_fitting_config(cfg4)
     end
 
     @testset "sky config + grid snapping" begin
@@ -415,6 +457,65 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws "already pins the centroid" build_sky_config(
             centercfg(creg = true, center = true)
         )
+
+        # `center_power` is the intensity weighting of the centroid either mechanism pins
+        @test build_sky_config(centercfg(center = true))[1].metadata.center_power == 1
+        @test build_sky_config(centercfg(center = true, center_power = 2))[1].metadata.center_power == 2
+        @test build_sky_config(centercfg(creg = true, center_power = 2))[1].metadata.center_power == 2
+        @test_throws "must be a real number >= 1" build_sky_config(
+            centercfg(center = true, center_power = 0.5)
+        )
+        # nothing pins the position, so the power would be silently ignored
+        @test_throws "nothing pins it" build_sky_config(
+            centercfg(center = false, center_power = 2)
+        )
+
+        # A centered model puts the weighted centroid of its image at the origin, the plain
+        # centroid elsewhere. Showing it needs an interpolating pulse — a delta-pulse render on
+        # the model's own grid returns the raster itself, so the shift only reaches the
+        # visibilities — and what is left of the I² centroid is the interpolation of a pixelized
+        # raster, a fraction of a pixel.
+        skyp, _ = build_sky_config(centercfg(center = true, center_power = 2, pulse = "bspline3"))
+        xp = rand(Random.Xoshiro(42), Comrade.NamedDist(skyp.prior))
+        imgp = intensitymap(skyp.f(xp, skyp.metadata), skyp.grid)
+        px = rad2μas(pixelsizes(skyp.grid).X)
+        c2 = rad2μas.(power_centroid(imgp, 2))
+        c1 = rad2μas.(centroid(imgp))
+        @test maximum(abs, c2) < 0.1 * px
+        @test maximum(abs, c1) > maximum(abs, c2)
+    end
+
+    @testset "intensity-power-weighted centroid" begin
+        # A compact blob at the origin plus a faint wide background offset along X: the center of
+        # light rides along with the background, the I² centroid stays on the blob.
+        gs = imagepixels(μas2rad(400.0), μas2rad(400.0), 64, 64)
+        blob = modify(Gaussian(), Stretch(μas2rad(10.0)))
+        bkgd(off) = modify(
+            Gaussian(), Stretch(μas2rad(100.0)), Shift(μas2rad(off), 0.0), Renormalize(0.3)
+        )
+        img0 = intensitymap(blob + bkgd(0.0), gs)
+        imgo = intensitymap(blob + bkgd(120.0), gs)
+
+        # p = 1 goes through `centroid` itself, so it agrees to the last bit
+        @test power_centroid(img0, 1) === centroid(img0)
+        @test power_centroid(imgo, 1) === centroid(imgo)
+
+        d1 = rad2μas.(centroid(imgo) .- centroid(img0))
+        d2 = rad2μas.(power_centroid(imgo, 2) .- power_centroid(img0, 2))
+        @test d1[1] > 10
+        @test abs(d2[1]) < 0.05 * abs(d1[1])
+        @test maximum(abs, rad2μas.(power_centroid(imgo, 2))) < 1.0
+
+        # Differentiable in the raster: Enzyme reverse mode against a central difference along a
+        # random direction. Single-pixel difference quotients are not a usable reference here —
+        # derivatives in the faint wings are ~1e-13 and the quotient there is mostly round-off.
+        f2(b) = first(power_centroid(IntensityMap(b, gs), 2))
+        b0 = collect(baseimage(imgo))
+        gr = Enzyme.gradient(Enzyme.Reverse, f2, b0)[1]
+        @test all(isfinite, gr)
+        v = randn(Random.Xoshiro(7), size(b0))
+        h = 1.0e-6 * maximum(b0)
+        @test sum(gr .* v) ≈ (f2(b0 .+ h .* v) - f2(b0 .- h .* v)) / (2h) rtol = 1.0e-4
     end
 
     @testset "Markov RF correlation-length prior" begin
@@ -470,6 +571,50 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         )
         @test_throws "rho_prior sets the correlation-length prior" build_sky_config(
             markovcfg(rho_prior = "lognormal", order = 1)
+        )
+    end
+
+    @testset "sky prior overrides" begin
+        function overridecfg(overrides)
+            cfg = exconfig("image.toml")
+            cfg["grid"]["nx"] = 32
+            cfg["grid"]["ny"] = 32
+            cfg["model"]["order"] = -3
+            cfg["model"]["rho_prior"] = "lognormal"
+            cfg["overrides"] = overrides
+            return cfg
+        end
+
+        # a scalar override (σa) pins a narrow truncated Normal around the given value
+        skyσ, _ = build_sky_config(
+            overridecfg(Dict("σa" => Dict("dist" => "Normal", "args" => [2.5, 1.0e-3], "lower" => 0.0)))
+        )
+        @test logpdf(skyσ.prior.σa, 2.5) ≈ logpdf(Normal(2.5, 1.0e-3), 2.5) atol = 1.0e-6
+        @test logpdf(skyσ.prior.σa, 2.5) - logpdf(skyσ.prior.σa, 2.51) > 40  # narrow: steep falloff
+
+        # an array override (ρa) replaces each Markov-order term with its own narrow LogNormal,
+        # matching markov_rho_prior's own log ρ unconstrained coordinate
+        ρvals = (7.0, 3.0, 1.5)
+        skyρ, _ = build_sky_config(
+            overridecfg(
+                Dict(
+                    "ρa" => [
+                        Dict("dist" => "LogNormal", "args" => [log(v), 1.0e-3]) for v in ρvals
+                    ],
+                )
+            )
+        )
+        @test length(skyρ.prior.ρa) == 3
+        for (ρ, v) in zip(skyρ.prior.ρa, ρvals)
+            @test logpdf(ρ, v) ≈ logpdf(LogNormal(log(v), 1.0e-3), v) atol = 1.0e-6
+            @test logpdf(ρ, v) - logpdf(ρ, 1.01 * v) > 40  # narrow: steep falloff
+        end
+        # the untouched fields keep their default lognormal ρ prior
+        @test skyρ.prior.ρb != skyρ.prior.ρa
+
+        # an unknown override name fails fast
+        @test_throws "does not match any prior entry" build_sky_config(
+            overridecfg(Dict("σnope" => Dict("dist" => "Normal", "args" => [1.0, 1.0])))
         )
     end
 
@@ -599,6 +744,424 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
             @test isfinite(logdensityof(post, x0))
             xopt, _ = comrade_opt(post, BlackBoxVLBIImaging.Adam(); initial_params = x0, maxiters = 5, g_tol = 0.1)
             @test isfinite(logdensityof(post, xopt))
+
+            @testset "fix_scales: held optimization and field rescale" begin
+                icfg = exconfig("image.toml")
+                icfg["grid"]["nx"] = 32
+                icfg["grid"]["ny"] = 32
+                icfg["model"]["order"] = -3
+                skyf, imgf = build_sky_config(icfg)
+                postf = VLBIPosterior(skyf, intm, dcoh; imgdata = imgf)
+                sq(x) = sqrt(mean(abs2, x))
+
+                @test_throws "'σq' is not a scalar sky parameter" held_scale_values(postf, [:σq])
+                @test_throws "'b' is not a scalar sky parameter" held_scale_values(postf, [:b])
+                held = held_scale_values(postf, [:σb, :σc, :σd])
+                @test held[:σd] ≈ 0.1 * quantile(Normal(), 0.75)
+                @test held[:σb] ≈ held[:σc] ≈ 0.5 * quantile(Normal(), 0.75)
+
+                # the CPU optimizer moves everything but the held scales
+                xs = prior_sample(Random.Xoshiro(3), postf)
+                xh, _ = BlackBoxVLBIImaging._comrade_opt_held(
+                    postf, BlackBoxVLBIImaging.Adam(), held; initial_params = xs,
+                    maxiters = 20, g_tol = 0.1
+                )
+                for (k, v) in held
+                    @test xh.sky[k] ≈ v rtol = 1.0e-12
+                end
+                @test xh.sky.σa != xs.sky.σa
+                @test xh.sky.b != xs.sky.b
+                @test logdensityof(postf, xh) > logdensityof(postf, BlackBoxVLBIImaging._hold_scales(xs, held))
+
+                # rescaling puts every field at unit rms and leaves the image where it was
+                xr = rescale_fields(postf, xh)
+                g = postf.skymodel.grid.imgdomain
+                for k in (:a, :b, :c, :d)
+                    σk = Symbol(:σ, k)
+                    @test sq(xr.sky[k]) ≈ 1 rtol = 1.0e-12
+                    @test xr.sky[σk] ≈ xh.sky[σk] * sq(xh.sky[k]) rtol = 1.0e-12
+                end
+                img(x) = baseimage(intensitymap(skymodel(postf, x), g))
+                @test isapprox(img(xr), img(xh); rtol = 1.0e-12)
+                # an all-zero field stays zero, its scale goes to the prior median
+                xz = merge(xh, (sky = merge(xh.sky, (d = zero(xh.sky.d),)),))
+                xzr = rescale_fields(postf, xz)
+                @test all(iszero, xzr.sky.d)
+                @test xzr.sky.σd ≈ held[:σd]
+                # a model without a non-centered field
+                @test_throws "no non-centered field" rescale_fields(post, x0)
+
+                # end to end on the CPU path: two tempering stages, then the rescale
+                strat = FittingStrategy(;
+                    maxiters = 20, ntrials = 1, noise_schedule = [0.05, 0.0],
+                    fix_scales = [:σb, :σc, :σd]
+                )
+                xt = mktempdir() do d
+                    BlackBoxVLBIImaging._optimize_tempered(
+                        joinpath(d, "t"), skyf, intm, (dcoh,), imgf, strat,
+                        BlackBoxVLBIImaging.Adam(), Random.Xoshiro(4)
+                    )
+                end
+                for k in (:a, :b, :c, :d)
+                    @test sq(xt.sky[k]) ≈ 1 rtol = 1.0e-12
+                end
+                @test_throws "'σz' is not a scalar sky parameter" mktempdir() do d
+                    BlackBoxVLBIImaging._optimize_tempered(
+                        joinpath(d, "t"), skyf, intm, (dcoh,), imgf,
+                        FittingStrategy(; maxiters = 2, ntrials = 1, fix_scales = [:σz]),
+                        BlackBoxVLBIImaging.Adam(), Random.Xoshiro(4)
+                    )
+                end
+            end
+
+            @testset "symmetry moves" begin
+                BB = BlackBoxVLBIImaging
+                ProbProg = BB.Reactant.ProbProg
+                icfg = exconfig("image.toml")
+                icfg["grid"]["nx"] = 16
+                icfg["grid"]["ny"] = 16
+                icfg["model"]["order"] = -2
+                icfg["model"]["rho_prior"] = "lognormal"
+                icfg["mean"] = Dict{String, Any}("type" => "GaussBkgd", "fwhm_beams" => 2.0)
+                skym, imgm = build_sky_config(icfg)
+                # Gauss–Markov gain amplitudes, a per-site phase offset (gp1μ) with pinned
+                # sites, and the Gauss–Markov ratio terms.
+                instr = TOML.parse(
+                    """
+                    frcal = false
+                    gaugefix = "pin"
+                    [gain]
+                    scheme = "gain_offsetphase"
+                    [leakage]
+                    scheme = "leakage_simple"
+                    [priors.lg1]
+                    kind = "gaussmarkov"
+                    seg = "integ"
+                    process = { kind = "ou", sigma = { dist = "Exponential", args = [0.2] }, tau = { dist = "InverseGamma", args = [2.0, 1.0] } }
+                    [priors.lgrat]
+                    kind = "gaussmarkov"
+                    seg = "integ"
+                    process = { kind = "ou", sigma = { dist = "Exponential", args = [0.05] }, tau = { dist = "InverseGamma", args = [2.0, 10.0] } }
+                    [priors."lgratμ"]
+                    seg = "track"
+                    dist = { dist = "Normal", args = [0.0, 0.2] }
+                    [priors."gp1μ"]
+                    seg = "track"
+                    dist = { dist = "DiagonalVonMises", args = [0.0, 3.141592653589793] }
+                    refant = { kind = "SEFD", val = 0.0 }
+                    gauge = "phase"
+                    [priors.gp1]
+                    seg = "integ"
+                    dist = { dist = "DiagonalVonMises", args = [0.0, 3.141592653589793] }
+                    init = { kind = "fixed", value = 0.0 }
+                    refant = { kind = "SEFD", val = 0.0 }
+                    gauge = "phase"
+                    [priors.gprat]
+                    kind = "gaussmarkov"
+                    seg = "scan"
+                    init = { kind = "fixed", value = 0.0 }
+                    process = { kind = "WrappedOrnsteinUhlenbeck", sigma = { dist = "Exponential", args = [0.3], lower = 0.05 }, tau = { dist = "InverseGamma", args = [2.0, 24.0], upper = 48.0 } }
+                    [priors."gpratμ"]
+                    seg = "track"
+                    dist = { dist = "DiagonalVonMises", args = [0.0, 3.141592653589793] }
+                    [priors.d1re]
+                    seg = "track"
+                    dist = { dist = "Normal", args = [0.0, 0.2] }
+                    [priors.d1im]
+                    seg = "track"
+                    dist = { dist = "Normal", args = [0.0, 0.2] }
+                    [priors.d2re]
+                    seg = "track"
+                    dist = { dist = "Normal", args = [0.0, 0.2] }
+                    [priors.d2im]
+                    seg = "track"
+                    dist = { dist = "Normal", args = [0.0, 0.2] }
+                    """
+                )
+                intg = build_instrument_config(instr)
+                postm = VLBIPosterior(skym, intg, dcoh; imgdata = imgm)
+                tpm = asflat(postm)
+                grid = postm.skymodel.grid
+                θs = [prior_sample(Random.Xoshiro(k), postm) for k in 1:2]
+                allnames = ["flux_gain", "field_scale", "rho_field", "mean_field", "phase_offset"]
+                sm = SymmetryMoves(postm, allnames, θs[1]; rounds = 2)
+                names = BB.move_name.(sm.moves)
+                gpμ = θs[1].instrument[Symbol("gp1μ")]
+                freesites = [s for (s, v) in zip(gpμ.sites, gpμ) if v != 0]
+                @test collect(names) == [
+                    "flux_gain",
+                    "field_scale[a]", "field_scale[b]", "field_scale[c]", "field_scale[d]",
+                    "rho_field[a,1]", "rho_field[a,2]", "rho_field[b,1]", "rho_field[b,2]",
+                    "rho_field[c,1]", "rho_field[c,2]", "rho_field[d,1]", "rho_field[d,2]",
+                    "mean_field[fwhm]", "mean_field[fb]",
+                    ["phase_offset[$s]" for s in freesites]...,
+                ]
+                J = length(sm.moves)
+                ustep(::BB.PhaseOffsetMove) = 0.7
+                ustep(::BB.FieldScaleMove) = 0.2
+                ustep(::BB.SymmetryMove) = 0.1
+                stokesmap(θ) = baseimage(intensitymap(skymodel(postm, θ), grid))
+                rel(a, b) = maximum(abs, a .- b) / maximum(abs, b)
+
+                @testset "invariance, reversibility: $(BB.move_name(m)), draw $i" for (i, θ) in enumerate(θs), m in sm.moves
+                    x = Comrade.inverse(tpm, θ)
+                    u = ustep(m)
+                    x′, ld = BB.propose(m, x, u, tpm, sm.ctx)
+                    xb, ldb = BB.propose(m, x′, -u, tpm, sm.ctx)
+                    @test xb ≈ x rtol = 1.0e-10
+                    @test ldb ≈ -ld atol = 1.0e-9
+                    θ′ = Comrade.transform(tpm, x′)
+                    l0 = Comrade.loglikelihood(postm, θ)
+                    l1 = Comrade.loglikelihood(postm, θ′)
+                    if m isa BB.PhaseOffsetMove
+                        a0 = atan(x[m.i], x[m.i + 1])
+                        a1 = atan(x′[m.i], x′[m.i + 1])
+                        @test rem2pi(a1 - a0 - u, RoundNearest) ≈ 0 atol = 1.0e-12
+                        @test hypot(x′[m.i], x′[m.i + 1]) ≈ hypot(x[m.i], x[m.i + 1]) rtol = 1.0e-14
+                        @test l1 != l0
+                    else
+                        @test l1 ≈ l0 rtol = 1.0e-10
+                    end
+                    if !(m isa BB.FluxGainMove || m isa BB.PhaseOffsetMove)
+                        # the polarized image itself is unchanged, pixel by pixel
+                        s0, s1 = stokesmap(θ), stokesmap(θ′)
+                        for p in (:I, :Q, :U, :V)
+                            @test rel(stokes(s1, p), stokes(s0, p)) < 1.0e-10
+                        end
+                    end
+                end
+
+                # The move is x ↦ M_u(x) and changes only the coordinates `S`, so
+                # log|det ∂M/∂x| = log|det ∂M_S/∂x_S|; compare with central differences.
+                @testset "log-determinant: $(BB.move_name(m))" for m in sm.moves[[1, 2, 6, 9, 14, 15, 16]]
+                    x = Comrade.inverse(tpm, θs[2])
+                    u = ustep(m)
+                    M(y) = first(BB.propose(m, y, u, tpm, sm.ctx))
+                    S = findall(M(x) .!= x)
+                    @test !isempty(S)
+                    Jac = zeros(length(S), length(S))
+                    for (k, j) in pairs(S)
+                        h = 1.0e-6 * max(1.0, abs(x[j]))
+                        xp = copy(x)
+                        xp[j] += h
+                        xm = copy(x)
+                        xm[j] -= h
+                        Jac[:, k] = (M(xp)[S] .- M(xm)[S]) ./ (2h)
+                    end
+                    @test first(logabsdet(Jac)) ≈ last(BB.propose(m, x, u, tpm, sm.ctx)) atol = 1.0e-5
+                end
+
+                # Under a prior-only target the move kernel alone must leave the prior
+                # invariant: start from exact prior draws, apply the kernel, and compare the
+                # moved coordinates with fresh prior draws (two-sample Kolmogorov–Smirnov).
+                # The same run with one move's Jacobian dropped must fail the comparison.
+                @testset "prior stationarity of the move kernel" begin
+                    ldprior(tp, z) = last(BB.PT.latent_pfwd_and_logdensity(tp.transform, vec(z)))
+                    function ks(a, b)
+                        grid_ = sort(vcat(a, b))
+                        Fa = [count(<=(g), a) / length(a) for g in grid_]
+                        Fb = [count(<=(g), b) / length(b) for g in grid_]
+                        return maximum(abs, Fa .- Fb)
+                    end
+                    scale(::BB.FluxGainMove) = 0.5
+                    scale(::BB.FieldScaleMove) = 0.1
+                    scale(::BB.RhoFieldMove) = 0.5
+                    scale(::BB.MeanFieldMove) = 0.05
+                    scale(::BB.PhaseOffsetMove) = 1.5
+                    stats(θ) = (
+                        ftot = θ.sky.flux.ftot, σa = θ.sky.σa, σd = θ.sky.σd,
+                        ρa1 = θ.sky.ρa[1], ρb2 = θ.sky.ρb[2],
+                        fwhm = θ.sky.mean.fwhm, fb = θ.sky.mean.fb,
+                        cosφ = cos(θ.instrument[Symbol("gp1μ")][findfirst(==(freesites[1]), gpμ.sites)]),
+                    )
+                    ndraw, R = 400, 3
+                    rng = Random.Xoshiro(21)
+                    run(moves) = map(1:ndraw) do _
+                        z = Comrade.inverse(tpm, prior_sample(rng, postm))
+                        steps = [scale(m) * randn(rng) for m in moves, _ in 1:R]
+                        logu = log.(rand(rng, length(moves), R))
+                        z′, logα = BB.run_moves(tpm, moves, sm.ctx, z, steps, logu; ldf = ldprior)
+                        stats(Comrade.transform(tpm, z′)), logu .< logα
+                    end
+                    moved = run(sm.moves)
+                    fresh = [stats(prior_sample(rng, postm)) for _ in 1:ndraw]
+                    accept = mean(last.(moved))
+                    @test all(>(0.02), accept)
+                    Dcrit = 1.95 * sqrt(2 / ndraw)   # α ≈ 0.001 per statistic
+                    for k in keys(first(fresh))
+                        @test ks(getproperty.(first.(moved), k), getproperty.(fresh, k)) < Dcrit
+                    end
+                    # field_scale[a] with its Jacobian dropped drifts σa off its prior
+                    nojac = (BB.FieldScaleMove(:a, sm.moves[2].coeffs, sm.moves[2].iscale, sm.moves[2].tscale),)
+                    wrong = map(1:ndraw) do _
+                        z = Comrade.inverse(tpm, prior_sample(rng, postm))
+                        for _ in 1:R
+                            u = scale(nojac[1]) * randn(rng)
+                            z′, _ = BB.propose(nojac[1], z, u, tpm, sm.ctx)
+                            if log(rand(rng)) < ldprior(tpm, z′) - ldprior(tpm, z)
+                                z = z′
+                            end
+                        end
+                        Comrade.transform(tpm, z).sky.σa
+                    end
+                    @test ks(wrong, getproperty.(fresh, :σa)) > Dcrit
+                end
+
+                # The compiled device step and the host step take the same proposals and
+                # decisions on the same random numbers, through a preconditioner.
+                @testset "device step matches the host step" begin
+                    n = dimension(tpm)
+                    prng = Random.Xoshiro(11)
+                    V = Matrix(qr(randn(prng, n, 3)).Q)[:, 1:3]
+                    pre = LowRankPreconditioner(randn(prng, n), exp.(0.3 .* randn(prng, n)), V, [3.0, 0.5, 1.5])
+                    tph = BB.PT.transport_to(postm, pre)
+                    postc = BB.ConstructionBase.setproperties(postm, (; admode = nothing))
+                    rpost = Comrade.prepare_device(postc, Comrade.ComradeBase.ReactantEx())
+                    devpre = Comrade._device_pre(pre)
+                    tpd = BB.PT.transport_to(rpost, devpre)
+                    z0 = Comrade._affine_inv(pre, Comrade.inverse(tpm, θs[1]))
+                    steps = [0.3 * ustep(m) * randn(prng) for m in sm.moves, _ in 1:2]
+                    logu = log.(rand(prng, J, 2))
+                    zh, αh = BB.run_moves(tph, sm.moves, sm.ctx, z0, steps, logu)
+                    zd, αd = BB._device_moves(sm, tpd, BB.Reactant.to_rarray(z0), steps, logu)
+                    @test (logu .< αd) == (logu .< αh)
+                    @test count(logu .< αh) > 0
+                    # the device and host log densities agree to rounding of their magnitude
+                    @test αd ≈ αh atol = 1.0e-11 * abs(logdensityof(tph, z0))
+                    @test Array(zd) ≈ zh rtol = 1.0e-9
+                    # same tpost, no recompile; a new one recompiles
+                    c = sm.compiled[]
+                    BB._device_moves(sm, tpd, zd, steps, logu)
+                    @test sm.compiled[] === c
+
+                    # a refit that overwrites the device preconditioner in place is seen by
+                    # the compiled step without a recompile: it proposes and accepts in the
+                    # new coordinates exactly as the host step does with the new transform
+                    V2 = Matrix(qr(randn(prng, n, 3)).Q)[:, 1:3]
+                    pre2 = LowRankPreconditioner(randn(prng, n), exp.(0.3 .* randn(prng, n)), V2, [0.2, 4.0, 1.3])
+                    Comrade._update_device_pre!(devpre, pre2)
+                    tph2 = BB.PT.transport_to(postm, pre2)
+                    z2 = Comrade._affine_inv(pre2, Comrade.inverse(tpm, θs[2]))
+                    zh2, αh2 = BB.run_moves(tph2, sm.moves, sm.ctx, z2, steps, logu)
+                    zd2, αd2 = BB._device_moves(sm, tpd, BB.Reactant.to_rarray(z2), steps, logu)
+                    @test sm.compiled[] === c
+                    @test (logu .< αd2) == (logu .< αh2)
+                    @test αd2 ≈ αh2 atol = 1.0e-11 * abs(logdensityof(tph2, z2))
+                    @test Array(zd2) ≈ zh2 rtol = 1.0e-9
+
+                    # the hook on the device: moves the position, records every proposal
+                    state = ProbProg.MCMCState(BB.Reactant.to_rarray(z0), nothing, nothing, 0.1, nothing, nothing)
+                    info = (; phase = :warmup, step = 10, total = 100, pre = BB.Comrade._transport_pre(tpd))
+                    state = sm(state, tpd, info, Random.Xoshiro(12))
+                    @test Array(state.position) != z0
+                    @test all(t -> t.nwarmup == 2, sm.tuners)
+                    @test occursin("flux_gain acc=", move_summary(sm, :warmup))
+                    @test occursin("(0/0)", move_summary(sm, :sampling))
+                end
+
+                @testset "moves that do not apply are rejected up front" begin
+                    @test_throws "unknown move \"gain_phase\"" SymmetryMoves(postm, ["gain_phase"], θs[1])
+                    @test_throws "rounds must be at least 1" SymmetryMoves(postm, ["flux_gain"], θs[1]; rounds = 0)
+                    fcfg = deepcopy(icfg)
+                    fcfg["flux"]["ftot"] = [0.8]
+                    skyfix, imgfix = build_sky_config(fcfg)
+                    postfix = VLBIPosterior(skyfix, intg, dcoh; imgdata = imgfix)
+                    @test_throws "needs a sampled total flux" SymmetryMoves(
+                        postfix, ["flux_gain"], prior_sample(Random.Xoshiro(1), postfix)
+                    )
+                    # a first-stamp pin on lg1 cannot follow the common shift
+                    pcfg = deepcopy(instr)
+                    pcfg["priors"]["lg1"]["init"] = Dict("kind" => "fixed", "value" => 0.0)
+                    postpin = VLBIPosterior(skym, build_instrument_config(pcfg), dcoh; imgdata = imgm)
+                    @test_throws "move flux_gain changed the log-likelihood" SymmetryMoves(
+                        postpin, ["flux_gain"], prior_sample(Random.Xoshiro(1), postpin)
+                    )
+                    # a GMRF sky has neither correlation lengths nor the PolExp Markov mean
+                    gcfg = deepcopy(icfg)
+                    gcfg["model"]["order"] = 1
+                    delete!(gcfg["model"], "rho_prior")
+                    skyg, imgg = build_sky_config(gcfg)
+                    postg = VLBIPosterior(skyg, intg, dcoh; imgdata = imgg)
+                    θg = prior_sample(Random.Xoshiro(1), postg)
+                    @test_throws "needs a Markov RF sky model" SymmetryMoves(postg, ["rho_field"], θg)
+                    @test_throws "needs the PolExp Markov RF sky model" SymmetryMoves(postg, ["mean_field"], θg)
+                    postgm = VLBIPosterior(skym, build_instrument_config(exconfig("instrument_gaussmarkov.toml")), dcoh; imgdata = imgm)
+                    @test_throws "needs a gain phase offset `gp1μ`" SymmetryMoves(
+                        postgm, ["phase_offset"], prior_sample(Random.Xoshiro(1), postgm)
+                    )
+                end
+
+                @testset "DILI kernels" begin
+                    pre = BB.gaussian_standardization(postm)
+                    L = BB.flat_layout(tpm)
+                    gauss = sort(vcat([collect(L.instrument[p]) for p in (:d1re, :d1im, :d2re, :d2im, Symbol("lgratμ"))]...))
+                    @test findall(!=(1.0), pre.d) == gauss
+                    @test all(==(0.2), pre.d[gauss])
+                    @test all(iszero, pre.b)
+
+                    tps = BB.dili_posterior(postm)
+                    us = [Comrade.inverse(tps, θ) for θ in θs]
+                    for (u, θ) in zip(us, θs)
+                        @test logdensityof(tps, u) - logdensityof(tpm, Comrade.inverse(tpm, θ)) ≈ sum(log, pre.d) rtol = 1.0e-9
+                    end
+
+                    rm = BB.ResidualMap(postm)
+                    Φ = [BB.dili_potential(rm, tps, u) for u in us]
+                    @test Φ[1] - Φ[2] ≈ Comrade.loglikelihood(postm, θs[2]) - Comrade.loglikelihood(postm, θs[1]) rtol = 1.0e-10
+                    # Φ̃ = -log π - ½‖u‖² up to a constant
+                    c = [BB.dili_reference_potential(rm, tps, u) + logdensityof(tps, u) + sum(abs2, u) / 2 for u in us]
+                    @test c[1] ≈ c[2] rtol = 1.0e-10
+
+                    M = Tuple(copy.(rm.measurement))
+                    N = Tuple(copy.(rm.noise))
+                    M[2][3] = NaN
+                    N[4][5] = Inf
+                    @test length(BB.ResidualMap(M, N)) == length(rm) - 4
+                    N[1][1] = 0.0
+                    @test_throws "non-positive noise" BB.ResidualMap(M, N)
+
+                    k = BB.DILIKernels(postm)
+                    n = dimension(tps)
+                    prng = Random.Xoshiro(21)
+                    u, v, w = us[1], randn(prng, n), randn(prng, n)
+                    h = 1.0e-5
+                    fd(f, v) = (f(u .+ h .* v) .- f(u .- h .* v)) ./ (2h)
+                    resid(u) = BB.dili_resid(rm, tps, u)
+                    Jv, Jw = fd(resid, v), fd(resid, w)
+                    r = resid(u)
+
+                    @test BB.potential(k, u) ≈ Φ[1] rtol = 1.0e-9
+                    Φd, g = BB.potential_gradient(k, u)
+                    @test Φd ≈ Φ[1] rtol = 1.0e-9
+                    @test dot(Array(g), v) ≈ dot(r, Jv) rtol = 1.0e-6
+                    GNv, GNw = Array(BB.gauss_newton(k, u, v)), Array(BB.gauss_newton(k, u, w))
+                    @test dot(w, GNv) ≈ dot(Jw, Jv) rtol = 1.0e-6
+                    @test dot(w, GNv) ≈ dot(GNw, v) rtol = 1.0e-10
+
+                    Ψ(u) = BB.dili_prior_remainder(tps, u)
+                    hh = 1.0e-3
+                    wHv_fd = (
+                        Ψ(u .+ hh .* (v .+ w)) - Ψ(u .+ hh .* (v .- w)) -
+                            Ψ(u .- hh .* (v .- w)) + Ψ(u .- hh .* (v .+ w))
+                    ) / (4hh^2)
+                    Hv, Hw = Array(BB.prior_hvp(k, u, v)), Array(BB.prior_hvp(k, u, w))
+                    @test dot(w, Hv) ≈ wHv_fd rtol = 1.0e-4
+                    @test dot(w, Hv) ≈ dot(Hw, v) rtol = 1.0e-10
+                    @test Array(BB.curvature(k, u, v)) ≈ GNv .+ Hv rtol = 1.0e-10
+
+                    Φ̃d, g̃ = BB.reference_gradient(k, u)
+                    @test Φ̃d ≈ BB.dili_reference_potential(rm, tps, u) rtol = 1.0e-9
+                    @test dot(Array(g̃) .- Array(g), v) ≈ fd(Ψ, v) rtol = 1.0e-6
+                    # standardized blocks are exactly N(0, I): Ψ does not depend on them
+                    u′ = copy(u)
+                    u′[gauss] .= randn(prng, length(gauss))
+                    @test Ψ(u′) ≈ Ψ(u) rtol = 1.0e-12
+
+                    compiled = copy(k.compiled)
+                    BB.gauss_newton(k, us[2], w)
+                    @test k.compiled == compiled
+                end
+            end
         else
             @test_skip "test data not found at $datafile"
         end

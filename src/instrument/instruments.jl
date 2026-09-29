@@ -299,6 +299,23 @@ end
     end
 end
 
+#     leakage_disk(; priors)
+#
+# Leakage given by a single complex number `z` per feed, mapped into the unit disk by
+# `D = z / sqrt(1 + |z|²)`. The priors apply to `z`. |D| < 1 excludes the feed-swapped
+# solutions with |D| > 1.
+@instrument function leakage_disk(; priors)
+    return @jones begin
+        d1re ~ priors.d1re
+        d1im ~ priors.d1im
+        d2re ~ priors.d2re
+        d2im ~ priors.d2im
+        return JonesD((unitdisk(complex(d1re, d1im)), unitdisk(complex(d2re, d2im))))
+    end
+end
+
+unitdisk(z) = z / sqrt(1 + abs2(z))
+
 #     leakage_hier(; priors)
 #
 # Hierarchical leakage: each feed's real/imaginary parts are given by a mean, a standard
@@ -343,6 +360,7 @@ const LEAKAGE_SCHEMES = Dict{String, Any}(
     "none" => nothing,
     "leakage_simple" => leakage_simple,
     "leakage_hier" => leakage_hier,
+    "leakage_disk" => leakage_disk,
 )
 
 const SEGMENTATIONS = Dict{String, Any}(

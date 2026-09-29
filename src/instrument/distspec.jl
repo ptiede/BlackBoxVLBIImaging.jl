@@ -12,6 +12,10 @@
 #
 # Special case: `DiagonalVonMises` takes `args = [mean, width]` where `width` is an angular
 # std-dev-like scale, converted to a concentration via `κ = inv(width^2)`.
+#
+# `LogNormal` takes `args = [mu, sigma]` (mu = log of the median) and is built as the `exp`
+# pushforward of a `VLBIGaussian`, matching `markov_rho_prior`'s own log-normal ρ priors: the
+# unconstrained coordinate is exactly `log` of the sampled value.
 
 const _DIST_ALLOWLIST = Dict{String, Function}(
     "Normal" => (a...) -> VLBIImagePriors.VLBIGaussian(a...),
@@ -23,6 +27,7 @@ const _DIST_ALLOWLIST = Dict{String, Function}(
     "Beta" => (a...) -> VLBIImagePriors.VLBIBeta(a...),
     "InverseGamma" => (a...) -> VLBIImagePriors.VLBIInverseGamma(a...),
     "DiagonalVonMises" => (a...) -> DiagonalVonMises(a[1], inv(a[2]^2)),
+    "LogNormal" => (a...) -> PT.PushforwardDistribution(exp, VLBIImagePriors.VLBIGaussian(a...)),
 )
 
 """

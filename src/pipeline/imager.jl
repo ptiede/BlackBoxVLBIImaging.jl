@@ -60,24 +60,29 @@ function _run_reactant_benchmarks(post, transport_method)
 end
 
 """
-    best_image(post, ntrials=20, maxiters=10_000, rng=Random.default_rng(); opt=Adam())
+    best_image(post, ntrials=20, maxiters=10_000, rng=Random.default_rng(); opt=Adam(),
+               held=Dict{Symbol, Float64}())
 
 Run `ntrials` random-restart optimizations of `post`, returning the valid solutions and
 their log-densities sorted best-first. Each trial does two optimization passes and keeps
-the better one.
+the better one. The sky parameters in `held` (name => value) stay at their values
+throughout.
 """
-function best_image(post, ntrials = 20, maxiters = 10_000, rng = Random.default_rng(); opt = Adam())
+function best_image(
+        post, ntrials = 20, maxiters = 10_000, rng = Random.default_rng();
+        opt = Adam(), held::AbstractDict = Dict{Symbol, Float64}()
+    )
     nd = mapreduce(Comrade.ndata, +, post.data)
     sols = map(1:ntrials) do i
-        xopt0, sol0 = comrade_opt(
-            post, opt;
+        xopt0, sol0 = _comrade_opt_held(
+            post, opt, held;
             initial_params = prior_sample(rng, post), maxiters = maxiters ÷ 2, g_tol = 1.0e-1
         )
         c20 = mapreduce(sum, +, chi2(post, xopt0)) / nd
         @info "Preliminary image $i/$(ntrials) done minimum χ²: $(c20)"
 
-        xopt1, sol1 = comrade_opt(
-            post, opt;
+        xopt1, sol1 = _comrade_opt_held(
+            post, opt, held;
             initial_params = xopt0, maxiters = maxiters ÷ 2, g_tol = 1.0e-1
         )
         c21 = mapreduce(sum, +, chi2(post, xopt1)) / nd
@@ -96,7 +101,7 @@ end
 # restarts with `best_image` on the first stage and refines with `comrade_opt` afterwards;
 # the Reactant path uses `reactant_opt`, which folds restart-then-refine into a single call
 # (it multi-starts when `initial_params === nothing`, and warm-starts otherwise).
-function _optimize_stage(post_i, opt, xprev, i, nstage, frac, strategy, rng)
+function _optimize_stage(post_i, opt, xprev, i, nstage, frac, strategy, rng, held)
     if strategy.use_reactant
         # Mirror the CPU schedule: full maxiters on the first and last stage, half on the
         # intermediate refine stages; `g_tol` early-stop as in `comrade_opt`/`best_image`.
@@ -104,17 +109,19 @@ function _optimize_stage(post_i, opt, xprev, i, nstage, frac, strategy, rng)
         @info "Optimization stage $i/$nstage on Reactant (added noise = $frac)"
         x, _ = reactant_opt(
             post_i, opt; initial_params = xprev, maxiters = mi, ntrials = strategy.ntrials,
-            g_tol = strategy.g_tol, verify = strategy.verify_reactant, rng = rng
+            g_tol = strategy.g_tol, verify = strategy.verify_reactant, rng = rng, held = held
         )
         return x
     elseif i == 1
         @info "Optimization stage $i/$nstage: random restarts (added noise = $frac)"
-        sols, _ = best_image(post_i, strategy.ntrials, strategy.maxiters, rng; opt = opt)
+        sols, _ = best_image(post_i, strategy.ntrials, strategy.maxiters, rng; opt, held)
         return sols[1]
     else
         mi = (i == nstage) ? strategy.maxiters : strategy.maxiters ÷ 2
         @info "Optimization stage $i/$nstage: refine (added noise = $frac)"
-        x, _ = comrade_opt(post_i, opt; initial_params = xprev, maxiters = mi, g_tol = strategy.g_tol)
+        x, _ = _comrade_opt_held(
+            post_i, opt, held; initial_params = xprev, maxiters = mi, g_tol = strategy.g_tol
+        )
         return x
     end
 end
@@ -124,14 +131,25 @@ function _optimize_tempered(imgbase, skym, intm, data, imgdata, strategy, opt, r
     # whose multi-start triggers only when `initial_params === nothing`); later stages
     # warm-start from the previous stage's result.
     xprev = nothing
+    post_i = nothing
+    held = Dict{Symbol, Float64}()
     nstage = length(strategy.noise_schedule)
     for (i, frac) in enumerate(strategy.noise_schedule)
         dat_i = frac == 0.0 ? data : map(d -> add_fractional_noise(d, frac), data)
         post_i = VLBIPosterior(skym, intm, dat_i...; imgdata)
-        xprev = _optimize_stage(post_i, opt, xprev, i, nstage, frac, strategy, rng)
+        if i == 1 && !isempty(strategy.fix_scales)
+            held = held_scale_values(post_i, strategy.fix_scales)
+            @info "Holding sky scales at their prior medians during optimization: $held"
+        end
+        xprev = _optimize_stage(post_i, opt, xprev, i, nstage, frac, strategy, rng, held)
+        _check_held(xprev, held)
         plot_residuals_png(imgbase * "_residuals_step$(i)_map.png", post_i, xprev)
     end
-    return xprev
+    isempty(held) && return xprev
+    xres = rescale_fields(post_i, xprev)
+    @info "Rescaled the sky fields to unit rms: " *
+        join(("$k = $(xres.sky[k])" for k in keys(xres.sky) if xres.sky[k] isa Real && startswith(String(k), "σ")), ", ")
+    return xres
 end
 
 # `start` accepts either a serialized parameter file — a raw NamedTuple, or a run's
@@ -185,7 +203,9 @@ function _metric_adaptor(strategy::FittingStrategy)
     end
     isnothing(sched) && return strategy.adapt_mass_matrix ?
         Comrade.WelfordDiagonal() : Comrade.FixedMetric()
-    return Comrade.FisherLowRank(; rank = strategy.precond_rank, schedule = sched)
+    return Comrade.FisherLowRank(;
+        rank = strategy.precond_rank, schedule = sched, discard = strategy.precond_discard
+    )
 end
 
 function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, transport_method, tgrad = nothing)
@@ -196,6 +216,10 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
     post_cpu = @set post.admode = nothing
     rpost = Comrade.prepare_device(post_cpu, Comrade.ComradeBase.ReactantEx())
     adaptor = _metric_adaptor(strategy)
+    moves = isempty(strategy.moves) ? nothing :
+        SymmetryMoves(post_cpu, strategy.moves, xopt; rounds = strategy.moves_per_chunk)
+    isnothing(moves) ||
+        @info "Moves between NUTS chunks, $(strategy.moves_per_chunk) round(s) each time: $(join(move_name.(moves.moves), ", "))"
     smplr = Comrade.ReactantNUTS(;
         n_adapts = strategy.nadapt, init_step_size = strategy.step_size,
         max_tree_depth = strategy.max_tree_depth,
@@ -263,15 +287,19 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
         trace = sample(
             rpost, smplr, strategy.nsample;
             saveto = disk, initial_params = xopt, restart = restart, warmup_callback = wcb,
-            transport_method = transport_method
+            transport_method = transport_method, between_chunks = moves
         )
     else
         disk = DiskStore(mkpath(out), stride)
         trace = sample(
             rpost, smplr, strategy.nsample;
             saveto = disk, initial_params = xopt, restart = restart,
-            transport_method = transport_method
+            transport_method = transport_method, between_chunks = moves
         )
+    end
+    if !isnothing(moves)
+        @info "moves, warmup: " * move_summary(moves, :warmup)
+        @info "moves, sampling: " * move_summary(moves, :sampling)
     end
     return trace.out, 1:10:strategy.nsample
 end

@@ -168,10 +168,16 @@ function _build_mean_model(meancfg::AbstractDict, g, beam)
     end
 end
 
+_parse_sky_override_value(v::AbstractDict) = parse_dist(v)
+_parse_sky_override_value(v::AbstractVector) = Tuple(parse_dist(vi) for vi in v)
+
+# A sky prior entry is either a single distribution (e.g. `σa`) or, for a Markov RF term
+# (`ρa`, ...), an `NTuple` of one distribution per order — so an override is either a
+# distribution spec table or an array of one spec per term.
 function _parse_sky_overrides(ocfg::AbstractDict)
     d = Dict{Symbol, Any}()
     for (k, v) in ocfg
-        d[Symbol(k)] = parse_dist(v)
+        d[Symbol(k)] = _parse_sky_override_value(v)
     end
     return d
 end
@@ -197,6 +203,17 @@ the key the choice comes from `centerfix` of the mean model, except under
 `model.creg = true`, which turns re-centering off. `center = false` turns it off explicitly
 (with or without `creg`), `center = true` turns it on; `center = true` alongside
 `creg = true` is an error, since both pin the image position.
+
+`model.center_power` is the intensity power `p ≥ 1` of the [`power_centroid`](@ref) that both
+mechanisms use, `1` (the center of light) by default. `p = 2` follows the bright compact
+structure and barely responds to faint diffuse flux. The power reaches the model only through
+re-centering or the centroid regularizer, so setting it while neither is in effect is an error.
+
+`[overrides]` replaces individual sky-prior entries by name (see [`apply_sky_overrides`](@ref)
+for the matching rules). A value is a distribution spec table (`{ dist = "Normal", args =
+[...] }`, parsed by [`parse_dist`](@ref)) for a scalar prior entry (`σa`, ...), or an array of
+one such table per term for a Markov RF correlation length (`ρa`, ...), whose prior is an
+`NTuple` of one distribution per order.
 """
 function build_sky_config(cfg::AbstractDict; beam = nothing)
     check_config_keys(
@@ -208,8 +225,8 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     check_config_keys(
         model,
         (
-            "polrep", "order", "addgauss", "creg", "center", "beamsize_beams", "beamsize",
-            "pulse", "rho_prior",
+            "polrep", "order", "addgauss", "creg", "center", "center_power",
+            "beamsize_beams", "beamsize", "pulse", "rho_prior",
         ),
         "[model]"
     )
@@ -283,6 +300,13 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
 
     gaussp = addg ? gengaussprior(polrep) : NamedTuple()
 
+    # Intensity power of the centroid both position-pinning mechanisms use; see
+    # `power_centroid`. p = 1 is the center of light, larger p tracks the compact structure.
+    cpower = get(model, "center_power", 1)
+    (cpower isa Real && cpower >= 1) ||
+        error("[model] center_power must be a real number >= 1, got $(repr(cpower))")
+    centmsg = isone(cpower) ? "centroid" : "I^$(cpower)-weighted centroid"
+
     # The image position is pinned either by re-centering the raster on its centroid or by the
     # centroid regularizer, never by both. `[model] center` states the choice outright;
     # otherwise the mean model decides through `centerfix`, and `creg` turns re-centering off.
@@ -294,31 +318,41 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
                     "set only one of them"
             )
         end
-        @info "Using a centroid regularization"
+        @info "Using a $centmsg regularization"
         docenter = false
-        imgdata = (Comrade.ImgNormalData(rad2μas ∘ SVector ∘ centroid, SVector(0.0, 0.0), 1.0),)
+        cfunc = rad2μas ∘ SVector ∘ Base.Fix2(power_centroid, cpower)
+        imgdata = (Comrade.ImgNormalData(cfunc, SVector(0.0, 0.0), 1.0),)
     else
         docenter = Bool(get(model, "center", centerfix(typeof(mmodel))))
         imgdata = nothing
     end
-    @info docenter ? "Re-centering the image on its centroid" : "Image re-centering is off"
+
+    if haskey(model, "center_power") && !docenter && !creg
+        error(
+            "[model] center_power sets the intensity weighting of the centroid the image " *
+                "position is pinned to, but nothing pins it: set center = true or " *
+                "creg = true, or drop center_power"
+        )
+    end
+    @info docenter ? "Re-centering the image on its $centmsg" : "Image re-centering is off"
 
     ctor = sky_constructor(polrep, base)
     skym = if base === GMRF
         ctor(
             g; meanmodel = mmodel, ftot = ftotpr, beamsize = corr_beam, order = order,
-            gaussprior = gaussp, center = Val(docenter), pulse
+            gaussprior = gaussp, center = Val(docenter), center_power = cpower, pulse
         )
     elseif base isa MarkovRF
         ctor(
             g; base = prepare_base(base, g, order), meanmodel = mmodel, ftot = ftotpr,
-            beamsize = corr_beam, gaussprior = gaussp, center = Val(docenter), pulse,
-            rhoprior
+            beamsize = corr_beam, gaussprior = gaussp, center = Val(docenter),
+            center_power = cpower, pulse, rhoprior
         )
     else
         ctor(
             g; base = prepare_base(base, g, order), meanmodel = mmodel, ftot = ftotpr,
-            beamsize = corr_beam, gaussprior = gaussp, center = Val(docenter), pulse
+            beamsize = corr_beam, gaussprior = gaussp, center = Val(docenter),
+            center_power = cpower, pulse
         )
     end
     skym = @set skym.prior = apply_sky_overrides(skym.prior, overrides)

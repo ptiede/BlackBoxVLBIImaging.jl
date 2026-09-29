@@ -9,7 +9,8 @@
 #   - `mean ~ genmeanprior(meanmodel)` is the mean-model group (empty for a fixed image),
 #   - `flux ~ _flux_prior(ftot)` samples the total flux only when `ftot` is a distribution,
 #   - `gauss ~ gaussprior` is the optional extra-Gaussian group (empty NamedTuple = off),
-#   - `center` is `Val(true/false)` so re-centering stays a compile-time choice.
+#   - `center` is `Val(true/false)` so re-centering stays a compile-time choice, and
+#     `center_power` is the intensity power the centroid it re-centers on is weighted by.
 #
 # NOTE: the definitions carry plain comments instead of docstrings — the doc system cannot
 # attach a docstring to the multi-definition block `@sky`/`@instrument` expand to.
@@ -70,9 +71,26 @@ end
 end
 
 # --- centering ---------------------------------------------------------------------------
-@inline _center_model(pmap, ::Val{false}, pulse) = ContinuousImage(pmap, pulse)
-@inline function _center_model(pmap, ::Val{true}, pulse)
-    x0, y0 = centroid(pmap)
+"""
+    power_centroid(img, p)
+
+The `Iᵖ`-weighted centroid of an intensity map, in the coordinates of its grid. `p = 1` is the
+center of light, [`centroid`](@ref); a larger `p` weights the bright pixels more heavily, so
+the result follows the compact structure and is nearly blind to faint extended flux. Polarized
+maps use Stokes `I`.
+"""
+function power_centroid(img, p)
+    isone(p) && return centroid(img)
+    # The Iᵖ centroid is the center of light of the raised map, so it inherits whichever
+    # `centroid` the array type brings with it (CPU, GPU, Reactant).
+    return centroid(IntensityMap(baseimage(img) .^ p, axisdims(img)))
+end
+
+power_centroid(img::IntensityMap{<:StokesParams}, p) = power_centroid(stokes(img, :I), p)
+
+@inline _center_model(pmap, ::Val{false}, pulse, power) = ContinuousImage(pmap, pulse)
+@inline function _center_model(pmap, ::Val{true}, pulse, power)
+    x0, y0 = power_centroid(pmap, power)
     return shifted(ContinuousImage(pmap, pulse), -x0, -y0)
 end
 
@@ -173,7 +191,7 @@ end
 # =========================================================================================
 
 # Stokes-I imaging with a first-order GMRF fluctuation field (`order == 1`).
-@sky function stokesi_gmrf(grid; meanmodel, ftot, beamsize, order = 1, gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function stokesi_gmrf(grid; meanmodel, ftot, beamsize, order = 1, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     c ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
     σ ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
     mean ~ genmeanprior(meanmodel)
@@ -182,12 +200,12 @@ end
     mimg = make_mean(meanmodel, grid, mean)
     f = _get_ftot(ftot, flux)
     pmap = make_stokesi(_img_flux(f, gauss), mimg, σ .* c.params)
-    ms = _center_model(pmap, center, pulse)
+    ms = _center_model(pmap, center, pulse, center_power)
     return _add_gauss(ms, f, gauss)
 end
 
 # Stokes-I imaging with a non-centered Markov transform of the GMRF (`order > 1`).
-@sky function stokesi_ncmrf(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function stokesi_ncmrf(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     c ~ (
         hyperparams = VLBITruncated(
             VLBIInverseGamma(1.0, -log(0.01) * beamsize / pixelsizes(grid).X);
@@ -207,12 +225,12 @@ end
     apply_fluctuations!(CenteredLR(), img, mimg, δ)
     bimg = baseimage(img)
     bimg .*= _img_flux(f, gauss)
-    ms = _center_model(img, center, pulse)
+    ms = _center_model(img, center, pulse, center_power)
     return _add_gauss(ms, f, gauss)
 end
 
 # Stokes-I imaging with a stationary Matérn fluctuation field (`order == 0`).
-@sky function stokesi_matern(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function stokesi_matern(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     c ~ VLBIImagePriors.std_dist(base)
     σ ~ VLBITruncated(VLBIGaussian(0.0, 1.0); lower = 0.0)
     ρ ~ VLBITruncated(
@@ -229,12 +247,12 @@ end
     # (make_image(TotalIntensity, StationaryMatern) never multiplied by σ).
     δ = base(c, ρ, ν)
     pmap = make_stokesi(_img_flux(f, gauss), mimg, δ)
-    ms = _center_model(pmap, center, pulse)
+    ms = _center_model(pmap, center, pulse, center_power)
     return _add_gauss(ms, f, gauss)
 end
 
 # Stokes-I imaging with an order-`N` Markov power-spectrum stationary field (`order < 0`).
-@sky function stokesi_markovrf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function stokesi_markovrf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     c ~ VLBIImagePriors.std_dist(base.plan)
     σ ~ VLBITruncated(VLBIGaussian(0.0, 1.0); lower = 0.0)
     ρs ~ markov_rho_prior(rhoprior, grid, beamsize, markov_order(base.ps))
@@ -246,7 +264,7 @@ end
     δ = genfield(StationaryRandomField(MarkovPS(ρs), base.plan), c)
     δ .*= σ
     pmap = make_stokesi(_img_flux(f, gauss), mimg, δ)
-    ms = _center_model(pmap, center, pulse)
+    ms = _center_model(pmap, center, pulse, center_power)
     return _add_gauss(ms, f, gauss)
 end
 
@@ -255,7 +273,7 @@ end
 # =========================================================================================
 
 # Poincaré-sphere polarized imaging with a first-order GMRF field (`order == 1`).
-@sky function poincare_gmrf(grid; meanmodel, ftot, beamsize, order = 1, gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function poincare_gmrf(grid; meanmodel, ftot, beamsize, order = 1, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     c ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
     σ ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
     p ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
@@ -268,14 +286,14 @@ end
     mimg = make_mean(meanmodel, grid, mean)
     f = _get_ftot(ftot, flux)
     pmap = make_poincare(_img_flux(f, gauss), mimg, σ .* c.params, p0, pσ, p.params, angparams)
-    ms = _center_model(pmap, center, pulse)
+    ms = _center_model(pmap, center, pulse, center_power)
     return _add_gauss(ms, f, gauss)
 end
 
 # Poincaré-sphere polarized imaging with a stationary Matérn field (`order == 0`).
 # The polarized-field hyperparameters are named `pρ`/`pν` (matching the `p0`/`pσ` style);
 # the pre-macro code disagreed with itself (prior `ρp`/`νp` vs body `pρ`/`pν`) and errored.
-@sky function poincare_matern(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function poincare_matern(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     c ~ VLBIImagePriors.std_dist(base)
     σ ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
     ρ ~ VLBITruncated(
@@ -301,7 +319,7 @@ end
     pδ = base(p, pρ, pν)
     δ .*= σ
     pmap = make_poincare(_img_flux(f, gauss), mimg, δ, p0, pσ, pδ, angparams)
-    ms = _center_model(pmap, center, pulse)
+    ms = _center_model(pmap, center, pulse, center_power)
     return _add_gauss(ms, f, gauss)
 end
 
@@ -310,7 +328,7 @@ end
 # =========================================================================================
 
 # PolExp polarized imaging with first-order GMRF fields (`order == 1`).
-@sky function polexp_gmrf(grid; meanmodel, ftot, beamsize, order = 1, gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function polexp_gmrf(grid; meanmodel, ftot, beamsize, order = 1, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     a ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
     b ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
     c ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
@@ -325,12 +343,12 @@ end
     mimg = make_mean(meanmodel, grid, mean)
     f = _get_ftot(ftot, flux)
     pmap = make_pol2expimage(_img_flux(f, gauss), σa .* a.params, σb .* b.params, σc .* c.params, σd .* d.params, mimg)
-    ms = _center_model(pmap, center, pulse)
+    ms = _center_model(pmap, center, pulse, center_power)
     return _add_gauss(ms, f, gauss)
 end
 
 # PolExp polarized imaging with non-centered Markov transforms (`order > 1`).
-@sky function polexp_ncmrf(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function polexp_ncmrf(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     a ~ (
         hyperparams = VLBITruncated(
             VLBIInverseGamma(1.0, -log(0.01) * beamsize / pixelsizes(grid).X);
@@ -377,12 +395,12 @@ end
     δc .*= σc
     δd .*= σd
     pmap = make_pol2expimage(_img_flux(f, gauss), δa, δb, δc, δd, mimg)
-    ms = _center_model(pmap, center, pulse)
+    ms = _center_model(pmap, center, pulse, center_power)
     return _add_gauss(ms, f, gauss)
 end
 
 # PolExp polarized imaging with stationary Matérn fields (`order == 0`).
-@sky function polexp_matern(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function polexp_matern(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     a ~ VLBIImagePriors.std_dist(base)
     b ~ VLBIImagePriors.std_dist(base)
     c ~ VLBIImagePriors.std_dist(base)
@@ -425,12 +443,12 @@ end
     δc .*= σc
     δd .*= σd
     pmap = make_pol2expimage(_img_flux(f, gauss), δa, δb, δc, δd, mimg)
-    ms = _center_model(pmap, center, pulse)
+    ms = _center_model(pmap, center, pulse, center_power)
     return _add_gauss(ms, f, gauss)
 end
 
 # PolExp polarized imaging with order-`N` Markov power-spectrum stationary fields (`order < 0`).
-@sky function polexp_markovrf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), pulse = DeltaPulse())
+@sky function polexp_markovrf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     a ~ VLBIImagePriors.std_dist(base.plan)
     b ~ VLBIImagePriors.std_dist(base.plan)
     c ~ VLBIImagePriors.std_dist(base.plan)
@@ -457,7 +475,7 @@ end
     δc .*= σc
     δd .*= σd
     pmap = make_pol2expimage(_img_flux(f, gauss), δa, δb, δc, δd, mimg)
-    ms = _center_model(pmap, center, pulse)
+    ms = _center_model(pmap, center, pulse, center_power)
     return _add_gauss(ms, f, gauss)
 end
 

@@ -38,6 +38,15 @@ function _reactant_opt_step!(opt_state, tpost, x)
     return new_state, new_x, val, grad
 end
 
+# `_reactant_opt_step!` with the gradient zeroed where `free` is 0, so Adam leaves those
+# coordinates exactly where they are.
+function _reactant_opt_step!(opt_state, tpost, x, free)
+    grad, val = _reactant_value_and_grad(tpost, x)
+    grad = grad .* free
+    new_state, new_x = Optimisers.update!(opt_state, x, grad)
+    return new_state, new_x, val, grad
+end
+
 # Gradient ∞-norm as its own compiled program (see `_reactant_opt_step!`).
 _grad_infnorm(g) = maximum(abs, g)
 
@@ -99,7 +108,8 @@ end
 
 """
     reactant_opt(post::VLBIPosterior, optimiser; initial_params=nothing, maxiters=10_000,
-                 ntrials=1, log_stride=250, rng=Random.default_rng()) -> (xopt, sol)
+                 ntrials=1, log_stride=250, rng=Random.default_rng(),
+                 held=Dict{Symbol, Float64}()) -> (xopt, sol)
 
 Optimize `post` on the Reactant device with an Optimisers.jl `optimiser` (e.g.
 `Optimisers.Adam(η)`). Mirrors `comrade_opt`/`best_image`: with no `initial_params`, runs
@@ -107,6 +117,7 @@ Optimize `post` on the Reactant device with an Optimisers.jl `optimiser` (e.g.
 the best objective — this is what avoids the bad local minima that a single start falls
 into. A supplied `initial_params` (e.g. a later tempering stage) is a single warm start.
 Returns the optimum `xopt` as a host NamedTuple and `sol = (; objective = -logdensity)`.
+The sky parameters in `held` (name => value) stay at their values throughout.
 
 The posterior is moved to the device internally via `prepare_device`; the per-step program
 (value + Enzyme gradient + update) is compiled once and reused for every trial (the shapes
@@ -117,7 +128,7 @@ the host each step is far slower than the device step itself).
 function reactant_opt(
         post::VLBIPosterior, optimiser; initial_params = nothing, maxiters = 10_000,
         ntrials = 1, log_stride = 250, gc_stride = 100, g_tol = 1.0e-1, verify = true,
-        rtol = 1.0e-2, rng = Random.default_rng()
+        rtol = 1.0e-2, rng = Random.default_rng(), held::AbstractDict = Dict{Symbol, Float64}()
     )
     dpost = Comrade.prepare_device(post, Comrade.ComradeBase.ReactantEx())
     tpost = asflat(dpost)
@@ -127,11 +138,23 @@ function reactant_opt(
     nstarts = multistart ? max(ntrials, 1) : 1
     npass = multistart ? 2 : 1
     passmax = max(maxiters ÷ npass, 1)
-    _start() = multistart ? prior_sample(rng, dpost) : initial_params
+    _start() = if !multistart
+        _hold_scales(initial_params, held)
+    elseif isempty(held)
+        prior_sample(rng, dpost)
+    else
+        _hold_scales(prior_sample(rng, post), held)
+    end
 
     xr = Reactant.to_rarray(Comrade.inverse(tpost, _start()))
     opt_state = Reactant.@jit Optimisers.setup(optimiser, xr)
-    step_jit = Reactant.@compile _reactant_opt_step!(opt_state, tpost, xr)
+    step_args = if isempty(held)
+        ()
+    else
+        free = _free_coordinates(post, _hold_scales(prior_sample(rng, post), held), held)
+        (Reactant.to_rarray(Float64.(free)),)
+    end
+    step_jit = Reactant.@compile _reactant_opt_step!(opt_state, tpost, xr, step_args...)
     gnorm_jit = Reactant.@compile _grad_infnorm(xr)   # grad has x's shape
 
     best_x_flat = nothing
@@ -142,7 +165,7 @@ function reactant_opt(
             opt_state = Reactant.@jit Optimisers.setup(optimiser, xr)   # fresh optimizer per pass
             loss = nothing
             for i in 1:passmax
-                opt_state, xr, loss, grad = step_jit(opt_state, tpost, xr)
+                opt_state, xr, loss, grad = step_jit(opt_state, tpost, xr, step_args...)
                 # Log and check `g_tol` convergence at the same cadence (both read device
                 # scalars to the host, forcing a sync — so we avoid doing it every iteration).
                 if i == 1 || i % log_stride == 0 || i == passmax

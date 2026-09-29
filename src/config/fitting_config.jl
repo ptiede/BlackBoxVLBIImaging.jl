@@ -18,6 +18,9 @@ Base.@kwdef struct FittingStrategy
     ntrials::Int = 5
     g_tol::Float64 = 0.1
     eta::Float64 = 0.001            # learning rate for the Optimisers.jl rules (Adam/AdamW)
+    # sky scale parameters held at their prior medians during optimization; non-empty also
+    # rescales the optimum's fields to unit rms (see `build_fitting_config`)
+    fix_scales::Vector{Symbol} = Symbol[]
     # tempering: fractional-noise level per optimization round (0.0 = full data)
     noise_schedule::Vector{Float64} = [0.05, 0.025, 0.0]
     nsample::Int = 10_000
@@ -35,6 +38,10 @@ Base.@kwdef struct FittingStrategy
     # balance); with it off, the fitted preconditioner IS the metric and only the step
     # size adapts. Keep ON for pilot rounds with no preconditioner.
     adapt_mass_matrix::Bool = true
+    # Metropolis–Hastings moves run between the Reactant NUTS chunks (see
+    # `SymmetryMoves`), `moves_per_chunk` rounds of every move each time. Empty = none.
+    moves::Vector{String} = String[]
+    moves_per_chunk::Int = 1
     # preconditioning: before sampling, fit a low-rank affine reparameterization of the
     # flat latent space from a pilot run's posterior draws (see `fit_preconditioner`),
     # and sample in the preconditioned coordinates. `precond_pilot` is the pilot's MCMC
@@ -86,6 +93,31 @@ end
 Parse a fitting-strategy TOML into a [`FittingStrategy`](@ref). Sections: `[optimizer]`,
 `[tempering]`, `[sampler]` (NUTS tuning), `[run]`. The sampler is always NUTS; the backend
 (AdvancedHMC NUTS vs Reactant NUTS) follows `run.use_reactant`.
+
+`[optimizer] fix_scales` lists scalar sky parameters (e.g. `["σb", "σc", "σd"]`) that every
+optimization stage holds at the median of their prior; the other parameters are optimized
+as usual. After the last stage, every non-centered sky field `X` with scale `σX` (in
+`polexp_markovrf`: `a`, `b`, `c`, `d`) is rescaled to `σX * rms(X)` and `X / rms(X)`, which
+leaves the image unchanged and puts the white coefficients at the radius the prior's typical
+set has (`rms(X) = 1`); see [`rescale_fields`](@ref). The sampler starts from that point
+with every parameter free. Empty (the default) changes nothing. A name that is not a scalar
+sky parameter of the model is an error when optimization starts.
+
+`[sampler] moves` lists Metropolis–Hastings moves run between the Reactant NUTS chunks (see
+[`SymmetryMoves`](@ref)):
+
+  - `"flux_gain"`: total flux against a common gain log-amplitude `lg1`;
+  - `"field_scale"`: each non-centered sky field against its scale `σX`;
+  - `"rho_field"`: each correlation length of each Markov RF field against the field's
+    white coefficients;
+  - `"mean_field"`: each mean-model parameter against the log-intensity field `a` (PolExp
+    Markov RF models);
+  - `"phase_offset"`: a random-walk step of each free site's gain phase offset `gp1μ`.
+
+The first four leave the likelihood unchanged. `[sampler] moves_per_chunk` (an integer ≥ 1,
+default 1) is the number of rounds of every move made between two chunks. Absent or empty
+`moves` runs no moves. Unknown names, repeated names, moves on the AdvancedHMC path
+(`use_reactant = false`), and `moves_per_chunk` without `moves` are errors.
 """
 function build_fitting_config(cfg::AbstractDict)
     check_config_keys(
@@ -98,14 +130,16 @@ function build_fitting_config(cfg::AbstractDict)
     prec = get(cfg, "precondition", Dict{String, Any}())
     run = get(cfg, "run", Dict{String, Any}())
 
-    check_config_keys(opt, ("method", "maxiters", "ntrials", "g_tol", "eta"), "[optimizer]")
+    check_config_keys(
+        opt, ("method", "maxiters", "ntrials", "g_tol", "eta", "fix_scales"), "[optimizer]"
+    )
     check_config_keys(temp, ("noise_schedule",), "[tempering]")
     check_config_keys(
         samp,
         (
             "nsample", "nadapt", "step_size", "target_accept", "init_buffer",
             "term_buffer", "max_tree_depth", "chunk_size", "base_window",
-            "adapt_mass_matrix",
+            "adapt_mass_matrix", "moves", "moves_per_chunk",
         ),
         "[sampler]"
     )
@@ -132,6 +166,27 @@ function build_fitting_config(cfg::AbstractDict)
     startval = get(run, "start", "")
     start = (startval == "") ? nothing : String(startval)
 
+    fix_scales = get(opt, "fix_scales", String[])
+    (fix_scales isa AbstractVector && all(v -> v isa AbstractString, fix_scales)) ||
+        error("optimizer.fix_scales must be a list of sky parameter names, got $(repr(fix_scales))")
+    allunique(fix_scales) || error("optimizer.fix_scales lists a name twice: $fix_scales")
+
+    moves = get(samp, "moves", String[])
+    (moves isa AbstractVector && all(v -> v isa AbstractString, moves)) ||
+        error("sampler.moves must be a list of move names, got $(repr(moves))")
+    unknown_moves = setdiff(moves, SYMMETRY_MOVES)
+    isempty(unknown_moves) ||
+        error("unknown sampler.moves $(unknown_moves). Allowed: $(collect(SYMMETRY_MOVES))")
+    allunique(moves) || error("sampler.moves lists a move twice: $moves")
+    isempty(moves) || use_reactant ||
+        error("sampler.moves needs the Reactant sampler (run.use_reactant = true); got $moves")
+    moves_per_chunk = get(samp, "moves_per_chunk", 1)
+    (moves_per_chunk isa Integer && moves_per_chunk >= 1) || error(
+        "sampler.moves_per_chunk must be an integer ≥ 1, got $(repr(moves_per_chunk))"
+    )
+    (haskey(samp, "moves_per_chunk") && isempty(moves)) &&
+        error("sampler.moves_per_chunk is set but sampler.moves lists no moves")
+
     pilotval = get(prec, "pilot", "")
     precond_pilot = (pilotval == "") ? nothing : String(pilotval)
 
@@ -141,6 +196,7 @@ function build_fitting_config(cfg::AbstractDict)
         ntrials = Int(get(opt, "ntrials", 5)),
         g_tol = Float64(get(opt, "g_tol", 0.1)),
         eta = Float64(get(opt, "eta", 0.001)),
+        fix_scales = Symbol.(fix_scales),
         noise_schedule = Float64.(get(temp, "noise_schedule", [0.05, 0.025, 0.0])),
         nsample = Int(get(samp, "nsample", 10_000)),
         nadapt = Int(get(samp, "nadapt", 5_000)),
@@ -152,6 +208,8 @@ function build_fitting_config(cfg::AbstractDict)
         chunk_size = Int(get(samp, "chunk_size", 100)),
         base_window = Int(get(samp, "base_window", 25)),
         adapt_mass_matrix = Bool(get(samp, "adapt_mass_matrix", true)),
+        moves = String.(moves),
+        moves_per_chunk = Int(moves_per_chunk),
         precond_pilot = precond_pilot,
         precond_rank = Int(get(prec, "rank", 16)),
         precond_nsamples = Int(get(prec, "nsamples", 2000)),

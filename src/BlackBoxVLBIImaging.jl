@@ -65,7 +65,10 @@ include("config/fitting_config.jl")
 
 # --- imaging pipeline ------------------------------------------------------------------
 include("pipeline/output.jl")
+include("pipeline/fixed_scales.jl")
 include("pipeline/reactant_opt.jl")
+include("pipeline/moves.jl")
+include("pipeline/gibbs_dili.jl")
 include("pipeline/imager.jl")
 include("pipeline/run.jl")
 
@@ -76,7 +79,7 @@ function __init__()
 end
 
 # sky models (one @sky constructor per polrep × random-field base)
-export centroid
+export centroid, power_centroid
 export stokesi_gmrf, stokesi_ncmrf, stokesi_matern, stokesi_markovrf
 export poincare_gmrf, poincare_matern
 export polexp_gmrf, polexp_ncmrf, polexp_matern, polexp_markovrf
@@ -92,7 +95,8 @@ export assemble_instrument, parse_dist, parse_process, parse_init
 # config layer
 export build_sky_config, build_instrument_config, build_data_config, build_fitting_config
 export FittingStrategy
+export SymmetryMoves, FluxGainMove, FieldScaleMove, RhoFieldMove, MeanFieldMove, PhaseOffsetMove, move_summary
 # pipeline
-export comrade_imager, best_image, reactant_opt, load_chain_and_post, load_posterior, saveimgs, image_from_toml
+export comrade_imager, best_image, reactant_opt, rescale_fields, held_scale_values, load_chain_and_post, load_posterior, saveimgs, image_from_toml
 
 end

@@ -46,6 +46,12 @@ creg = false
 # turns re-centering off); center = true alongside creg = true is an error.
 # center = false
 
+# intensity power p >= 1 of the centroid that re-centering and creg pin (default 1, the center
+# of light). p = 2 follows the bright compact structure and is nearly blind to faint diffuse
+# flux. Only center = true or creg = true makes it do anything; setting it otherwise is an
+# error.
+# center_power = 2
+
 # pixel interpolation kernel: delta (default), bspline0, bspline1, bspline3, bicubic,
 # gaussian, raised_cosine
 pulse = "delta"
@@ -79,8 +85,10 @@ fwhm_beams = 1.0
 ftot = [0.1, 2.5]
 
 # --- optional per-prior overrides ------------------------------------------------------
-# Replace individual sky-prior entries by parameter name. The available names depend on
-# polrep/order (e.g. PolExp uses the a/b/c/d rasters and σa/σb/σc/σd scales). Distributions use
-# the same closed allowlist as the instrument priors (see src/instrument/distspec.jl).
+# Replace individual sky-prior entries by parameter name (quoted: TOML bare keys are ASCII
+# only). The available names depend on polrep/order (e.g. PolExp uses the a/b/c/d rasters and
+# σa/σb/σc/σd scales, and a Markov RF expansion's ρa/ρb/... take an array of one distribution
+# spec per order term instead of a single spec). Distributions use the same closed allowlist as
+# the instrument priors (see src/instrument/distspec.jl).
 # [overrides]
-# σa = { dist = "Exponential", args = [0.5] }
+# "σa" = { dist = "Exponential", args = [0.5] }
