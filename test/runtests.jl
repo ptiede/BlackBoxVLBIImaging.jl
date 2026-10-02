@@ -443,6 +443,32 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).carry === :keep
         cfg5["precondition"]["refit_carry"] = "yes"
         @test_throws "precondition.refit_carry must be" build_fitting_config(cfg5)
+        # Gauss–Newton refits
+        cfg5["precondition"] = Dict{String, Any}(
+            "refit_schedule" => "stan", "refit_kind" => "gauss_newton", "rank" => 600, "threshold" => 50.0
+        )
+        sg = build_fitting_config(cfg5)
+        @test (sg.precond_refit_kind, sg.precond_rank, sg.precond_threshold, sg.precond_oversample) == ("gauss_newton", 600, 50.0, 10)
+        H(x, W) = W
+        ga = BlackBoxVLBIImaging._metric_adaptor(sg, H)
+        @test ga isa Comrade.GaussNewtonLowRank && ga.curvature === H && ga.probes_per_draw == 610 && ga.schedule === :stan
+        cfg5["precondition"]["probes_per_draw"] = 70
+        @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5), H).probes_per_draw == 70
+        @test_throws "need a curvature function" BlackBoxVLBIImaging._metric_adaptor(sg)
+        for (edit, msg) in (
+                (c -> c["precondition"]["refit_kind"] = "hessian", "precondition.refit_kind must be"),
+                (c -> delete!(c["precondition"], "rank"), "needs precondition.rank"),
+                (c -> delete!(c["precondition"], "refit_schedule"), "needs refit_schedule or refit_at"),
+                (c -> c["precondition"]["refit_carry"] = "rescale", "precondition.refit_carry applies to Fisher refits"),
+                (c -> c["precondition"]["pilot"] = "run", "precondition.pilot fits a Fisher transform"),
+                (c -> c["run"]["latent_space"] = "flat", "needs run.latent_space = \"stdnormal\""),
+                (c -> c["run"]["use_reactant"] = false, "needs run.use_reactant = true"),
+                (c -> delete!(c["precondition"], "refit_kind"), "precondition.threshold, probes_per_draw apply to refit_kind = \"gauss_newton\" only"),
+            )
+            c = deepcopy(cfg5)
+            edit(c)
+            @test_throws msg build_fitting_config(c)
+        end
         delete!(cfg5, "precondition")
         cfg5["sampler"]["moves"] = ["phase_sheet"]
         @test build_fitting_config(cfg5).moves == ["phase_sheet"]
@@ -1324,6 +1350,19 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                     sub = BB.gauss_newton_subspace(k, us; rank = 10, threshold = thr, power = 4, rng = Random.Xoshiro(5))
                     @test length(sub) == 6
                     @test sub.λ ≈ Ed.values[1:6] rtol = 1.0e-6
+
+                    # the curvature function of the Gauss–Newton adaptor acts in the latent
+                    # coordinates the sampler's StdNormal space uses, column by column
+                    tsamp = Comrade.transport_to(posts, BB.PT.StdNormal())
+                    @test Comrade.transform(tsamp, u) == Comrade.transform(tps, u)
+                    curv = BB.gauss_newton_curvature(k)
+                    @test curv(u, [v w]) ≈ [GNv GNw] rtol = 1.0e-12
+                    # with a complete probe set the sketch is exact
+                    ga = Comrade.GaussNewtonLowRank(curv; rank = n - 4, oversample = 4, threshold = thr, min_draws = 2)
+                    st = Comrade.init_metric_adaptation(ga)
+                    foreach(x -> Comrade.observe_draw!(ga, st, nothing, x, zero(x)), us)
+                    fit = Comrade.metric_refit(ga, st)
+                    @test 1 ./ fit.s .^ 2 .- 1 ≈ Ed.values[1:6] rtol = 1.0e-6
                 end
             end
         else

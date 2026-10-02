@@ -128,11 +128,17 @@ end
 
 function GaussNewtonKernels(post::VLBIPosterior)
     postc = ConstructionBase.setproperties(post, (; admode = nothing))
-    rpost = Comrade.prepare_device(postc, Comrade.ComradeBase.ReactantEx())
-    return GaussNewtonKernels(
-        stdnormal_posterior(rpost), stdnormal_posterior(post), ResidualMap(post), Dict{Any, Any}()
-    )
+    return GaussNewtonKernels(post, Comrade.prepare_device(postc, Comrade.ComradeBase.ReactantEx()))
 end
+
+"""
+    GaussNewtonKernels(post::VLBIPosterior, rpost::VLBIPosterior)
+
+The kernels on `rpost`, an existing device copy of `post` (from `Comrade.prepare_device`).
+"""
+GaussNewtonKernels(post::VLBIPosterior, rpost::VLBIPosterior) = GaussNewtonKernels(
+    stdnormal_posterior(rpost), stdnormal_posterior(post), ResidualMap(post), Dict{Any, Any}()
+)
 
 _device(x) = x isa Reactant.ConcreteRArray ? x : Reactant.to_rarray(collect(Float64, x))
 
@@ -145,6 +151,24 @@ end
 
 gauss_newton(k::GaussNewtonKernels, u, v) =
     _kernel(gauss_newton_product, k, :gauss_newton, _device(u), _device(v))
+
+"""
+    gauss_newton_curvature(k::GaussNewtonKernels)
+
+The function `(x, W) -> H(x) W` of the Gauss–Newton operator `H` of `k` at the StdNormal
+latent point `x`, applied to each column of the host matrix `W`; the curvature argument of
+`Comrade.GaussNewtonLowRank`.
+"""
+function gauss_newton_curvature(k::GaussNewtonKernels)
+    return function (x, W)
+        xd = _device(x)
+        HW = similar(W, Float64)
+        for j in axes(W, 2)
+            HW[:, j] = Array(gauss_newton(k, xd, view(W, :, j)))
+        end
+        return HW
+    end
+end
 
 # --- averaged subspace -------------------------------------------------------------------
 

@@ -70,6 +70,16 @@ Base.@kwdef struct FittingStrategy
     # the starting transform (`seed_transport`) exactly and refits only the directions added
     # to it.
     precond_refit_carry::String = "none"
+    # What in-run refits fit: "fisher" (`Comrade.FisherLowRank`, from warmup draws and
+    # scores) or "gauss_newton" (`Comrade.GaussNewtonLowRank`, from the likelihood's
+    # Gauss–Newton curvature at the warmup draws; "stdnormal" space, Reactant only). For
+    # "gauss_newton", `precond_rank` is the most directions a fit keeps, `precond_threshold`
+    # the smallest curvature eigenvalue kept, `precond_oversample` the extra probe columns,
+    # and `precond_probes_per_draw` the probe columns applied per warmup draw (0 = all).
+    precond_refit_kind::String = "fisher"
+    precond_threshold::Float64 = 100.0
+    precond_oversample::Int = 10
+    precond_probes_per_draw::Int = 0
     # Start in the latent space stored in a transport.jls (a low-rank preconditioner of the
     # run's latent space). With in-run refits they refine it instead of the score-init
     # diagonal; without, it is the fixed transform. Exclusive with `precond_pilot`.
@@ -168,6 +178,7 @@ function build_fitting_config(cfg::AbstractDict)
         (
             "pilot", "rank", "nsamples", "discard", "augment",
             "refit_at", "refit_schedule", "refit_carry", "seed_transport",
+            "refit_kind", "threshold", "oversample", "probes_per_draw",
         ),
         "[precondition]"
     )
@@ -225,6 +236,26 @@ function build_fitting_config(cfg::AbstractDict)
         error("precondition.refit_carry must be \"none\", \"rescale\" or \"keep\", got $(repr(refit_carry))")
     (refit_carry == "keep" && get(prec, "seed_transport", "") == "") &&
         error("precondition.refit_carry = \"keep\" keeps the starting transform; set precondition.seed_transport")
+    refit_kind = get(prec, "refit_kind", "fisher")
+    refit_kind in ("fisher", "gauss_newton") ||
+        error("precondition.refit_kind must be \"fisher\" or \"gauss_newton\", got $(repr(refit_kind))")
+    gn_keys = filter(k -> haskey(prec, k), ["threshold", "oversample", "probes_per_draw"])
+    if refit_kind == "gauss_newton"
+        use_reactant || error("precondition.refit_kind = \"gauss_newton\" needs run.use_reactant = true")
+        latent_space == "stdnormal" ||
+            error("precondition.refit_kind = \"gauss_newton\" needs run.latent_space = \"stdnormal\"")
+        haskey(prec, "rank") ||
+            error("precondition.refit_kind = \"gauss_newton\" needs precondition.rank (the most directions a fit keeps)")
+        refit_carry == "none" ||
+            error("precondition.refit_carry applies to Fisher refits; remove it for refit_kind = \"gauss_newton\"")
+        (haskey(prec, "refit_at") || get(prec, "refit_schedule", "manual") != "manual") ||
+            error("precondition.refit_kind = \"gauss_newton\" needs refit_schedule or refit_at")
+        get(prec, "pilot", "") == "" ||
+            error("precondition.pilot fits a Fisher transform; use seed_transport to start a \"gauss_newton\" run from a stored one")
+    else
+        isempty(gn_keys) ||
+            error("precondition.$(join(gn_keys, ", ")) apply to refit_kind = \"gauss_newton\" only")
+    end
     return FittingStrategy(
         opt_method = opt_method,
         maxiters = Int(get(opt, "maxiters", 10_000)),
@@ -253,6 +284,10 @@ function build_fitting_config(cfg::AbstractDict)
         precond_refit_at = Float64.(get(prec, "refit_at", Float64[])),
         precond_refit_schedule = String(get(prec, "refit_schedule", "manual")),
         precond_refit_carry = refit_carry,
+        precond_refit_kind = refit_kind,
+        precond_threshold = Float64(get(prec, "threshold", 100.0)),
+        precond_oversample = Int(get(prec, "oversample", 10)),
+        precond_probes_per_draw = Int(get(prec, "probes_per_draw", 0)),
         precond_seed_transport = String(get(prec, "seed_transport", "")),
         latent_space = latent_space,
         use_reactant = use_reactant,

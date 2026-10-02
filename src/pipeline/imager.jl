@@ -192,11 +192,13 @@ function _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart, transport_
 end
 
 # The warmup metric strategy a fitting config asks for. A `[precondition]` refit schedule
-# selects the Fisher low-rank adaptor, which refits the latent space in-run and holds the
-# metric at identity; without one the sampler's own diagonal adaptation runs unless the
-# config turned it off (as it must be when a fitted transform is supplied up front, since
-# diagonal adaptation renormalizes the marginals the transform deliberately set).
-function _metric_adaptor(strategy::FittingStrategy)
+# selects a low-rank adaptor (Fisher or Gauss–Newton, per `refit_kind`), which refits the
+# latent space in-run and holds the metric at identity; without one the sampler's own
+# diagonal adaptation runs unless the config turned it off (as it must be when a fitted
+# transform is supplied up front, since diagonal adaptation renormalizes the marginals the
+# transform deliberately set). Gauss–Newton refits need `curvature`, the function
+# `gauss_newton_curvature` builds.
+function _metric_adaptor(strategy::FittingStrategy, curvature = nothing)
     sched = if strategy.precond_refit_schedule == "stan"
         :stan
     elseif strategy.precond_refit_schedule == "nutpie"
@@ -208,6 +210,15 @@ function _metric_adaptor(strategy::FittingStrategy)
     end
     isnothing(sched) && return strategy.adapt_mass_matrix ?
         Comrade.WelfordDiagonal() : Comrade.FixedMetric()
+    if strategy.precond_refit_kind == "gauss_newton"
+        isnothing(curvature) && throw(ArgumentError("Gauss–Newton refits need a curvature function"))
+        k = strategy.precond_rank + strategy.precond_oversample
+        return Comrade.GaussNewtonLowRank(
+            curvature; rank = strategy.precond_rank, oversample = strategy.precond_oversample,
+            probes_per_draw = strategy.precond_probes_per_draw == 0 ? k : strategy.precond_probes_per_draw,
+            threshold = strategy.precond_threshold, schedule = sched
+        )
+    end
     return Comrade.FisherLowRank(;
         rank = strategy.precond_rank, schedule = sched, discard = strategy.precond_discard,
         carry = Symbol(strategy.precond_refit_carry)
@@ -232,7 +243,9 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
     # its own gradients. This avoids rebuilding the instrument Jones matrices / FFT plans.
     post_cpu = @set post.admode = nothing
     rpost = Comrade.prepare_device(post_cpu, Comrade.ComradeBase.ReactantEx())
-    adaptor = _metric_adaptor(strategy)
+    curvature = strategy.precond_refit_kind == "gauss_newton" ?
+        gauss_newton_curvature(GaussNewtonKernels(post_cpu, rpost)) : nothing
+    adaptor = _metric_adaptor(strategy, curvature)
     rounds = strategy.moves_per_chunk
     sheet = "phase_sheet" in strategy.moves ? PhaseSheetMoves(post_cpu; rounds) : nothing
     symnames = filter(!=("phase_sheet"), strategy.moves)
