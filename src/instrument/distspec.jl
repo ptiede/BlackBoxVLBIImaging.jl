@@ -13,6 +13,16 @@
 # Special case: `DiagonalVonMises` takes `args = [mean, width]` where `width` is an angular
 # std-dev-like scale, converted to a concentration via `κ = inv(width^2)`.
 #
+# `AngularProjectedNormal` takes `args = [mean, γ]`: the angle of a 2-D normal with mean
+# `γ (cos mean, sin mean)` and unit covariance. It transports exactly to the `StdNormal`
+# space (two latent coordinates per angle) but has no flat (`asflat`) transform; `γ = 0.0808`
+# matches `DiagonalVonMises` of width π.
+#
+# `WrappedNormal` takes `args = [mean, σ]`: the angle `wrap(mean + σ u)` with `u` standard
+# normal. It transports exactly to the `StdNormal` space with one latent coordinate per angle
+# and no singular point, and has no flat transform; `σ = 2.44` matches `DiagonalVonMises` of
+# width π.
+#
 # `LogNormal` takes `args = [mu, sigma]` (mu = log of the median) and is built as the `exp`
 # pushforward of a `VLBIGaussian`, matching `markov_rho_prior`'s own log-normal ρ priors: the
 # unconstrained coordinate is exactly `log` of the sampled value.
@@ -27,6 +37,8 @@ const _DIST_ALLOWLIST = Dict{String, Function}(
     "Beta" => (a...) -> VLBIImagePriors.VLBIBeta(a...),
     "InverseGamma" => (a...) -> VLBIImagePriors.VLBIInverseGamma(a...),
     "DiagonalVonMises" => (a...) -> DiagonalVonMises(a[1], inv(a[2]^2)),
+    "AngularProjectedNormal" => (a...) -> PT.AngularProjectedNormal(a...),
+    "WrappedNormal" => (a...) -> PT.WrappedNormal(a...),
     "LogNormal" => (a...) -> PT.PushforwardDistribution(exp, VLBIImagePriors.VLBIGaussian(a...)),
 )
 
@@ -70,7 +82,7 @@ end
 # distribution spec (parsed with `parse_dist`, so the same Reactant-friendly `VLBI*`
 # variants are used — they are `<: Distributions.Distribution`, which is how `hyperprior`
 # recognizes a field as fitted). Like `parse_dist`, this is a closed allowlist: only
-# `OrnsteinUhlenbeck`, `WrappedBrownian`, `WrappedOrnsteinUhlenbeck`, and
+# `OrnsteinUhlenbeck`, `BrownianMotion`, `WrappedBrownian`, `WrappedOrnsteinUhlenbeck`, and
 # `VonMisesProcess` are constructible.
 
 # A hyperparameter is a fixed number or a fitted distribution (a distribution spec table).
@@ -90,6 +102,9 @@ restricted to the closed allowlist:
     (marginal std) and `tau` (correlation time in hours) are each a number (fixed) or a
     distribution spec (fitted hyperparameter); `mu` is an optional fixed number (default
     `0.0`, not fittable).
+  - `kind = "BrownianMotion"` (alias `"bm"`): the non-reverting real-line random walk.
+    `D` is the diffusion coefficient (parameter² per hour), a number or a distribution
+    spec. Nonstationary, so the prior needs an explicit `init` (e.g. `fixed`).
   - `kind = "WrappedBrownian"` (alias `"wb"`): Brownian motion on the circle, the process
     to use for gain *phases* — its wrapped-normal transitions make the prior exactly
     `2π`-periodic, so the `2π`-shifted modes a real-line phase prior produces are all
@@ -122,6 +137,12 @@ function parse_process(spec::AbstractDict)
         μraw isa Real ||
             error("process 'mu' must be a fixed number (it is not fittable), got: $(repr(μraw))")
         return OrnsteinUhlenbeck(; σ = σ, τ = τ, μ = Float64(μraw))
+    elseif name in ("BrownianMotion", "bm")
+        check_config_keys(spec, ("kind", "D"), "a BrownianMotion process spec")
+        haskey(spec, "D") || error(
+            "BrownianMotion process spec is missing 'D', the diffusion coefficient per hour: $spec"
+        )
+        return BrownianMotion(; D = _parse_hyper(spec["D"]))
     elseif name in ("WrappedBrownian", "wb")
         # `D` was the old (pre-tau) spelling; catch it with a conversion hint rather than
         # letting check_config_keys report it as a generic unknown key.
@@ -164,7 +185,7 @@ function parse_process(spec::AbstractDict)
         )
     else
         error(
-            "unknown process '$name'. Allowed: OrnsteinUhlenbeck, " *
+            "unknown process '$name'. Allowed: OrnsteinUhlenbeck, BrownianMotion, " *
                 "WrappedBrownian, WrappedOrnsteinUhlenbeck, VonMisesProcess"
         )
     end

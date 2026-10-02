@@ -52,11 +52,12 @@ _grad_infnorm(g) = maximum(abs, g)
 
 """
     check_reactant_consistency(post::VLBIPosterior, dpost; x=nothing, rtol=1e-2,
-                               rng=Random.default_rng()) -> NamedTuple
+                               rng=Random.default_rng(), space=nothing) -> NamedTuple
 
 Verify that the Reactant *device* posterior `dpost` (from `prepare_device(post, ...)`)
 computes the same log-density **and gradient** as the CPU/Enzyme reference `post`, at a
-parameter point `x` (flat; a prior draw if `nothing`). Errors if either disagrees beyond
+latent point `x` (a prior draw if `nothing`) of the latent space `space` (`nothing` is the
+flat space; see `Comrade.maybe_transport`). Errors if either disagrees beyond
 `rtol`. This guards against silent device/AD discrepancies that yield garbage Reactant fits
 while the CPU fit is fine — the cheapest way to catch a broken device model up front.
 
@@ -70,10 +71,11 @@ and returns `-logdensity`, so both are recovered exactly without separately comp
 value-and-gradient entry point (which overflows Julia's inference as a top-level `@compile`).
 """
 function check_reactant_consistency(
-        post::VLBIPosterior, dpost; x = nothing, rtol = 1.0e-2, rng = Random.default_rng()
+        post::VLBIPosterior, dpost; x = nothing, rtol = 1.0e-2, rng = Random.default_rng(),
+        space = nothing
     )
-    tpost = asflat(post)      # CPU / Enzyme reference (post must carry an AD mode)
-    tpostd = asflat(dpost)    # Reactant device
+    tpost = Comrade.maybe_transport(post, space)      # CPU / Enzyme reference (post must carry an AD mode)
+    tpostd = Comrade.maybe_transport(dpost, space)    # Reactant device
     xx = isnothing(x) ? Comrade.inverse(tpost, prior_sample(rng, post)) : x
 
     # CPU reference: log-density + gradient via Comrade's own Enzyme path (the one
@@ -109,7 +111,7 @@ end
 """
     reactant_opt(post::VLBIPosterior, optimiser; initial_params=nothing, maxiters=10_000,
                  ntrials=1, log_stride=250, rng=Random.default_rng(),
-                 held=Dict{Symbol, Float64}()) -> (xopt, sol)
+                 held=Dict{Symbol, Float64}(), space=nothing) -> (xopt, sol)
 
 Optimize `post` on the Reactant device with an Optimisers.jl `optimiser` (e.g.
 `Optimisers.Adam(η)`). Mirrors `comrade_opt`/`best_image`: with no `initial_params`, runs
@@ -117,7 +119,9 @@ Optimize `post` on the Reactant device with an Optimisers.jl `optimiser` (e.g.
 the best objective — this is what avoids the bad local minima that a single start falls
 into. A supplied `initial_params` (e.g. a later tempering stage) is a single warm start.
 Returns the optimum `xopt` as a host NamedTuple and `sol = (; objective = -logdensity)`.
-The sky parameters in `held` (name => value) stay at their values throughout.
+The sky parameters in `held` (name => value) stay at their values throughout. The
+optimization runs in the latent space `space` (`nothing` is the flat space; see
+`Comrade.maybe_transport`).
 
 The posterior is moved to the device internally via `prepare_device`; the per-step program
 (value + Enzyme gradient + update) is compiled once and reused for every trial (the shapes
@@ -128,11 +132,12 @@ the host each step is far slower than the device step itself).
 function reactant_opt(
         post::VLBIPosterior, optimiser; initial_params = nothing, maxiters = 10_000,
         ntrials = 1, log_stride = 250, gc_stride = 100, g_tol = 1.0e-1, verify = true,
-        rtol = 1.0e-2, rng = Random.default_rng(), held::AbstractDict = Dict{Symbol, Float64}()
+        rtol = 1.0e-2, rng = Random.default_rng(), held::AbstractDict = Dict{Symbol, Float64}(),
+        space = nothing
     )
     dpost = Comrade.prepare_device(post, Comrade.ComradeBase.ReactantEx())
-    tpost = asflat(dpost)
-    tpost_cpu = asflat(post)   # CPU reference (value-only; no AD mode needed)
+    tpost = Comrade.maybe_transport(dpost, space)
+    tpost_cpu = Comrade.maybe_transport(post, space)   # CPU reference (value-only; no AD mode needed)
 
     multistart = isnothing(initial_params)
     nstarts = multistart ? max(ntrials, 1) : 1
@@ -151,7 +156,7 @@ function reactant_opt(
     step_args = if isempty(held)
         ()
     else
-        free = _free_coordinates(post, _hold_scales(prior_sample(rng, post), held), held)
+        free = _free_coordinates(post, _hold_scales(prior_sample(rng, post), held), held; space)
         (Reactant.to_rarray(Float64.(free)),)
     end
     step_jit = Reactant.@compile _reactant_opt_step!(opt_state, tpost, xr, step_args...)

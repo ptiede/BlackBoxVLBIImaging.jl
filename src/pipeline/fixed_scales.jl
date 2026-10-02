@@ -25,10 +25,10 @@ end
 _hold_scales(x, held::AbstractDict) =
     isempty(held) ? x : merge(x, (sky = merge(x.sky, NamedTuple(held)),))
 
-# Flat-space mask, `false` at the coordinate of each held parameter. Found by moving one
-# held parameter between two in-support values and recording which flat coordinate moves.
-function _free_coordinates(post::VLBIPosterior, x, held::AbstractDict)
-    tpost = asflat(post)
+# Latent-space mask, `false` at the coordinate of each held parameter. Found by moving one
+# held parameter between two in-support values and recording which latent coordinate moves.
+function _free_coordinates(post::VLBIPosterior, x, held::AbstractDict; space = nothing)
+    tpost = Comrade.maybe_transport(post, space)
     free = trues(dimension(tpost))
     for k in keys(held)
         d = getproperty(post.prior.sky, k)
@@ -36,8 +36,8 @@ function _free_coordinates(post::VLBIPosterior, x, held::AbstractDict)
         y2 = Comrade.inverse(tpost, _hold_scales(x, Dict(k => quantile(d, 0.75))))
         moved = findall(y1 .!= y2)
         length(moved) == 1 || error(
-            "fix_scales entry '$k' maps to $(length(moved)) flat coordinates; only a scalar " *
-                "parameter with its own flat coordinate can be held fixed"
+            "fix_scales entry '$k' maps to $(length(moved)) latent coordinates; only a " *
+                "scalar parameter with its own latent coordinate can be held fixed"
         )
         free[only(moved)] = false
     end
@@ -53,14 +53,18 @@ function _check_held(x, held::AbstractDict)
     return nothing
 end
 
-# `comrade_opt` with the `held` parameters fixed: the optimizer sees only the free flat
-# coordinates.
-function _comrade_opt_held(post::VLBIPosterior, opt, held::AbstractDict; initial_params, kwargs...)
-    isempty(held) && return comrade_opt(post, opt; initial_params, kwargs...)
-    tpost = asflat(post)
+# `comrade_opt` in the latent space `space` with the `held` parameters fixed: the optimizer
+# sees only the free latent coordinates.
+function _comrade_opt_held(
+        post::VLBIPosterior, opt, held::AbstractDict; initial_params, space = nothing, kwargs...
+    )
+    isempty(held) && return comrade_opt(
+        post, opt; initial_params, transform = p -> Comrade.maybe_transport(p, space), kwargs...
+    )
+    tpost = Comrade.maybe_transport(post, space)
     x0 = _hold_scales(initial_params, held)
     y0 = Comrade.inverse(tpost, x0)
-    idx = findall(_free_coordinates(post, x0, held))
+    idx = findall(_free_coordinates(post, x0, held; space))
     embed(u) = (y = copy(y0); y[idx] .= u; y)
     ℓ(u, p = tpost) = -logdensityof(p, embed(u))
     function grad!(G, u, p)

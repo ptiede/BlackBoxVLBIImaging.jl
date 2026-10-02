@@ -43,7 +43,7 @@ end
 # of the call measures full device execution (compilation happens once, up front).
 function _run_reactant_benchmarks(post, transport_method)
     dpost = Comrade.prepare_device(post, Comrade.ComradeBase.ReactantEx())
-    tpost = Comrade.maybe_transport(dpost, transport_method)
+    tpost = Comrade.maybe_transport(dpost, Comrade._device_space(transport_method))
     xr = Reactant.to_rarray(Comrade.inverse(tpost, prior_sample(Random.default_rng(), dpost)))
     fwd = Reactant.@compile sync = true logdensityof(tpost, xr)
     vg = Reactant.@compile sync = true _reactant_value_and_grad(tpost, xr)
@@ -61,29 +61,30 @@ end
 
 """
     best_image(post, ntrials=20, maxiters=10_000, rng=Random.default_rng(); opt=Adam(),
-               held=Dict{Symbol, Float64}())
+               held=Dict{Symbol, Float64}(), space=nothing)
 
 Run `ntrials` random-restart optimizations of `post`, returning the valid solutions and
 their log-densities sorted best-first. Each trial does two optimization passes and keeps
 the better one. The sky parameters in `held` (name => value) stay at their values
-throughout.
+throughout. The optimization runs in the latent space `space` (`nothing` is the flat space;
+see `Comrade.maybe_transport`).
 """
 function best_image(
         post, ntrials = 20, maxiters = 10_000, rng = Random.default_rng();
-        opt = Adam(), held::AbstractDict = Dict{Symbol, Float64}()
+        opt = Adam(), held::AbstractDict = Dict{Symbol, Float64}(), space = nothing
     )
     nd = mapreduce(Comrade.ndata, +, post.data)
     sols = map(1:ntrials) do i
         xopt0, sol0 = _comrade_opt_held(
             post, opt, held;
-            initial_params = prior_sample(rng, post), maxiters = maxiters ÷ 2, g_tol = 1.0e-1
+            initial_params = prior_sample(rng, post), space, maxiters = maxiters ÷ 2, g_tol = 1.0e-1
         )
         c20 = mapreduce(sum, +, chi2(post, xopt0)) / nd
         @info "Preliminary image $i/$(ntrials) done minimum χ²: $(c20)"
 
         xopt1, sol1 = _comrade_opt_held(
             post, opt, held;
-            initial_params = xopt0, maxiters = maxiters ÷ 2, g_tol = 1.0e-1
+            initial_params = xopt0, space, maxiters = maxiters ÷ 2, g_tol = 1.0e-1
         )
         c21 = mapreduce(sum, +, chi2(post, xopt1)) / nd
         @info "Best image $i/$(ntrials) done minimum χ²: $(c21)"
@@ -109,18 +110,22 @@ function _optimize_stage(post_i, opt, xprev, i, nstage, frac, strategy, rng, hel
         @info "Optimization stage $i/$nstage on Reactant (added noise = $frac)"
         x, _ = reactant_opt(
             post_i, opt; initial_params = xprev, maxiters = mi, ntrials = strategy.ntrials,
-            g_tol = strategy.g_tol, verify = strategy.verify_reactant, rng = rng, held = held
+            g_tol = strategy.g_tol, verify = strategy.verify_reactant, rng, held,
+            space = latent_space(strategy)
         )
         return x
     elseif i == 1
         @info "Optimization stage $i/$nstage: random restarts (added noise = $frac)"
-        sols, _ = best_image(post_i, strategy.ntrials, strategy.maxiters, rng; opt, held)
+        sols, _ = best_image(
+            post_i, strategy.ntrials, strategy.maxiters, rng; opt, held, space = latent_space(strategy)
+        )
         return sols[1]
     else
         mi = (i == nstage) ? strategy.maxiters : strategy.maxiters ÷ 2
         @info "Optimization stage $i/$nstage: refine (added noise = $frac)"
         x, _ = _comrade_opt_held(
-            post_i, opt, held; initial_params = xprev, maxiters = mi, g_tol = strategy.g_tol
+            post_i, opt, held; initial_params = xprev, space = latent_space(strategy),
+            maxiters = mi, g_tol = strategy.g_tol
         )
         return x
     end
@@ -204,8 +209,20 @@ function _metric_adaptor(strategy::FittingStrategy)
     isnothing(sched) && return strategy.adapt_mass_matrix ?
         Comrade.WelfordDiagonal() : Comrade.FixedMetric()
     return Comrade.FisherLowRank(;
-        rank = strategy.precond_rank, schedule = sched, discard = strategy.precond_discard
+        rank = strategy.precond_rank, schedule = sched, discard = strategy.precond_discard,
+        carry = Symbol(strategy.precond_refit_carry)
     )
+end
+
+# A stored preconditioner to seed warmup from; it must act in the run's latent space.
+function _seed_transport(strategy::FittingStrategy)
+    t = deserialize(strategy.precond_seed_transport)
+    want = strategy.latent_space == "flat" ? Comrade.LowRankPreconditioner : Comrade.Preconditioned
+    t isa want || error(
+        "precondition.seed_transport $(strategy.precond_seed_transport) holds a $(nameof(typeof(t))); " *
+            "run.latent_space = \"$(strategy.latent_space)\" needs a $(nameof(want))"
+    )
+    return t
 end
 
 function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, transport_method, tgrad = nothing)
@@ -216,10 +233,17 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
     post_cpu = @set post.admode = nothing
     rpost = Comrade.prepare_device(post_cpu, Comrade.ComradeBase.ReactantEx())
     adaptor = _metric_adaptor(strategy)
-    moves = isempty(strategy.moves) ? nothing :
-        SymmetryMoves(post_cpu, strategy.moves, xopt; rounds = strategy.moves_per_chunk)
-    isnothing(moves) ||
-        @info "Moves between NUTS chunks, $(strategy.moves_per_chunk) round(s) each time: $(join(move_name.(moves.moves), ", "))"
+    rounds = strategy.moves_per_chunk
+    sheet = "phase_sheet" in strategy.moves ? PhaseSheetMoves(post_cpu; rounds) : nothing
+    symnames = filter(!=("phase_sheet"), strategy.moves)
+    sym = isempty(symnames) ? nothing :
+        SymmetryMoves(post_cpu, symnames, xopt; rounds, space = latent_space(strategy))
+    isnothing(sheet) ||
+        @info "Phase sheet moves between NUTS chunks, $rounds proposal(s) each time over $(length(sheet.points)) site paths"
+    isnothing(sym) ||
+        @info "Moves between NUTS chunks, $rounds round(s) each time: $(join(move_name.(sym.moves), ", "))"
+    hooks = Tuple(h for h in (sheet, sym) if !isnothing(h))
+    moves = isempty(hooks) ? nothing : length(hooks) == 1 ? only(hooks) : ChainedMoves(hooks)
     smplr = Comrade.ReactantNUTS(;
         n_adapts = strategy.nadapt, init_step_size = strategy.step_size,
         max_tree_depth = strategy.max_tree_depth,
@@ -269,15 +293,12 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
         # nutpie-style init: with in-run refits configured and no pilot transform, one
         # score at the start point sets the initial diagonal metric, so warmup's first
         # segment starts pre-scaled instead of on a unit metric.
-        if adaptor isa Comrade.FisherLowRank && isnothing(transport_method) &&
+        if adaptor isa Comrade.FisherLowRank && transport_method isa Union{Nothing, PT.StdNormal} &&
                 !restart && !isnothing(xopt)
-            if !isempty(strategy.precond_seed_transport)
-                @info "Seeding transform from $(strategy.precond_seed_transport)"
-                transport_method = deserialize(strategy.precond_seed_transport)
-            else
-                @info "Initializing transform from the start point's score (nutpie-style)"
-                transport_method = Comrade._score_init_pre(post, xopt; reactant = true)
-            end
+            @info "Initializing transform from the start point's score (nutpie-style)"
+            transport_method = Comrade._score_init_pre(
+                post, xopt; reactant = true, space = latent_space(strategy)
+            )
         end
         # The sampling DiskStore records wall time per draw; with the cost of one gradient
         # stored next to it, leapfrog steps per draw (and so tree depth) can be recovered
@@ -297,11 +318,45 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
             transport_method = transport_method, between_chunks = moves
         )
     end
-    if !isnothing(moves)
-        @info "moves, warmup: " * move_summary(moves, :warmup)
-        @info "moves, sampling: " * move_summary(moves, :sampling)
+    isnothing(sheet) || @info "phase sheet moves: " * sheet_summary(sheet)
+    if !isnothing(sym)
+        @info "moves, warmup: " * move_summary(sym, :warmup)
+        @info "moves, sampling: " * move_summary(sym, :sampling)
     end
     return trace.out, 1:10:strategy.nsample
+end
+
+"""
+    check_start(post, space, x) -> Float64
+
+The log density of `post` in the latent space `space` (see `Comrade.maybe_transport`) at the
+parameters `x`. Errors if it is not finite, naming the parameters whose latent coordinates are
+not finite.
+"""
+function check_start(post, space, x)
+    tpost = Comrade.maybe_transport(post, space)
+    u = Comrade.inverse(tpost, x)
+    ℓ = logdensityof(tpost, u)
+    isfinite(ℓ) && return ℓ
+    bad = String[]
+    _nonfinite_paths!(bad, "", latent_layout(tpost), u)
+    where_ = isempty(bad) ? "every latent coordinate is finite" :
+        "non-finite latent coordinates in " * join(bad, ", ")
+    return error(
+        "the start point has log density $ℓ in the $(isnothing(space) ? "flat" : nameof(typeof(space))) " *
+            "latent space ($where_)"
+    )
+end
+
+function _nonfinite_paths!(bad, prefix, node, u)
+    if node isa AbstractRange
+        all(isfinite, view(u, node)) || push!(bad, isempty(prefix) ? "(all)" : prefix)
+    else
+        for (k, v) in pairs(node)
+            _nonfinite_paths!(bad, isempty(prefix) ? string(k) : "$prefix.$k", v, u)
+        end
+    end
+    return bad
 end
 
 """
@@ -309,8 +364,8 @@ end
                    rng=Random.default_rng(), restart=false)
 
 Run the full imaging pipeline: staged noise-tempered optimization (or restart/start),
-save the optimal image + caltables, then sample the posterior (AdvancedHMC or Reactant
-NUTS per `strategy`) and write posterior FITS draws. Returns the path the run was written
+save the optimal image + caltables, then sample the posterior (AdvancedHMC NUTS, Reactant
+NUTS or DILI per `strategy`) and write posterior FITS draws. Returns the path the run was written
 to.
 
 `restart=true` resumes from a previously serialized optimum at `outbase` instead of
@@ -321,6 +376,8 @@ function comrade_imager(
         strategy::FittingStrategy, imgdata = nothing, rng = Random.default_rng(),
         restart::Bool = false
     )
+    (restart && !isnothing(strategy.dili)) &&
+        error("restart is not supported with the DILI sampler ([dili] in the fitting config)")
     @info "Imaging output base: $outbase"
     mkpath(dirname(outbase))
     outimg = mkpath(joinpath(dirname(outbase), "images"))
@@ -332,7 +389,7 @@ function comrade_imager(
 
     # CPU / Enzyme posterior used for optimization, residuals and serialization.
     post = VLBIPosterior(skym, intm, data...; imgdata)
-    tpost = asflat(post)
+    tpost = Comrade.maybe_transport(post, latent_space(strategy))
 
     # The posterior is a property of the run, not of the optimizer, so it gets its own file
     # rather than riding along in `_optimum_allres.jls` (which is rewritten per optimization
@@ -346,27 +403,39 @@ function comrade_imager(
     # CPU reference. Errors on mismatch.
     if strategy.use_reactant && strategy.verify_reactant
         @info "Verifying Reactant device posterior against the CPU/Enzyme reference"
-        check_reactant_consistency(post, Comrade.prepare_device(post, Comrade.ComradeBase.ReactantEx()); rng = rng)
+        check_reactant_consistency(
+            post, Comrade.prepare_device(post, Comrade.ComradeBase.ReactantEx());
+            rng, space = latent_space(strategy)
+        )
     end
 
     # The preconditioner participates in every log-density evaluation, so it is fit
     # before benchmarking. `sample` persists it to `<out>/transport.jls`; on restart the
     # stored space wins, so refitting is skipped (a restart with a pilot configured
     # would otherwise warn and be ignored).
-    transport_method = if isnothing(strategy.precond_pilot) || restart
+    transport_method = if restart
         nothing
+    elseif !isempty(strategy.precond_seed_transport)
+        isnothing(strategy.precond_pilot) ||
+            error("precondition.pilot and precondition.seed_transport are exclusive; set one")
+        @info "Seeding transform from $(strategy.precond_seed_transport)"
+        _seed_transport(strategy)
+    elseif isnothing(strategy.precond_pilot)
+        latent_space(strategy)
     else
         @info "Fitting latent-space preconditioner from pilot run $(strategy.precond_pilot)"
         fit_preconditioner(
             strategy.precond_pilot, post;
             rank = strategy.precond_rank, nsamples = strategy.precond_nsamples,
             discard = strategy.precond_discard, augment = strategy.precond_augment,
+            space = latent_space(strategy),
             # tune gradients on the same backend the run samples on
             grad_reactant = strategy.use_reactant
         )
     end
 
-    tgrad = strategy.benchmark ? _run_benchmarks(post, strategy, transport_method) : nothing
+    bench_space = isnothing(transport_method) ? latent_space(strategy) : transport_method
+    tgrad = strategy.benchmark ? _run_benchmarks(post, strategy, bench_space) : nothing
 
     g = post.skymodel.grid.imgdomain
     gimg = refinespatial(g, 2)
@@ -393,7 +462,15 @@ function comrade_imager(
     end
 
     # ---- sampling --------------------------------------------------------------------
-    if strategy.use_reactant
+    if strategy.latent_space == "stdnormal"
+        xopt, nsheet = unwrap_phase_chains(post, xopt)
+        nsheet > 0 && @info "Re-wrapped $nsheet phase-chain step(s) of the start point to their shortest form"
+    end
+    check_start(post, latent_space(strategy), xopt)
+    if !isnothing(strategy.dili)
+        trace = sample_dili(out, post, xopt, strategy.dili; rng)
+        range = 1:(trace.nsamples)
+    elseif strategy.use_reactant
         trace, range = _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, transport_method, tgrad)
     else
         trace, range = _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart, transport_method)

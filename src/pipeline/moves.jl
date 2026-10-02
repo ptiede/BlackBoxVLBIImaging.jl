@@ -40,6 +40,12 @@ function _replace(x, r::AbstractUnitRange, v)
 end
 
 _scalar(t, x, i) = TV.transform(t, _rget(x, i))
+_scalar(t::PT.AbstractTransport, x, i) = PT.latent_pfwd(t, x[i:i])
+
+# A parameter block's value from its flat (TransformVariables) or StdNormal latent
+# (transport) coordinates `x[r]`.
+_value(t, x, r) = TV.transform(t, x[r])
+_value(t::PT.AbstractTransport, x, r) = PT.latent_pfwd(t, x[r])
 
 _sky_metadata(tpost) = tpost.lpost.skymodel.metadata
 
@@ -123,7 +129,7 @@ end
     MeanFieldMove
 
 Trade one mean-model parameter against the log-intensity field `a` of the PolExp Markov RF
-sky model: the parameter's flat coordinate moves by `u`, changing the mean image `m → m′`,
+sky model: the parameter's flat (or StdNormal latent) coordinate moves by `u`, changing the mean image `m → m′`,
 and the white coefficients of `a` move by the inverse of the linear map from coefficients to
 `σa · δa`, applied to `log m − log m′`. Then `m′ exp(σa δa′) = m exp(σa δa)` pixelwise and
 Stokes I, Q, U and V, the flux normalization and the centering are all unchanged. The
@@ -228,10 +234,10 @@ function propose(m::MeanFieldMove, x, u, tpost, ctx)
     md = _sky_metadata(tpost)
     i = m.mean[m.imean]
     x′ = _replace(x, i, _rget(x, i) + u)
-    lm = log.(baseimage(make_mean(md.meanmodel, md.grid, TV.transform(m.tmean, x[m.mean]))))
-    lm′ = log.(baseimage(make_mean(md.meanmodel, md.grid, TV.transform(m.tmean, x′[m.mean]))))
+    lm = log.(baseimage(make_mean(md.meanmodel, md.grid, _value(m.tmean, x, m.mean))))
+    lm′ = log.(baseimage(make_mean(md.meanmodel, md.grid, _value(m.tmean, x′, m.mean))))
     σ = _scalar(m.tscale, x, m.iscale)
-    la = _log_amplitude(TV.transform(m.trho, x[m.rho]), ctx.k2, m.dk)
+    la = _log_amplitude(_value(m.trho, x, m.rho), ctx.k2, m.dk)
     Δ = _hartley((lm .- lm′) ./ σ) .* exp.(.-la) ./ sqrt(prod(m.dims))
     x′ = _replace(x′, m.coeffs, x[m.coeffs] .+ vec(Δ))
     return x′, zero(σ)
@@ -368,6 +374,54 @@ function _phase_offset_moves(root, post, θ)
     return [PhaseOffsetMove(sites[v], first(r) + 2 * (k - 1)) for (k, v) in enumerate(free)]
 end
 
+# The StdNormal transport node of the parameter at `path` of `tp` and its latent coordinates.
+function _std_leaf(tp, path)
+    t = PT.transport_node(tp.transform)
+    L = latent_layout(tp)
+    for k in path
+        t = getfield(getfield(t, :transports), k)
+        L = getfield(L, k)
+    end
+    return t, _latent_span(L)
+end
+_latent_span(r::AbstractUnitRange) = r
+_latent_span(r) = first(_latent_span(first(r))):last(_latent_span(last(r)))
+
+function _mean_field_moves_std(post, θ)
+    post.skymodel.f === _polexp_markovrf_sky || error(
+        "move \"mean_field\" needs the PolExp Markov RF sky model (polrep = \"PolExp\", " *
+            "order < 0)"
+    )
+    means = get(θ.sky, :mean, NamedTuple())
+    isempty(means) && error("move \"mean_field\" needs a mean model with free parameters")
+    plan = _markov_plan(post, "mean_field")
+    _, dk = _plan_wavenumbers(plan)
+    tp = dili_posterior(post)
+    tmean, rmean = _std_leaf(tp, (:sky, :mean))
+    length(rmean) == length(means) ||
+        error("the mean-model parameters do not have one latent coordinate each")
+    ta, coeffs = _std_leaf(tp, (:sky, :a))
+    v = randn(Random.Xoshiro(1), length(coeffs))
+    vec(PT.latent_pfwd(ta, v)) == v || error(
+        "sky field a is not an identity leaf of the StdNormal space; the move needs its " *
+            "latent coordinates to be the white coefficients themselves"
+    )
+    tscale, rscale = _std_leaf(tp, (:sky, :σa))
+    trho, rrho = _std_leaf(tp, (:sky, :ρa))
+    dims = size(θ.sky.a)
+    return [
+        MeanFieldMove(k, i, rmean, tmean, coeffs, only(rscale), tscale, rrho, trho, dk, dims)
+            for (i, k) in enumerate(keys(means))
+    ]
+end
+
+function _parse_moves_std(names, post, θ)
+    bad = setdiff(names, ("mean_field",))
+    isempty(bad) ||
+        error("moves $(bad) act on the flat latent space; in the StdNormal space only \"mean_field\" runs")
+    return Tuple(_mean_field_moves_std(post, θ))
+end
+
 const _MOVE_BUILDERS = Dict(
     "flux_gain" => _flux_gain_moves,
     "field_scale" => _field_scale_moves,
@@ -489,7 +543,7 @@ function record!(t::MoveTuner, phase::Symbol, α, accepted::Bool, target)
 end
 
 """
-    SymmetryMoves(post::VLBIPosterior, names, θ0; rounds = 1, target_accept = 0.45)
+    SymmetryMoves(post::VLBIPosterior, names, θ0; rounds = 1, target_accept = 0.45, space = nothing)
 
 Metropolis–Hastings moves (`names`, a subset of `$(SYMMETRY_MOVES)`), callable as Comrade's
 `between_chunks` hook of the Reactant NUTS sampler: `sm(state, tpost, info, rng) -> state`.
@@ -525,8 +579,10 @@ Robbins–Monro recursion toward `target_accept` acceptance, and it is frozen fo
 Every warmup call logs the NUTS step size and each move's acceptance and `τ`;
 [`move_summary`](@ref) summarizes a phase.
 
-Construction fails if a move does not apply to the model, or if at `θ0` (a constrained
-parameter point of `post`) a move that should leave the likelihood unchanged does not.
+With `space = StdNormal()` the base coordinates are the StdNormal latent space instead of
+base-flat (only `"mean_field"` runs there). Construction fails if a move does not apply to
+the model, or if at `θ0` (a constrained parameter point of `post`) a move that should leave
+the likelihood unchanged does not.
 """
 struct SymmetryMoves{M <: Tuple, C}
     moves::M
@@ -537,14 +593,17 @@ struct SymmetryMoves{M <: Tuple, C}
     compiled::Base.RefValue{Any}
 end
 
-function SymmetryMoves(post::VLBIPosterior, names, θ0; rounds::Integer = 1, target_accept = 0.45)
+function SymmetryMoves(
+        post::VLBIPosterior, names, θ0; rounds::Integer = 1, target_accept = 0.45, space = nothing
+    )
     rounds >= 1 || throw(ArgumentError("rounds must be at least 1, got $rounds"))
     θ0 = Comrade.Adapt.adapt(Array, θ0)
-    tflat = asflat(post)
-    moves = _parse_moves(names, post, _flat_root(tflat), θ0)
+    std = space isa PT.StdNormal
+    tbase = std ? dili_posterior(post) : asflat(post)
+    moves = std ? _parse_moves_std(names, post, θ0) : _parse_moves(names, post, _flat_root(tbase), θ0)
     ctx = _move_context(post, moves)
-    x0 = Comrade.inverse(tflat, θ0)
-    foreach(m -> is_invariant(m) && check_move_invariance(post, m, ctx, x0), moves)
+    x0 = Comrade.inverse(tbase, θ0)
+    foreach(m -> is_invariant(m) && check_move_invariance(post, m, ctx, x0; tbase), moves)
     return SymmetryMoves(
         moves, ctx, [MoveTuner(initial_scale(m)) for m in moves], Float64(target_accept),
         Int(rounds), Ref{Any}(nothing)
@@ -552,16 +611,15 @@ function SymmetryMoves(post::VLBIPosterior, names, θ0; rounds::Integer = 1, tar
 end
 
 """
-    check_move_invariance(post, move, ctx, x; step = 0.05, rtol = 1e-9)
+    check_move_invariance(post, move, ctx, x; tbase = asflat(post), step = 0.05, rtol = 1e-9)
 
-Error unless the proposal of `move` at the base-flat point `x` with the given `step` leaves
-the log-likelihood of `post` unchanged (up to `rtol`).
+Error unless the proposal of `move` at the point `x` of the base space `tbase` with the
+given `step` leaves the log-likelihood of `post` unchanged (up to `rtol`).
 """
-function check_move_invariance(post, move, ctx, x; step = 0.05, rtol = 1.0e-9)
-    tflat = asflat(post)
-    x′, _ = propose(move, x, step, tflat, ctx)
-    l0 = Comrade.loglikelihood(post, Comrade.transform(tflat, x))
-    l1 = Comrade.loglikelihood(post, Comrade.transform(tflat, x′))
+function check_move_invariance(post, move, ctx, x; tbase = asflat(post), step = 0.05, rtol = 1.0e-9)
+    x′, _ = propose(move, x, step, tbase, ctx)
+    l0 = Comrade.loglikelihood(post, Comrade.transform(tbase, x))
+    l1 = Comrade.loglikelihood(post, Comrade.transform(tbase, x′))
     abs(l1 - l0) <= rtol * (abs(l0) + 1) || error(
         "move $(move_name(move)) changed the log-likelihood from $l0 to $l1; the model is " *
             "not invariant under it"
@@ -622,6 +680,19 @@ function (sm::SymmetryMoves)(state, tpost, info, rng)
     state.position = z
     return state
 end
+
+"""
+    ChainedMoves(hooks)
+
+`between_chunks` hooks applied in turn: `cm(state, tpost, info, rng)` threads `state`
+through each of `hooks`.
+"""
+struct ChainedMoves{H <: Tuple}
+    hooks::H
+end
+
+(cm::ChainedMoves)(state, tpost, info, rng) =
+    foldl((s, h) -> h(s, tpost, info, rng), cm.hooks; init = state)
 
 _host_scalar(x::Number) = Float64(x)
 _host_scalar(x) = Float64(only(Array(x)))

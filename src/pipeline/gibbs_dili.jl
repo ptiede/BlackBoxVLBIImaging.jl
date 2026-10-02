@@ -1,80 +1,37 @@
 # Kernels of the dimension-independent likelihood-informed (DILI) sampler. The sampled
-# coordinates `u` have the reference measure N(0, I); the target is
-# `exp(-Φ̃(u)) N(u; 0, I)` with `Φ̃ = Φ + Ψ`, `Φ` the negative log-likelihood (up to a
-# constant) and `Ψ` the remainder of the prior and log-Jacobian not captured by N(0, I).
-
-# --- standardization of Gaussian prior blocks ---------------------------------------------
-
-"""
-    flat_layout(tpost)
-
-The flat coordinates of each parameter of the flat posterior `tpost`, as a nested
-`NamedTuple` of index ranges mirroring the prior (a `Tuple` for tuple-valued parameters).
-"""
-flat_layout(tpost) = _layout(_flat_root(tpost), 0)
-
-function _layout(t, offset::Int)
-    t isa TV.TransformTuple || return (offset + 1):(offset + TV.dimension(t))
-    children = getfield(t, :inner)
-    ranges = Any[]
-    for c in children
-        push!(ranges, _layout(c, offset))
-        offset += TV.dimension(c)
-    end
-    return children isa NamedTuple ? NamedTuple{keys(children)}(Tuple(ranges)) : Tuple(ranges)
-end
-
-"""
-    gaussian_standardization(post::VLBIPosterior)
-
-The diagonal affine map `x = μ .+ s .* z` of the flat coordinates of `post` that makes the
-prior of every independent-Gaussian block (a non-phase `Normal(μ, s)` leaf whose flat
-transform is the identity, e.g. leakage terms and `lgratμ`) exactly N(0, I) in `z`. Other
-coordinates pass through unchanged. Returned as a rank-0 `LowRankPreconditioner`; see
-[`dili_posterior`](@ref).
-"""
-function gaussian_standardization(post::VLBIPosterior)
-    n = dimension(asflat(post))
-    b = zeros(n)
-    s = ones(n)
-    _standardize!(b, s, post.prior, flat_layout(asflat(post)))
-    return LowRankPreconditioner(b, s, zeros(n, 0), Float64[])
-end
-
-function _standardize!(b, s, d::PT.NamedDist, layout::NamedTuple)
-    for k in keys(layout)
-        _standardize!(b, s, getproperty(d, k), layout[k])
-    end
-    return nothing
-end
-
-function _standardize!(b, s, d, r)
-    μs = _gaussian_affine(d)
-    μs === nothing && return nothing
-    b[r] .= first(μs)
-    s[r] .= last(μs)
-    return nothing
-end
-
-_gaussian_affine(d) = nothing
-_gaussian_affine(d::Comrade.ObservedArrayPrior) = d.phase ? nothing : _gaussian_affine(d.dists)
-_gaussian_affine(d::Comrade.PartiallyConditionedDist) = _gaussian_affine(d.dist)
-function _gaussian_affine(d::PT.PushforwardDistribution{<:PT.ScaleShift, <:PT.StdNormal})
-    _identity_flat(PT.transport_node(d, PT.TVFlat())) || return nothing
-    return d.f.μ, d.f.s
-end
-
-_identity_flat(t) = t isa TV.Identity || t isa TV.ArrayTransformation{TV.Identity}
+# coordinates `u` are the `StdNormal` latent space of the posterior, where the prior is
+# exactly N(0, I), so the target is `exp(-Φ(u)) N(u; 0, I)` with `Φ` the negative
+# log-likelihood up to a constant.
 
 """
     dili_posterior(post::VLBIPosterior)
 
-The flat posterior of `post` with [`gaussian_standardization`](@ref) composed in front of
-the flat transform: the coordinates the DILI kernels act on.
+`post` transported to the `StdNormal` latent space: the coordinates the DILI kernels act
+on. Every prior block must have an exact transport to N(0, I); circular priors need
+`AngularProjectedNormal` and wrapped Gauss–Markov chains are not supported.
 """
-dili_posterior(post::VLBIPosterior) = PT.transport_to(post, gaussian_standardization(post))
+dili_posterior(post::VLBIPosterior) = PT.transport_to(post, PT.StdNormal())
 
-# --- potentials --------------------------------------------------------------------------
+"""
+    latent_layout(tpost)
+
+The latent coordinates of each parameter of the transported posterior `tpost`, as a nested
+`NamedTuple` of index ranges mirroring the prior (a `Tuple` for tuple-valued parameters).
+"""
+latent_layout(tpost) = _layout(PT.transport_node(tpost.transform), 0)
+
+function _layout(t, offset::Int)
+    t isa PT.TupleTransport || return (offset + 1):(offset + PT.dimension(t))
+    children = getfield(t, :transports)
+    ranges = Any[]
+    for c in children
+        push!(ranges, _layout(c, offset))
+        offset += PT.dimension(c)
+    end
+    return children isa NamedTuple ? NamedTuple{keys(children)}(Tuple(ranges)) : Tuple(ranges)
+end
+
+# --- potential ---------------------------------------------------------------------------
 
 """
     ResidualMap(post::VLBIPosterior)
@@ -131,37 +88,16 @@ end
 """
 dili_potential(rm::ResidualMap, tpost, u) = sum(abs2, dili_resid(rm, tpost, u)) / 2
 
-"""
-    dili_prior_remainder(tpost, u)
-
-`Ψ(u) = -ℓ(u) - ½‖u‖²`, with `ℓ` the log prior plus log-Jacobian of the flat transform:
-the part of the prior not captured by the N(0, I) reference. Zero on blocks whose prior
-is exactly N(0, I) in `u`.
-"""
-dili_prior_remainder(tpost, u) =
-    -last(PT.latent_pfwd_and_logdensity(tpost.transform, u)) - sum(abs2, u) / 2
-
-"""
-    dili_reference_potential(rm::ResidualMap, tpost, u)
-
-`Φ̃(u) = Φ(u) + Ψ(u)`: the target is `exp(-Φ̃(u)) N(u; 0, I)`.
-"""
-dili_reference_potential(rm::ResidualMap, tpost, u) =
-    dili_potential(rm, tpost, u) + dili_prior_remainder(tpost, u)
-
 # --- derivatives -------------------------------------------------------------------------
 
-function _value_and_gradient(f, rm, tpost, u)
+function dili_potential_gradient(rm, tpost, u)
     g = zero(u)
     _, v = Enzyme.autodiff(
-        Enzyme.ReverseWithPrimal, f, Enzyme.Active,
+        Enzyme.ReverseWithPrimal, dili_potential, Enzyme.Active,
         Enzyme.Const(rm), Enzyme.Const(tpost), Enzyme.Duplicated(u, g)
     )
     return v, g
 end
-
-dili_potential_gradient(rm, tpost, u) = _value_and_gradient(dili_potential, rm, tpost, u)
-dili_reference_gradient(rm, tpost, u) = _value_and_gradient(dili_reference_potential, rm, tpost, u)
 
 _resid_jvp(rm, tpost, u, v) = only(
     Enzyme.autodiff(
@@ -188,45 +124,20 @@ The Gauss–Newton product `Jᵀ(J v)` of the potential `Φ`, with `J` the Jacob
 """
 dili_gauss_newton(rm, tpost, u, v) = _resid_vjp(rm, tpost, u, _resid_jvp(rm, tpost, u, v))
 
-function _prior_remainder_gradient(tpost, u)
-    g = zero(u)
-    Enzyme.autodiff(Enzyme.Reverse, dili_prior_remainder, Enzyme.Active, Enzyme.Const(tpost), Enzyme.Duplicated(u, g))
-    return g
-end
-
-"""
-    dili_prior_hvp(tpost, u, v)
-
-The exact Hessian-vector product `∇²Ψ(u) v` of [`dili_prior_remainder`](@ref), by forward
-differentiation of its reverse-mode gradient.
-"""
-dili_prior_hvp(tpost, u, v) = only(
-    Enzyme.autodiff(Enzyme.Forward, _prior_remainder_gradient, Enzyme.Const(tpost), Enzyme.Duplicated(u, v))
-)
-
-"""
-    dili_curvature(rm::ResidualMap, tpost, u, v)
-
-The product of the likelihood-informed curvature operator with `v`: the Gauss–Newton
-product of `Φ` plus the exact Hessian of `Ψ`.
-"""
-dili_curvature(rm, tpost, u, v) = dili_gauss_newton(rm, tpost, u, v) .+ dili_prior_hvp(tpost, u, v)
-
 # --- compiled device kernels -------------------------------------------------------------
 
 """
     DILIKernels(post::VLBIPosterior)
 
-The DILI potentials and their derivatives on [`dili_posterior`](@ref)`(post)`, compiled
-with Reactant for the device. Each kernel compiles on its first call and is reused; all
-positions and directions are runtime inputs, so new values (including pinned
-hyperparameters held in `u`) never recompile.
+The DILI potential and its derivatives on [`dili_posterior`](@ref)`(post)`, compiled with
+Reactant for the device. Each kernel compiles on its first call and is reused; positions
+and directions are runtime inputs, so new values (including pinned hyperparameters held in
+`u`) never recompile.
 
 Callable kernels (host or device vectors in, device vectors out):
 - `potential(k, u)`: `Φ(u)` as a `Float64`
 - `potential_gradient(k, u)`: `(Φ(u), ∇Φ(u))`
-- `reference_gradient(k, u)`: `(Φ̃(u), ∇Φ̃(u))`
-- `gauss_newton(k, u, v)`, `prior_hvp(k, u, v)`, `curvature(k, u, v)`
+- `gauss_newton(k, u, v)`
 
 `k.tpost` is the device posterior and `k.host` the matching host posterior.
 """
@@ -234,20 +145,18 @@ struct DILIKernels{TP, TH, R}
     tpost::TP
     host::TH
     resid::R
-    compiled::Dict{Symbol, Any}
+    compiled::Dict{Any, Any}
 end
 
 function DILIKernels(post::VLBIPosterior)
-    pre = gaussian_standardization(post)
     postc = ConstructionBase.setproperties(post, (; admode = nothing))
     rpost = Comrade.prepare_device(postc, Comrade.ComradeBase.ReactantEx())
-    tpost = PT.transport_to(rpost, Comrade._device_pre(pre))
-    return DILIKernels(tpost, PT.transport_to(post, pre), ResidualMap(post), Dict{Symbol, Any}())
+    return DILIKernels(dili_posterior(rpost), dili_posterior(post), ResidualMap(post), Dict{Any, Any}())
 end
 
 _device(x) = x isa Reactant.ConcreteRArray ? x : Reactant.to_rarray(collect(Float64, x))
 
-function _kernel(f, k::DILIKernels, name::Symbol, args...)
+function _kernel(f, k::DILIKernels, name, args...)
     c = get!(k.compiled, name) do
         Reactant.@compile sync = true f(k.resid, k.tpost, args...)
     end
@@ -261,15 +170,4 @@ function potential_gradient(k::DILIKernels, u)
     return _host_scalar(v), g
 end
 
-function reference_gradient(k::DILIKernels, u)
-    v, g = _kernel(dili_reference_gradient, k, :reference_gradient, _device(u))
-    return _host_scalar(v), g
-end
-
 gauss_newton(k::DILIKernels, u, v) = _kernel(dili_gauss_newton, k, :gauss_newton, _device(u), _device(v))
-
-_prior_hvp(rm, tpost, u, v) = dili_prior_hvp(tpost, u, v)
-prior_hvp(k::DILIKernels, u, v) = _kernel(_prior_hvp, k, :prior_hvp, _device(u), _device(v))
-
-# Two compiled calls: a fused kernel costs as much compile time as both together.
-curvature(k::DILIKernels, u, v) = gauss_newton(k, u, v) .+ prior_hvp(k, u, v)

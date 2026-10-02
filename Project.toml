@@ -43,6 +43,8 @@ VLBISkyModels = "d6343c73-7174-4e0f-bb64-562643efbeca"
 
 [sources]
 Comrade = {path = "/home/ptiede/.julia/dev/Comrade"}
+ProbabilityTransports = {path = "/home/ptiede/.julia/dev/ProbabilityTransports"}
+VLBIImagePriors = {path = "/home/ptiede/.julia/dev/VLBIImagePriors"}
 
 [compat]
 Accessors = "0.1"
@@ -57,7 +59,7 @@ ComradeBase = "0.9.19"
 ConstructionBase = "1"
 DataFrames = "1"
 Distributions = "0.25"
-Enzyme = "0.13"
+Enzyme = "0.13.206"
 FINUFFT = "3"
 FillArrays = "1"
 LinearAlgebra = "1"
@@ -69,7 +71,7 @@ OptimizationOptimisers = "0.3"
 Printf = "1"
 ProbabilityTransports = "0.1.3"
 Random = "1"
-Reactant = "0.2"
+Reactant = "0.2.289"
 Reexport = "1"
 Serialization = "1"
 StaticArrays = "1"

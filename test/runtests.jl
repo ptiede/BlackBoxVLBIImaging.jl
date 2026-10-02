@@ -21,6 +21,14 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         d = parse_dist(Dict("dist" => "Normal", "args" => [0.0, 1.0], "lower" => 0.0))
         @test occursin("Truncated", string(typeof(d)))
         @test parse_dist(Dict("dist" => "DiagonalVonMises", "args" => [0.0, 3.14159])) isa DiagonalVonMises
+        @test parse_dist(Dict("dist" => "AngularProjectedNormal", "args" => [0.0, 0.0808])) isa
+            BlackBoxVLBIImaging.PT.AngularProjectedNormal
+        @test parse_dist(Dict("dist" => "WrappedNormal", "args" => [0.0, 2.44])) isa
+            BlackBoxVLBIImaging.PT.WrappedNormal
+        # a bounded LogNormal is the truncated log-normal
+        dln = parse_dist(Dict("dist" => "LogNormal", "args" => [2.66, 0.764], "upper" => 48.0))
+        ref = BlackBoxVLBIImaging.Distributions.truncated(LogNormal(2.66, 0.764); upper = 48.0)
+        @test logpdf(dln, 20.0) - logpdf(ref, 20.0) ≈ logpdf(dln, 3.0) - logpdf(ref, 3.0) atol = 1.0e-12
         @test_throws ErrorException parse_dist(Dict("dist" => "Nonsense", "args" => [1.0]))
         @test_throws ErrorException parse_dist(Dict("args" => [1.0]))               # missing 'dist'
         @test_throws ErrorException parse_dist(Dict("dist" => "Normal", "arg" => [1.0]))  # typo'd key
@@ -112,6 +120,14 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws ErrorException parse_process(Dict("kind" => "wb", "tau" => 1.0, "sigma" => 1.0))  # OU key
         # `D` was the pre-tau spelling: rejected with a conversion hint, not silently accepted
         @test_throws ErrorException parse_process(Dict("kind" => "wb", "D" => 2.0))
+        # BrownianMotion: the real-line random walk, parameterized by the diffusion coefficient D
+        bm = parse_process(Dict("kind" => "BrownianMotion", "D" => 0.5))
+        @test bm isa BrownianMotion
+        @test isempty(Comrade.hyperprior(bm))
+        bmfit = parse_process(Dict("kind" => "bm", "D" => Dict("dist" => "Exponential", "args" => [1.0])))
+        @test keys(Comrade.hyperprior(bmfit)) == (:D,)
+        @test_throws "missing 'D'" parse_process(Dict("kind" => "bm"))
+        @test_throws ErrorException parse_process(Dict("kind" => "bm", "D" => 0.5, "tau" => 1.0))
 
         # WrappedOrnsteinUhlenbeck: circular AND stationary (the mean-reverting phase prior)
         wou = parse_process(Dict("kind" => "WrappedOrnsteinUhlenbeck", "sigma" => 0.3, "tau" => 12.0))
@@ -401,6 +417,294 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         cfg4["sampler"]["moves"] = ["field_scale"]
         cfg4["run"]["use_reactant"] = false
         @test_throws "needs the Reactant sampler" build_fitting_config(cfg4)
+
+        @test s.latent_space == "flat"
+        @test isnothing(BlackBoxVLBIImaging.latent_space(s))
+        cfg5 = exconfig("fitting.toml")
+        cfg5["run"]["latent_space"] = "stdnormal"
+        s5 = build_fitting_config(cfg5)
+        @test BlackBoxVLBIImaging.latent_space(s5) isa BlackBoxVLBIImaging.PT.StdNormal
+        cfg5["run"]["use_reactant"] = true
+        cfg5["run"]["latent_space"] = "cube"
+        @test_throws "unknown run.latent_space 'cube'" build_fitting_config(cfg5)
+        cfg5["run"]["latent_space"] = "stdnormal"
+        cfg5["sampler"]["moves"] = ["flux_gain"]
+        @test_throws "cannot run with run.latent_space" build_fitting_config(cfg5)
+        delete!(cfg5["sampler"], "moves")
+        cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan")
+        @test build_fitting_config(cfg5).precond_refit_schedule == "stan"
+        @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).carry === :none
+        cfg5["precondition"]["refit_carry"] = "rescale"
+        ad = BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5))
+        @test ad isa Comrade.FisherLowRank && ad.carry === :rescale
+        cfg5["precondition"]["refit_carry"] = "keep"
+        @test_throws "set precondition.seed_transport" build_fitting_config(cfg5)
+        cfg5["precondition"]["seed_transport"] = "t.jls"
+        @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).carry === :keep
+        cfg5["precondition"]["refit_carry"] = "yes"
+        @test_throws "precondition.refit_carry must be" build_fitting_config(cfg5)
+        delete!(cfg5, "precondition")
+        cfg5["sampler"]["moves"] = ["phase_sheet"]
+        @test build_fitting_config(cfg5).moves == ["phase_sheet"]
+        cfg5["sampler"]["moves"] = ["phase_sheet", "flux_gain"]
+        @test_throws "act on the flat latent space" build_fitting_config(cfg5)
+        cfg5["sampler"]["moves"] = ["phase_sheet", "mean_field"]
+        @test build_fitting_config(cfg5).moves == ["phase_sheet", "mean_field"]
+        cm = BlackBoxVLBIImaging.ChainedMoves(((s, _...) -> s + 1, (s, _...) -> 2s))
+        @test cm(3, nothing, nothing, nothing) == 8
+        cfg5["sampler"]["moves"] = ["phase_sheet"]
+        cfg5["run"]["latent_space"] = "flat"
+        @test_throws "\"phase_sheet\" needs run.latent_space = \"stdnormal\"" build_fitting_config(cfg5)
+
+        @test isnothing(s.dili)
+        function dilicfg(d = Dict{String, Any}())
+            cfg = exconfig("fitting.toml")
+            delete!(cfg, "sampler")
+            delete!(cfg["run"], "sample_checkpoint")
+            cfg["run"]["use_reactant"] = true
+            cfg["run"]["latent_space"] = "stdnormal"
+            cfg["dili"] = d
+            return cfg
+        end
+        dc = build_fitting_config(dilicfg()).dili
+        @test all(f -> getfield(dc, f) == getfield(DILIConfig(), f), fieldnames(DILIConfig))
+        dc = build_fitting_config(
+            dilicfg(Dict{String, Any}("nsample" => 20, "thin" => 4, "refine_at" => [0.25, 0.5], "pin" => ["sky.σa"], "subspace" => "s.jls", "langevin_complement" => true))
+        ).dili
+        @test (dc.nsample, dc.thin, dc.refine_at, dc.pin, dc.subspace, dc.subspace_draws) == (20, 4, [0.25, 0.5], ["sky.σa"], "s.jls", nothing)
+        @test dc.langevin_complement
+        @test_throws "unknown key(s) [\"nsamples\"] in [dili]" build_fitting_config(dilicfg(Dict{String, Any}("nsamples" => 3)))
+        bad = dilicfg()
+        bad["run"]["use_reactant"] = false
+        @test_throws "[dili] needs run.use_reactant = true" build_fitting_config(bad)
+        bad = dilicfg()
+        bad["run"]["latent_space"] = "flat"
+        @test_throws "[dili] needs run.latent_space = \"stdnormal\"" build_fitting_config(bad)
+        bad = dilicfg()
+        bad["sampler"] = Dict{String, Any}("nsample" => 10)
+        @test_throws "[sampler] configures NUTS" build_fitting_config(bad)
+        bad = dilicfg()
+        bad["run"]["sample_checkpoint"] = 10
+        @test_throws "run.sample_checkpoint configures NUTS" build_fitting_config(bad)
+        for (d, msg) in (
+                ("nwarmup" => -1, "dili.nwarmup must be an integer ≥ 0"),
+                ("thin" => true, "dili.thin must be an integer ≥ 1"),
+                ("rank" => 2.5, "dili.rank must be an integer ≥ 1"),
+                ("step_subspace" => 0, "dili.step_subspace must be positive"),
+                ("step_complement" => -0.1, "dili.step_complement must be non-negative"),
+                ("target_accept" => 1.0, "dili.target_accept must be in (0, 1)"),
+                ("refine_at" => [0.5, 0.5], "dili.refine_at must be increasing fractions in (0, 1)"),
+                ("refine_at" => [1.0], "dili.refine_at must be increasing fractions in (0, 1)"),
+                ("pin" => "sky.σa", "dili.pin must be a list of strings"),
+                ("pin" => ["sky.σa", "sky.σa"], "dili.pin lists a path twice"),
+                ("langevin_complement" => 1, "dili.langevin_complement must be true or false"),
+            )
+            @test_throws msg build_fitting_config(dilicfg(Dict{String, Any}(d)))
+        end
+        @test_throws "dili.nsample = 3 is less than dili.thin = 4" build_fitting_config(dilicfg(Dict{String, Any}("nsample" => 3, "thin" => 4)))
+        for (nw, ra) in ((0, [0.5]), (10, [0.01]), (10, [0.2, 0.24]), (10, [0.97]))
+            @test_throws "they must be distinct and strictly between 0 and dili.nwarmup" build_fitting_config(dilicfg(Dict{String, Any}("nwarmup" => nw, "refine_at" => ra)))
+        end
+        @test_throws "are exclusive" build_fitting_config(dilicfg(Dict{String, Any}("subspace" => "a.jls", "subspace_draws" => "run")))
+    end
+
+    @testset "likelihood-informed subspace" begin
+        BB = BlackBoxVLBIImaging
+        rng = Random.Xoshiro(7)
+        n = 60
+        lowrank(λ) = (V = Matrix(qr(randn(rng, n, length(λ))).Q)[:, eachindex(λ)]; (V * Diagonal(λ) * V', V))
+        λ0 = [40.0, 9.0, 3.0, 0.5, 0.05]
+        A, V0 = lowrank(λ0)
+        s = BB.likelihood_subspace(v -> A * v, n; rank = 8, threshold = 0.1, rng)
+        @test s.λ ≈ λ0[1:4] rtol = 1.0e-10
+        @test abs.(s.V' * V0[:, 1:4]) ≈ I atol = 1.0e-8
+        @test s.V' * s.V ≈ I
+        @test length(s) == 4
+
+        @test_throws "raise rank" BB.likelihood_subspace(v -> A * v, n; rank = 2, threshold = 0.1, rng)
+        @test_throws "max_basis_bytes" BB.likelihood_subspace(v -> A * v, n; rank = 8, max_basis_bytes = 100, rng)
+        @test_throws "oversample must be at least 1" BB.likelihood_subspace(v -> A * v, n; rank = 8, oversample = 0, rng)
+        @test_throws "free must be distinct" BB.likelihood_subspace(v -> A * v, n; rank = 8, free = [1, 1], rng)
+
+        # restricted to free coordinates: the eigenpairs of the principal submatrix
+        free = collect(1:2:n)
+        sf = BB.likelihood_subspace(v -> A * v, n; rank = 8, free, threshold = 0.1, rng)
+        Ef = eigen(Symmetric(A[free, free]); sortby = -)
+        @test sf.λ ≈ filter(>=(0.1), Ef.values) rtol = 1.0e-10
+        @test sf.free == free
+
+        # averaged over draws: the eigenpairs of the mean operator
+        B, _ = lowrank([20.0, 2.0, 0.3])
+        avg = BB.averaged_operator((M, v) -> M * v, [A, B])
+        sa = BB.likelihood_subspace(avg, n; rank = 10, threshold = 0.1, rng)
+        Ea = eigen(Symmetric((A + B) / 2); sortby = -)
+        @test sa.λ ≈ filter(>=(0.1), Ea.values) rtol = 1.0e-10
+        @test_throws "at least one draw" BB.averaged_operator((M, v) -> M * v, [])
+
+        path = joinpath(mktempdir(), "subspace.jls")
+        BB.save_subspace(path, sa)
+        sl = BB.load_subspace(path)
+        @test sl.λ == sa.λ && sl.V == sa.V && sl.free == sa.free
+        BB.Serialization.serialize(path, 1.0)
+        @test_throws "not a LikelihoodSubspace" BB.load_subspace(path)
+    end
+
+    @testset "DILI step" begin
+        BB = BlackBoxVLBIImaging
+        rng = Random.Xoshiro(11)
+
+        # linear-Gaussian likelihood with the exact subspace: every proposal is accepted
+        n, m = 30, 5
+        A, y = 3 .* randn(rng, m, n), randn(rng, m)
+        fglin(u) = (r = A * u .- y; (sum(abs2, r) / 2, A' * r))
+        sub = BB.likelihood_subspace(v -> A' * (A * v), n; rank = 8, threshold = 0.1, rng)
+        @test length(sub) == m
+        plin = BB.DILIProposal(sub)
+        u = randn(rng, n)
+        for lc in (false, true)
+            pl = BB.DILIProposal(sub; langevin_complement = lc)
+            logαs = map(1:100) do _
+                δr, δc = exp.(randn(rng, 2))
+                BB.dili_step(fglin, pl, u, fglin(u)..., δr, δc, randn(rng, m), randn(rng, n), -Inf)[4]
+            end
+            @test maximum(abs, logαs) < 1.0e-9
+        end
+
+        # nonlinear 4-D toy, one pinned coordinate: logα against the explicit density ratio
+        free = [1, 2, 3]
+        Φt(u) = (u[1] + u[2]^2 - 1)^2 + (u[3] * u[1] - 0.3 + u[4])^2 / 2
+        function ∇Φt(u)
+            d1, d2 = u[1] + u[2]^2 - 1, u[3] * u[1] - 0.3 + u[4]
+            return [2 * d1 + d2 * u[3], 4 * d1 * u[2], d2 * u[1], d2]
+        end
+        fgt(u) = (Φt(u), ∇Φt(u))
+        v, λ = normalize([1.0, 0.5, -0.3]), 2.5
+        st = BB.LikelihoodSubspace([λ], reshape(v, 3, 1), free, 4, 0.1)
+        pt = BB.DILIProposal(st)
+        W = nullspace(reshape(v, 1, 3))
+        logπ(u) = -Φt(u) - sum(abs2, u[free]) / 2
+        function logq(u′, u, δr, δc, κ)
+            (sr, βr), (sc, βc) = BB._cn(δr), BB._cn(δc)
+            γ = 1 / (1 + λ)
+            a, a′ = v' * u[free], v' * u′[free]
+            g = ∇Φt(u)[free]
+            gr = v' * g - λ * a
+            w, w′ = W' * u[free], W' * u′[free]
+            qr_ = δr > 0 ? -(a′ - sr * a + (1 - sr) * γ * gr)^2 / (2βr^2 * γ) : 0.0
+            qc = δc > 0 ? -sum(abs2, w′ .- sc .* w .+ κ * (1 - sc) .* (W' * g)) / (2βc^2) : 0.0
+            return qr_ + qc
+        end
+        for lc in (false, true), _ in 1:200
+            p = BB.DILIProposal(st; langevin_complement = lc)
+            u = randn(rng, 4)
+            δr, δc = 3 .* rand(rng, 2)
+            u′, _, _, logα = BB.dili_step(fgt, p, u, fgt(u)..., δr, δc, randn(rng, 1), randn(rng, 4), -Inf)
+            @test u′[4] == u[4]
+            @test logα ≈ logπ(u′) + logq(u, u′, δr, δc, lc) - logπ(u) - logq(u′, u, δr, δc, lc) atol = 1.0e-8 rtol = 1.0e-12
+        end
+        # one block frozen: δr = 0 leaves the subspace coordinate, δc = 0 the complement
+        for lc in (false, true), (fr, fc) in ((0, 1), (1, 0)), _ in 1:100
+            p = BB.DILIProposal(st; langevin_complement = lc)
+            u = randn(rng, 4)
+            δr, δc = fr .* 3 .* rand(rng), fc .* 3 .* rand(rng)
+            u′, _, _, logα = BB.dili_step(fgt, p, u, fgt(u)..., δr, δc, randn(rng, 1), randn(rng, 4), -Inf)
+            fr == 0 && @test v' * u′[free] ≈ v' * u[free] atol = 1.0e-12
+            fc == 0 && @test W' * u′[free] ≈ W' * u[free] atol = 1.0e-12
+            @test logα ≈ logπ(u′) + logq(u, u′, δr, δc, lc) - logπ(u) - logq(u′, u, δr, δc, lc) atol = 1.0e-8 rtol = 1.0e-12
+        end
+        # the propose/accept algebra against the direct projections
+        let p = BB.DILIProposal(st; langevin_complement = true), u = randn(rng, 4)
+            ξr, ξ = randn(rng, 1), randn(rng, 4)
+            g = ∇Φt(u)
+            u′, a′ = BB.dili_propose(p, u, g, p.V' * u, p.V' * g, 0.7, 0.4, ξr, ξ)
+            @test a′ ≈ p.V' * u′
+        end
+        pinf = BB.dili_step(u -> (Inf, zero(u)), pt, u, fgt(u)..., 1.0, 1.0, [0.0], zeros(4), -Inf)
+        @test pinf[4] == -Inf && pinf[1] == u
+
+        # stationarity: chains started from exact draws (rejection from the prior) stay
+        # at the target; KS at p ≈ 0.001. The same test rejects a step that omits the
+        # subspace proposal densities, or the complement Langevin terms, from logα (KS ≈ 0.15).
+        Φs(u) = 2 * (u[1] + u[2]^2 - 1)^2 + (u[3] * u[1] - 0.5)^2
+        function ∇Φs(u)
+            d1, d2 = u[1] + u[2]^2 - 1, u[3] * u[1] - 0.5
+            return [4 * d1 + 2 * d2 * u[3], 8 * d1 * u[2], 2 * d2 * u[1], 0.0, 0.0]
+        end
+        fgs(u) = (Φs(u), ∇Φs(u))
+        function exact_draws(rng, N)
+            out = Vector{Vector{Float64}}()
+            while length(out) < N
+                u = randn(rng, 5)
+                rand(rng) < exp(-Φs(u)) && push!(out, u)
+            end
+            return out
+        end
+        Vs = Matrix(qr(randn(Random.Xoshiro(1), 5, 2)).Q)[:, 1:2]
+        ss = BB.LikelihoodSubspace([4.0, 1.0], Vs, collect(1:5), 5, 0.1)
+        ps = BB.DILIProposal(ss)
+        N = 4000
+        function run_chains(p, δc; split = false)
+            return map(exact_draws(Random.Xoshiro(200), N)) do u
+                srng = Random.Xoshiro(hash(u))
+                Φu, gu = fgs(u)
+                for _ in 1:10
+                    for (δr′, δc′) in (split ? ((3.0, 0.0), (0.0, δc)) : ((3.0, δc),))
+                        u, Φu, gu, _ = BB.dili_step(fgs, p, u, Φu, gu, δr′, δc′, randn(srng, 2), randn(srng, 5), log(rand(srng)))
+                    end
+                end
+                u
+            end
+        end
+        ref = exact_draws(Random.Xoshiro(100), N)
+        function ks2(x, y)
+            xs, ys = sort(x), sort(y)
+            return maximum(t -> abs(searchsortedlast(xs, t) / length(xs) - searchsortedlast(ys, t) / length(ys)), vcat(x, y))
+        end
+        chains = run_chains(ps, 1.0)
+        chainsl = run_chains(BB.DILIProposal(ss; langevin_complement = true), 1.0)
+        chainss = run_chains(BB.DILIProposal(ss; langevin_complement = true), 1.0; split = true)
+        for f in (u -> u[1], u -> u[2], u -> u[3], Φs)
+            @test ks2(f.(chains), f.(ref)) < 1.95 * sqrt(2 / N)
+            @test ks2(f.(chainsl), f.(ref)) < 1.95 * sqrt(2 / N)
+            @test ks2(f.(chainss), f.(ref)) < 1.95 * sqrt(2 / N)
+        end
+
+        # tuning toward target_accept during warmup, then frozen
+        smp = BB.DILISampler(fgs, ps; target_accept = 0.6)
+        res = BB.dili_sample(smp, randn(rng, 5), 5000, 20000; rng, record = u -> u[1])
+        @test length(res.draws) == 20000 && length(res.logα) == 25000
+        @test mean(res.accepted[5001:end]) ≈ 0.6 atol = 0.05
+        δ = BB.step_sizes(smp)
+        BB.dili_sample(smp, randn(rng, 5), 0, 10; rng)
+        @test BB.step_sizes(smp) == δ
+
+        # the linear-Gaussian posterior mean (A'A + I) \ A'y
+        slin = BB.DILISampler(fglin, plin; δr = 2.0, δc = 2.0)
+        rlin = BB.dili_sample(slin, zeros(n), 100, 4000; rng)
+        @test all(rlin.accepted)
+        @test mean(rlin.draws) ≈ (A' * A + I) \ (A' * y) atol = 0.1
+
+        # a split sampler tunes each block to the target on its own
+        ssp = BB.DILISampler(fgs, ps; target_accept = 0.6, split = true)
+        st0 = BB.dili_start(ssp, randn(rng, 5))
+        w = BB.dili_advance!((_...) -> nothing, ssp, st0, :warmup, 3000; rng)
+        rs = BB.dili_advance!((_...) -> nothing, ssp, w.state, :sampling, 20000; rng)
+        @test mean(rs.accepted) ≈ 0.6 atol = 0.05
+        @test mean(rs.accepted_c) ≈ 0.6 atol = 0.05
+        @test BB.step_sizes(ssp)[1] != BB.step_sizes(ssp)[2]
+        @test length(rs.logα_c) == 20000 && isempty(BB.dili_advance!((_...) -> nothing, smp, w.state, :sampling, 3; rng).logα_c)
+        @test_throws "cannot both be zero" BB.DILISampler(fgs, ps; δr = 0.0, δc = 0.0)
+        @test_throws "must be non-negative" BB.DILISampler(fgs, ps; δr = -1.0)
+        @test_throws "a split sampler needs δr > 0 and δc > 0" BB.DILISampler(fgs, ps; δc = 0.0, split = true)
+        @test_throws "target_accept must be in (0, 1)" BB.DILISampler(fgs, ps; target_accept = 1.0)
+        # NaN potentials at proposals are rejected and counted; a NaN logα leaves the tuner finite
+        snan = BB.DILISampler(u -> (u[1] < 0 ? NaN : 0.0, zero(u)), ps; δr = 1.0e6, δc = 1.0e6)
+        rnan = BB.dili_sample(snan, ones(5), 5, 5; rng)
+        @test rnan.nnan.warmup + rnan.nnan.sampling == count(isnan, rnan.logα) > 0
+        @test all(d -> d[1] >= 0, rnan.draws)
+        @test all(isfinite, BB.step_sizes(snan))
+        @test_throws "the potential at u0 is NaN" BB.dili_sample(snan, -ones(5), 1, 1; rng)
+        @test_throws DimensionMismatch BB.dili_sample(smp, zeros(4), 1, 1)
     end
 
     @testset "sky config + grid snapping" begin
@@ -1092,25 +1396,105 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                 end
 
                 @testset "DILI kernels" begin
-                    pre = BB.gaussian_standardization(postm)
-                    L = BB.flat_layout(tpm)
-                    gauss = sort(vcat([collect(L.instrument[p]) for p in (:d1re, :d1im, :d2re, :d2im, Symbol("lgratμ"))]...))
-                    @test findall(!=(1.0), pre.d) == gauss
-                    @test all(==(0.2), pre.d[gauss])
-                    @test all(iszero, pre.b)
+                    @test_throws "Cannot transport the circular distribution" BB.dili_posterior(postm)
 
-                    tps = BB.dili_posterior(postm)
-                    us = [Comrade.inverse(tps, θ) for θ in θs]
-                    for (u, θ) in zip(us, θs)
-                        @test logdensityof(tps, u) - logdensityof(tpm, Comrade.inverse(tpm, θ)) ≈ sum(log, pre.d) rtol = 1.0e-9
+                    # the same instrument with every prior exactly transportable to N(0, I):
+                    # projected-normal phases and a real-line non-centered gprat chain
+                    icfg_std = deepcopy(instr)
+                    for p in ("gp1μ", "gp1", "gpratμ")
+                        icfg_std["priors"][p]["dist"] = Dict("dist" => "AngularProjectedNormal", "args" => [0.0, 0.0808])
                     end
+                    # log-normal τ: the InverseGamma quantile does not trace under Reactant
+                    icfg_std["priors"]["lg1"]["process"]["tau"] = Dict("dist" => "LogNormal", "args" => [-0.518, 0.764])
+                    icfg_std["priors"]["lgrat"]["process"]["tau"] = Dict("dist" => "LogNormal", "args" => [1.785, 0.764])
+                    gprat = icfg_std["priors"]["gprat"]
+                    gprat["centered"] = false
+                    gprat["process"] = Dict(
+                        "kind" => "ou",
+                        "sigma" => Dict("dist" => "Exponential", "args" => [0.3], "lower" => 0.05),
+                        "tau" => Dict("dist" => "LogNormal", "args" => [2.66, 0.764], "upper" => 48.0),
+                    )
+                    bm = Dict(
+                        "kind" => "gaussmarkov", "seg" => "scan", "centered" => false,
+                        "init" => Dict("kind" => "fixed", "value" => 0.0),
+                        "process" => Dict("kind" => "bm", "D" => Dict("dist" => "Exponential", "args" => [1.0])),
+                    )
+                    gprat["overrides"] = Dict("SW" => bm, "AA" => deepcopy(bm))
+                    posts = VLBIPosterior(skym, build_instrument_config(icfg_std), dcoh; imgdata = imgm)
 
-                    rm = BB.ResidualMap(postm)
+                    tps = BB.dili_posterior(posts)
+                    n = dimension(tps)
+                    L = BB.latent_layout(tps)
+                    @test last(L.instrument.d2im) == n
+                    @test first(L.sky.a) == 1
+
+                    θd = [prior_sample(Random.Xoshiro(k), posts) for k in 1:2]
+                    us = [Comrade.inverse(tps, θ) for θ in θd]
+                    ll(θ) = Comrade.loglikelihood(posts, θ)
+                    @test ll(Comrade.transform(tps, us[1])) ≈ ll(θd[1]) rtol = 1.0e-10
+                    # the prior is exactly N(0, I): log π + ½‖u‖² - log L is constant
+                    c(u) = logdensityof(tps, u) + sum(abs2, u) / 2 - ll(Comrade.transform(tps, u))
+                    cs = [c.(us); c(randn(Random.Xoshiro(3), n))]
+                    @test all(≈(cs[1]; rtol = 1.0e-11), cs)
+
+                    # a start point whose latent is not finite fails before sampling
+                    @test BB.check_start(posts, BB.PT.StdNormal(), θd[1]) ≈ logdensityof(tps, us[1])
+                    θ1 = θd[1]
+                    θbad = BB.@set θ1.sky.mean.fwhm = 0.0
+                    @test_throws "non-finite latent coordinates in sky.mean.fwhm" BB.check_start(posts, BB.PT.StdNormal(), θbad)
+
+                    # real-line phase chains: the start re-wrap and the ±2π sheet move
+                    xs1 = Comrade.transform(tps, us[1])
+                    @test BB.phase_chain_terms(xs1) == (:gprat,)
+                    xb = deepcopy(xs1)
+                    Iaa = Dict(BB._site_points(xb.instrument.gprat.params))[:AA]
+                    parent(xb.instrument.gprat.params)[Iaa[4:end]] .+= 2π
+                    xw, nch = BB.unwrap_phase_chains(posts, xb)
+                    @test nch >= 1
+                    @test all(abs.(diff(parent(xw.instrument.gprat.params)[Iaa])) .<= π + 1.0e-12)
+                    @test ll(xw) ≈ ll(xb) rtol = 1.0e-10
+                    @test logdensityof(tps, Comrade.inverse(tps, xw)) >= logdensityof(tps, Comrade.inverse(tps, xb))
+                    sm = BB.PhaseSheetMoves(posts; rounds = 3)
+                    fx = sm.fixed[:gprat]
+                    term, Ip = sm.points[findfirst(p -> length(p[2]) > 3 && !fx[p[2][3]], sm.points)]
+                    span = BB._shift_span(fx, Ip, 3)
+                    u1 = BB.sheet_proposal(sm, us[1], term, Ip, 3, 1)
+                    d = parent(Comrade.transform(tps, u1).instrument.gprat.params) .- parent(xs1.instrument.gprat.params)
+                    @test all(≈(2π; atol = 1.0e-9), d[span])
+                    @test maximum(abs, d[setdiff(eachindex(d), span)]) < 1.0e-9
+                    @test ll(Comrade.transform(tps, u1)) ≈ ll(xs1) rtol = 1.0e-10
+                    @test BB.sheet_proposal(sm, u1, term, Ip, 3, -1) ≈ us[1] atol = 1.0e-10
+                    # unit Jacobian: the latent shift is the same at another path with the same hyperparameters
+                    rg, gn = sm.ranges[term], BB._term_node(sm.node, term)
+                    u2 = copy(us[1])
+                    xg = BB.PT.latent_pfwd(gn, u2[rg])
+                    xg2 = BB.PT.latent_pfwd(gn, u2[rg] .+ 0.3 .* randn(Random.Xoshiro(9), length(rg)))
+                    u2[rg] = BB.PT.latent_pback(gn, (; params = xg2.params, hyperparams = xg.hyperparams))
+                    @test BB.sheet_proposal(sm, us[1], term, Ip, 3, 1) .- us[1] ≈
+                        BB.sheet_proposal(sm, u2, term, Ip, 3, 1) .- u2 atol = 1.0e-9
+
+                    # the mean-field move in the StdNormal space: the likelihood is unchanged, the
+                    # move is reversed by the opposite step, and only the mean-model coordinate and
+                    # the white coefficients of `a` change, by a shift that does not depend on `a`
+                    smn = BB.SymmetryMoves(posts, ["mean_field"], θd[1]; space = BB.PT.StdNormal())
+                    @test collect(BB.move_name.(smn.moves)) == ["mean_field[fwhm]", "mean_field[fb]"]
+                    for m in smn.moves, u in us
+                        u′, ld = BB.propose(m, u, 0.1, tps, smn.ctx)
+                        @test ld == 0
+                        @test first(BB.propose(m, u′, -0.1, tps, smn.ctx)) ≈ u rtol = 1.0e-10
+                        @test ll(Comrade.transform(tps, u′)) ≈ ll(Comrade.transform(tps, u)) rtol = 1.0e-10
+                        @test all(i -> i in m.coeffs || i == m.mean[m.imean], findall(u′ .!= u))
+                        ua = copy(u)
+                        ua[m.coeffs] .+= randn(Random.Xoshiro(4), length(m.coeffs))
+                        @test first(BB.propose(m, ua, 0.1, tps, smn.ctx)) .- ua ≈ u′ .- u atol = 1.0e-10
+                    end
+                    @test_throws "in the StdNormal space only \"mean_field\" runs" BB.SymmetryMoves(
+                        posts, ["flux_gain"], θd[1]; space = BB.PT.StdNormal()
+                    )
+
+                    rm = BB.ResidualMap(posts)
                     Φ = [BB.dili_potential(rm, tps, u) for u in us]
-                    @test Φ[1] - Φ[2] ≈ Comrade.loglikelihood(postm, θs[2]) - Comrade.loglikelihood(postm, θs[1]) rtol = 1.0e-10
-                    # Φ̃ = -log π - ½‖u‖² up to a constant
-                    c = [BB.dili_reference_potential(rm, tps, u) + logdensityof(tps, u) + sum(abs2, u) / 2 for u in us]
-                    @test c[1] ≈ c[2] rtol = 1.0e-10
+                    @test Φ[1] - Φ[2] ≈ ll(θd[2]) - ll(θd[1]) rtol = 1.0e-10
 
                     M = Tuple(copy.(rm.measurement))
                     N = Tuple(copy.(rm.noise))
@@ -1120,8 +1504,7 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                     N[1][1] = 0.0
                     @test_throws "non-positive noise" BB.ResidualMap(M, N)
 
-                    k = BB.DILIKernels(postm)
-                    n = dimension(tps)
+                    k = BB.DILIKernels(posts)
                     prng = Random.Xoshiro(21)
                     u, v, w = us[1], randn(prng, n), randn(prng, n)
                     h = 1.0e-5
@@ -1138,28 +1521,89 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                     @test dot(w, GNv) ≈ dot(Jw, Jv) rtol = 1.0e-6
                     @test dot(w, GNv) ≈ dot(GNw, v) rtol = 1.0e-10
 
-                    Ψ(u) = BB.dili_prior_remainder(tps, u)
-                    hh = 1.0e-3
-                    wHv_fd = (
-                        Ψ(u .+ hh .* (v .+ w)) - Ψ(u .+ hh .* (v .- w)) -
-                            Ψ(u .- hh .* (v .- w)) + Ψ(u .- hh .* (v .+ w))
-                    ) / (4hh^2)
-                    Hv, Hw = Array(BB.prior_hvp(k, u, v)), Array(BB.prior_hvp(k, u, w))
-                    @test dot(w, Hv) ≈ wHv_fd rtol = 1.0e-4
-                    @test dot(w, Hv) ≈ dot(Hw, v) rtol = 1.0e-10
-                    @test Array(BB.curvature(k, u, v)) ≈ GNv .+ Hv rtol = 1.0e-10
-
-                    Φ̃d, g̃ = BB.reference_gradient(k, u)
-                    @test Φ̃d ≈ BB.dili_reference_potential(rm, tps, u) rtol = 1.0e-9
-                    @test dot(Array(g̃) .- Array(g), v) ≈ fd(Ψ, v) rtol = 1.0e-6
-                    # standardized blocks are exactly N(0, I): Ψ does not depend on them
-                    u′ = copy(u)
-                    u′[gauss] .= randn(prng, length(gauss))
-                    @test Ψ(u′) ≈ Ψ(u) rtol = 1.0e-12
-
                     compiled = copy(k.compiled)
                     BB.gauss_newton(k, us[2], w)
                     @test k.compiled == compiled
+
+                    # the subspace of the draw-averaged Gauss–Newton operator against its
+                    # dense eigendecomposition
+                    Id = Matrix{Float64}(I, n, n)
+                    H = sum(u -> reduce(hcat, (Array(BB.gauss_newton(k, u, Id[:, j])) for j in 1:n)), us) ./ length(us)
+                    Ed = eigen(Symmetric(H); sortby = -)
+                    thr = (Ed.values[6] + Ed.values[7]) / 2
+                    sub = BB.dili_subspace(k, us; rank = 10, threshold = thr, power = 4, rng = Random.Xoshiro(5))
+                    @test length(sub) == 6
+                    @test sub.λ ≈ Ed.values[1:6] rtol = 1.0e-6
+
+                    # the compiled DILI step against the host step on the device potential
+                    fgk(u) = ((Φ, g) = BB.potential_gradient(k, u); (Φ, Array(g)))
+                    ds = BB.DILISampler(k, sub)
+                    hp = BB.DILIProposal(sub)
+                    Φ0, g0 = fgk(u)
+                    ξr, ξ = randn(prng, length(sub)), randn(prng, n)
+                    hu, hΦ, _, hα = BB.dili_step(fgk, hp, u, Φ0, g0, 1.0e-7, 1.0e-3, ξr, ξ, -Inf)
+                    du, dΦ, dg, dα = ds.step(u, Φ0, g0, 1.0e-7, 1.0e-3, ξr, ξ, -Inf)
+                    @test Array(du) ≈ hu rtol = 1.0e-10
+                    @test dΦ ≈ hΦ rtol = 1.0e-9
+                    @test dα ≈ hα atol = 1.0e-6 * abs(Φ0)
+                    compiled = copy(k.compiled)
+                    ds.step(Array(du), dΦ, Array(dg), 0.1, 0.5, ξr, ξ, 0.0)
+                    @test k.compiled == compiled
+                    res = BB.dili_sample(ds, u, 2, 3; rng = prng)
+                    @test length(res.draws) == 3 && length(res.draws[1]) == n
+                    @test_throws DimensionMismatch BB.DILISampler(k, BB.LikelihoodSubspace(sub.λ, sub.V, sub.free, n + 1, sub.threshold))
+                    # the Langevin complement: its own compiled pair, same agreement with the host step
+                    dsl = BB.DILISampler(k, sub; langevin_complement = true)
+                    hpl = BB.DILIProposal(sub; langevin_complement = true)
+                    hul, hΦl, _, hαl = BB.dili_step(fgk, hpl, u, Φ0, g0, 1.0e-7, 1.0e-7, ξr, ξ, -Inf)
+                    dul, dΦl, _, dαl = dsl.step(u, Φ0, g0, 1.0e-7, 1.0e-7, ξr, ξ, -Inf)
+                    @test Array(dul) ≈ hul rtol = 1.0e-10
+                    @test dαl ≈ hαl atol = 1.0e-6 * abs(Φ0)
+                    @test !(Array(dul) ≈ first(BB.dili_propose(hp, u, g0, hp.V' * u, hp.V' * g0, 1.0e-7, 1.0e-7, ξr, ξ)))
+                    # the device step caches (Vᵀu, Vᵀ∇Φ) between steps: it follows the host step
+                    # along a trajectory of accepted and rejected moves, split or not
+                    for split in (false, true)
+                        trng = Random.Xoshiro(5)
+                        hu, hΦ, hg = u, Φ0, g0
+                        tu, tΦ, tg = u, Φ0, g0
+                        for _ in 1:10, (δr, δc) in (split ? ((1.0e-7, 0.0), (0.0, 1.0e-7)) : ((1.0e-7, 1.0e-7),))
+                            ξr, ξ, logu = randn(trng, length(sub)), randn(trng, n), log(rand(trng))
+                            hu, hΦ, hg, hα = BB.dili_step(fgk, hp, hu, hΦ, hg, δr, δc, ξr, ξ, logu)
+                            tu, tΦ, tg, tα = ds.step(tu, tΦ, tg, δr, δc, ξr, ξ, logu)
+                            @test (logu < hα) == (logu < tα)
+                            @test Array(tu) ≈ hu rtol = 1.0e-10
+                        end
+                    end
+
+                    # the sampling run: DiskStore output, pinned coordinates, subspace rebuild
+                    mktempdir() do dir
+                        out = joinpath(dir, "dili")
+                        cfg = DILIConfig(;
+                            nwarmup = 4, nsample = 6, thin = 2, stride = 2, rank = 20, power = 1,
+                            threshold = thr, refine_at = [0.5], subspace_ndraws = 2, pin = ["sky.σa"],
+                            step_subspace = 1.0e-6, step_complement = 1.0e-4,
+                        )
+                        pins = BB.pinned_coordinates(tps, cfg.pin)
+                        @test pins == collect(L.sky.σa)
+                        @test_throws "is not a parameter path: no \"nope\"" BB.pinned_coordinates(tps, ["sky.nope"])
+                        res = BB.sample_dili(out, k, u, cfg; rng = Random.Xoshiro(4))
+                        @test (res.nsamples, res.nfiles, res.stride) == (3, 2, 2)
+                        ch = load_samples(out)
+                        xs = Comrade.postsamples(ch)
+                        @test length(xs) == 3
+                        @test Comrade.samplerstats(ch).step == [2, 4, 6]
+                        @test all(x -> x.sky.σa == Comrade.transform(tps, u).sky.σa, xs)
+                        tr = BB.deserialize(joinpath(out, "dili_trace.jls"))
+                        @test tr.phase == [fill(:warmup, 4); fill(:sampling, 6)]
+                        @test length(tr.logα) == length(tr.scale) == length(tr.seconds) == 10
+                        @test tr.refine_steps == [2]
+                        @test isfile(joinpath(out, "subspace_0.jls")) && isfile(joinpath(out, "subspace_1.jls"))
+                        @test BB.load_subspace(joinpath(out, "subspace.jls")).free == setdiff(1:n, pins)
+                        @test_throws "already holds a chain" BB.sample_dili(out, k, u, cfg)
+                        # a saved subspace must match the sampled coordinates
+                        cfg2 = DILIConfig(; nwarmup = 0, nsample = 1, subspace = joinpath(out, "subspace.jls"))
+                        @test_throws "check dili.pin" BB.sample_dili(joinpath(dir, "dili2"), k, u, cfg2)
+                    end
                 end
             end
         else
