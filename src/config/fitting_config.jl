@@ -2,34 +2,6 @@
 # the noise-tempering schedule, and the MCMC sampler (AdvancedHMC vs Reactant NUTS).
 
 """
-    DILIConfig
-
-Settings of the DILI sampler (the `[dili]` table of a fitting config; see
-[`build_fitting_config`](@ref)).
-"""
-Base.@kwdef struct DILIConfig
-    nwarmup::Int = 1000
-    nsample::Int = 5000
-    thin::Int = 1
-    stride::Int = 100
-    step_subspace::Float64 = 1.0
-    step_complement::Float64 = 1.0
-    target_accept::Float64 = 0.5
-    langevin_complement::Bool = false
-    split_blocks::Bool = false
-    rank::Int = 200
-    oversample::Int = 10
-    power::Int = 2
-    threshold::Float64 = 0.1
-    max_basis_gb::Float64 = 2.0
-    subspace::Union{Nothing, String} = nothing
-    subspace_draws::Union{Nothing, String} = nothing
-    subspace_ndraws::Int = 10
-    refine_at::Vector{Float64} = Float64[]
-    pin::Vector{String} = String[]
-end
-
-"""
     FittingStrategy
 
 Typed description of how to fit: the optimizer, the fractional-noise tempering schedule,
@@ -122,8 +94,6 @@ Base.@kwdef struct FittingStrategy
     # Optimization is deliberately NOT checkpointed — rendering on the host each step is far
     # slower than the device step.
     sample_checkpoint::Int = 0
-    # the DILI sampler replaces NUTS when set
-    dili::Union{Nothing, DILIConfig} = nothing
 end
 
 """
@@ -168,31 +138,10 @@ required by priors without a flat transform such as `AngularProjectedNormal`). M
 than `"phase_sheet"` need the flat space; the low-rank preconditioner acts in front of
 either. In the `"stdnormal"` space the start point's real-line phase chains are re-wrapped
 to their shortest steps (see [`unwrap_phase_chains`](@ref)) before sampling.
-
-A `[dili]` table replaces NUTS with the DILI sampler (see [`sample_dili`](@ref)), which needs
-`run.use_reactant = true` and `run.latent_space = "stdnormal"` and excludes `[sampler]`,
-`[precondition]` and `run.sample_checkpoint`. Keys (defaults in parentheses):
-
-  - `nwarmup` (1000), `nsample` (5000): tuning and sampling steps;
-  - `thin` (1): keep every `thin`-th sampling step; `stride` (100): kept draws per file;
-  - `step_subspace`, `step_complement` (1.0, 1.0): the step sizes `δr`, `δc` before the
-    common tuning factor; `step_complement = 0` freezes the complement;
-  - `target_accept` (0.5), `langevin_complement` (false);
-  - `split_blocks` (false): alternate subspace-only and complement-only steps, each with its
-    own tuned step factor;
-  - `rank` (200), `oversample` (10), `power` (2), `threshold` (0.1), `max_basis_gb` (2.0):
-    the likelihood-informed subspace (see `likelihood_subspace`);
-  - `subspace` (unset): a saved subspace to start from, instead of building one from
-    `subspace_draws` (an MCMC DiskStore directory; unset uses the start point alone) with
-    `subspace_ndraws` (10) evenly spaced draws;
-  - `refine_at` (empty): increasing fractions of `nwarmup` in (0, 1) at which the subspace is
-    rebuilt from `subspace_ndraws` states of the warmup chain since the previous rebuild;
-  - `pin` (empty): parameter paths such as `"sky.σa"` or `"instrument.lg1"` whose latent
-    coordinates stay at the start point.
 """
 function build_fitting_config(cfg::AbstractDict)
     check_config_keys(
-        cfg, ("optimizer", "tempering", "sampler", "precondition", "run", "dili"),
+        cfg, ("optimizer", "tempering", "sampler", "precondition", "run"),
         "the fitting config (top level)"
     )
     opt = get(cfg, "optimizer", Dict{String, Any}())
@@ -305,7 +254,6 @@ function build_fitting_config(cfg::AbstractDict)
         precond_refit_schedule = String(get(prec, "refit_schedule", "manual")),
         precond_refit_carry = refit_carry,
         precond_seed_transport = String(get(prec, "seed_transport", "")),
-        dili = haskey(cfg, "dili") ? build_dili_config(cfg, use_reactant, latent_space) : nothing,
         latent_space = latent_space,
         use_reactant = use_reactant,
         benchmark = Bool(get(run, "benchmark", true)),
@@ -313,83 +261,6 @@ function build_fitting_config(cfg::AbstractDict)
         start = start,
         # `checkpoint` is accepted as an alias for `sample_checkpoint`.
         sample_checkpoint = Int(get(run, "sample_checkpoint", get(run, "checkpoint", 0))),
-    )
-end
-
-const _DILI_KEYS = (
-    "nwarmup", "nsample", "thin", "stride", "step_subspace", "step_complement",
-    "target_accept", "langevin_complement", "split_blocks", "rank", "oversample", "power", "threshold",
-    "max_basis_gb", "subspace", "subspace_draws", "subspace_ndraws", "refine_at", "pin",
-)
-
-function build_dili_config(cfg::AbstractDict, use_reactant::Bool, latent_space::AbstractString)
-    d = cfg["dili"]
-    d isa AbstractDict || error("[dili] must be a table")
-    check_config_keys(d, _DILI_KEYS, "[dili]")
-    use_reactant || error("[dili] needs run.use_reactant = true")
-    latent_space == "stdnormal" || error("[dili] needs run.latent_space = \"stdnormal\"")
-    for t in ("sampler", "precondition")
-        haskey(cfg, t) && error("[$t] configures NUTS; remove it when [dili] is set")
-    end
-    run = get(cfg, "run", Dict{String, Any}())
-    any(k -> haskey(run, k), ("sample_checkpoint", "checkpoint")) &&
-        error("run.sample_checkpoint configures NUTS; remove it when [dili] is set")
-
-    function intkey(key, default, lo)
-        v = get(d, key, default)
-        (v isa Integer && !(v isa Bool) && v >= lo) || error("dili.$key must be an integer ≥ $lo, got $(repr(v))")
-        return Int(v)
-    end
-    function realkey(key, default, ok, what)
-        v = get(d, key, default)
-        (v isa Real && !(v isa Bool) && ok(v)) || error("dili.$key must be $what, got $(repr(v))")
-        return Float64(v)
-    end
-    function pathkey(key)
-        v = get(d, key, "")
-        v isa AbstractString || error("dili.$key must be a path, got $(repr(v))")
-        return isempty(v) ? nothing : String(v)
-    end
-    function stringskey(key)
-        v = get(d, key, String[])
-        (v isa AbstractVector && all(x -> x isa AbstractString, v)) ||
-            error("dili.$key must be a list of strings, got $(repr(v))")
-        return String.(v)
-    end
-
-    subspace, subspace_draws = pathkey("subspace"), pathkey("subspace_draws")
-    (isnothing(subspace) || isnothing(subspace_draws)) ||
-        error("dili.subspace and dili.subspace_draws are exclusive: one gives the subspace, the other the draws to build it from")
-    refine_at = get(d, "refine_at", Float64[])
-    (refine_at isa AbstractVector && all(x -> x isa Real && 0 < x < 1, refine_at) && issorted(refine_at; lt = <=)) ||
-        error("dili.refine_at must be increasing fractions in (0, 1), got $(repr(refine_at))")
-    nwarmup = intkey("nwarmup", 1000, 0)
-    refine_steps = round.(Int, refine_at .* nwarmup)
-    (allunique(refine_steps) && all(t -> 0 < t < nwarmup, refine_steps)) || error(
-        "dili.refine_at = $(repr(refine_at)) gives warmup steps $refine_steps of $nwarmup; " *
-            "they must be distinct and strictly between 0 and dili.nwarmup"
-    )
-    pin = stringskey("pin")
-    allunique(pin) || error("dili.pin lists a path twice: $pin")
-    lc = get(d, "langevin_complement", false)
-    lc isa Bool || error("dili.langevin_complement must be true or false, got $(repr(lc))")
-    sb = get(d, "split_blocks", false)
-    sb isa Bool || error("dili.split_blocks must be true or false, got $(repr(sb))")
-
-    nsample, thin = intkey("nsample", 5000, 1), intkey("thin", 1, 1)
-    nsample >= thin || error("dili.nsample = $nsample is less than dili.thin = $thin: no draws would be kept")
-    return DILIConfig(;
-        nwarmup, nsample, thin,
-        stride = intkey("stride", 100, 1),
-        step_subspace = realkey("step_subspace", 1.0, >(0), "positive"),
-        step_complement = realkey("step_complement", 1.0, >=(0), "non-negative"),
-        target_accept = realkey("target_accept", 0.5, x -> 0 < x < 1, "in (0, 1)"),
-        langevin_complement = lc, split_blocks = sb, rank = intkey("rank", 200, 1),
-        oversample = intkey("oversample", 10, 1), power = intkey("power", 2, 0),
-        threshold = realkey("threshold", 0.1, >(0), "positive"),
-        max_basis_gb = realkey("max_basis_gb", 2.0, >(0), "positive"),
-        subspace, subspace_draws, subspace_ndraws = intkey("subspace_ndraws", 10, 1),
-        refine_at = Float64.(refine_at), pin,
     )
 end
 

@@ -68,10 +68,7 @@ include("pipeline/output.jl")
 include("pipeline/fixed_scales.jl")
 include("pipeline/reactant_opt.jl")
 include("pipeline/moves.jl")
-include("pipeline/gibbs_dili.jl")
-include("pipeline/dili_subspace.jl")
-include("pipeline/dili_step.jl")
-include("pipeline/dili_driver.jl")
+include("pipeline/gauss_newton.jl")
 include("pipeline/sheet_moves.jl")
 include("pipeline/imager.jl")
 include("pipeline/run.jl")
@@ -98,9 +95,9 @@ export read_dlist, read_array_table, build_data_uvfits, build_data_dlist, conjug
 export assemble_instrument, parse_dist, parse_process, parse_init
 # config layer
 export build_sky_config, build_instrument_config, build_data_config, build_fitting_config
-export FittingStrategy, DILIConfig
+export FittingStrategy
 export SymmetryMoves, FluxGainMove, FieldScaleMove, RhoFieldMove, MeanFieldMove, PhaseOffsetMove, move_summary
 # pipeline
-export comrade_imager, best_image, reactant_opt, rescale_fields, held_scale_values, load_chain_and_post, load_posterior, saveimgs, image_from_toml, sample_dili, unwrap_phase_chains, PhaseSheetMoves
+export comrade_imager, best_image, reactant_opt, rescale_fields, held_scale_values, load_chain_and_post, load_posterior, saveimgs, image_from_toml, unwrap_phase_chains, PhaseSheetMoves
 
 end

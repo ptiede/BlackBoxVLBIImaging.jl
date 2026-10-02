@@ -26,7 +26,7 @@ end
 # term => the chain points `post` fixes (reference or initial values): those whose value does
 # not move when the StdNormal latent point does.
 function _fixed_points(post)
-    tp = dili_posterior(post)
+    tp = stdnormal_posterior(post)
     n = dimension(tp)
     xa = Comrade.transform(tp, zeros(n))
     xb = Comrade.transform(tp, randn(Random.Xoshiro(1), n))
@@ -94,7 +94,7 @@ end
 
 function PhaseSheetMoves(post::VLBIPosterior; rounds::Integer = 1)
     rounds >= 1 || throw(ArgumentError("rounds must be at least 1, got $rounds"))
-    tp = dili_posterior(post)
+    tp = stdnormal_posterior(post)
     node = PT.transport_node(tp.transform)
     L = latent_layout(tp)
     x = Comrade.transform(tp, zeros(dimension(tp)))

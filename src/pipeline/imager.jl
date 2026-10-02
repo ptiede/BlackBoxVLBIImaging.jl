@@ -364,8 +364,8 @@ end
                    rng=Random.default_rng(), restart=false)
 
 Run the full imaging pipeline: staged noise-tempered optimization (or restart/start),
-save the optimal image + caltables, then sample the posterior (AdvancedHMC NUTS, Reactant
-NUTS or DILI per `strategy`) and write posterior FITS draws. Returns the path the run was written
+save the optimal image + caltables, then sample the posterior (AdvancedHMC or Reactant
+NUTS per `strategy`) and write posterior FITS draws. Returns the path the run was written
 to.
 
 `restart=true` resumes from a previously serialized optimum at `outbase` instead of
@@ -376,8 +376,6 @@ function comrade_imager(
         strategy::FittingStrategy, imgdata = nothing, rng = Random.default_rng(),
         restart::Bool = false
     )
-    (restart && !isnothing(strategy.dili)) &&
-        error("restart is not supported with the DILI sampler ([dili] in the fitting config)")
     @info "Imaging output base: $outbase"
     mkpath(dirname(outbase))
     outimg = mkpath(joinpath(dirname(outbase), "images"))
@@ -467,10 +465,7 @@ function comrade_imager(
         nsheet > 0 && @info "Re-wrapped $nsheet phase-chain step(s) of the start point to their shortest form"
     end
     check_start(post, latent_space(strategy), xopt)
-    if !isnothing(strategy.dili)
-        trace = sample_dili(out, post, xopt, strategy.dili; rng)
-        range = 1:(trace.nsamples)
-    elseif strategy.use_reactant
+    if strategy.use_reactant
         trace, range = _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, transport_method, tgrad)
     else
         trace, range = _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart, transport_method)

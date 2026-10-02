@@ -396,7 +396,7 @@ function _mean_field_moves_std(post, θ)
     isempty(means) && error("move \"mean_field\" needs a mean model with free parameters")
     plan = _markov_plan(post, "mean_field")
     _, dk = _plan_wavenumbers(plan)
-    tp = dili_posterior(post)
+    tp = stdnormal_posterior(post)
     tmean, rmean = _std_leaf(tp, (:sky, :mean))
     length(rmean) == length(means) ||
         error("the mean-model parameters do not have one latent coordinate each")
@@ -599,7 +599,7 @@ function SymmetryMoves(
     rounds >= 1 || throw(ArgumentError("rounds must be at least 1, got $rounds"))
     θ0 = Comrade.Adapt.adapt(Array, θ0)
     std = space isa PT.StdNormal
-    tbase = std ? dili_posterior(post) : asflat(post)
+    tbase = std ? stdnormal_posterior(post) : asflat(post)
     moves = std ? _parse_moves_std(names, post, θ0) : _parse_moves(names, post, _flat_root(tbase), θ0)
     ctx = _move_context(post, moves)
     x0 = Comrade.inverse(tbase, θ0)

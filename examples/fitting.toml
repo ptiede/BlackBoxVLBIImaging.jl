@@ -41,14 +41,3 @@ benchmark = true
 sample_checkpoint = 0   # Reactant only: render a checkpoint (FITS + PNG + residuals) every N
                         # sampling samples (also the sampling disk stride). 0 disables it.
 # start = "/path/to/start.jls"   # warm-start from a serialized parameter vector
-
-# DILI sampler in place of NUTS (needs use_reactant = true and latent_space = "stdnormal", and
-# no [sampler] or [precondition] table). See `build_fitting_config` for every key.
-# [dili]
-# nwarmup = 1000
-# nsample = 5000
-# thin = 10
-# rank = 500
-# subspace_draws = "/path/to/nuts/run"   # MCMC DiskStore directory; or subspace = "subspace.jls"
-# refine_at = [0.5]
-# pin = ["sky.σa", "sky.ρa"]
