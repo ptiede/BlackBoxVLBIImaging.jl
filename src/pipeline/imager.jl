@@ -198,7 +198,7 @@ end
 # transform is supplied up front, since diagonal adaptation renormalizes the marginals the
 # transform deliberately set). Gauss–Newton refits need `curvature`, the function
 # `gauss_newton_curvature` builds.
-function _metric_adaptor(strategy::FittingStrategy, curvature = nothing)
+function _metric_adaptor(strategy::FittingStrategy, curvature = nothing; rows = nothing)
     sched = if strategy.precond_refit_schedule == "stan"
         :stan
     elseif strategy.precond_refit_schedule == "nutpie"
@@ -216,7 +216,7 @@ function _metric_adaptor(strategy::FittingStrategy, curvature = nothing)
         return Comrade.GaussNewtonLowRank(
             curvature; rank = strategy.precond_rank, oversample = strategy.precond_oversample,
             probes_per_draw = strategy.precond_probes_per_draw == 0 ? k : strategy.precond_probes_per_draw,
-            threshold = strategy.precond_threshold, schedule = sched
+            threshold = strategy.precond_threshold, schedule = sched, rows
         )
     end
     return Comrade.FisherLowRank(;
@@ -236,6 +236,48 @@ function _seed_transport(strategy::FittingStrategy)
     return t
 end
 
+# The paths of the non-finite entries of a constrained parameter point, with the first
+# offending value of each array.
+function _nonfinite_paths(x, path = "")
+    x isa NamedTuple && return reduce(vcat, (_nonfinite_paths(v, "$path.$k") for (k, v) in pairs(x)); init = String[])
+    x isa Tuple && return reduce(vcat, (_nonfinite_paths(v, "$path[$i]") for (i, v) in pairs(x)); init = String[])
+    if x isa AbstractArray{<:Number}
+        bad = findall(!isfinite, vec(parent(x)))
+        return isempty(bad) ? String[] : ["$path ($(length(bad)) of $(length(x)) entries, e.g. $(vec(parent(x))[first(bad)]))"]
+    end
+    return x isa Number && !isfinite(x) ? ["$path = $x"] : String[]
+end
+
+# Error, naming the parameters, if a draw has a non-finite value.
+function _check_finite_draw(x, where)
+    bad = _nonfinite_paths(x)
+    isempty(bad) || error("the $where draw has non-finite parameters: $(join(bad, "; "))")
+    return x
+end
+
+# The wall time and the moves' total time (`Comrade.move_seconds`) at the end of the last
+# sampler callback of a phase; `t = NaN` before the first.
+mutable struct _NUTSClock
+    t::Float64
+    moved::Float64
+end
+_NUTSClock() = _NUTSClock(NaN, 0.0)
+_restart!(c::_NUTSClock, t, moved) = (c.t = t; c.moved = moved; c)
+
+# Leapfrog steps per draw over the `nsteps` draws since the clock was restarted: the wall
+# time to `t` less the moves' time in between, divided by the time of one gradient
+# `tgrad`. Empty before the first restart (that interval includes compile time) or without
+# `tgrad`. With `maxdepth`, a mean of at least 95% of the `2^maxdepth − 1` leapfrog steps
+# of a full tree is flagged: the trajectories end at the depth cap, not at a U-turn.
+function _depth_note(c::_NUTSClock, t, moved, nsteps, tgrad; maxdepth = nothing)
+    dt = t - c.t - (moved - c.moved)
+    (isnan(dt) || isnothing(tgrad) || nsteps <= 0) && return ""
+    lf = dt / nsteps / tgrad
+    capped = !isnothing(maxdepth) && lf >= 0.95 * (2^maxdepth - 1)
+    return " ~lf/step=$(round(Int, lf)) (depth≈$(round(log2(max(lf, 1)); digits = 1)))" *
+        (capped ? ", at the depth cap $maxdepth" : "")
+end
+
 function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, transport_method, tgrad = nothing)
     @info "Building Reactant device posterior for sampling"
     # Reuse the already-built posterior, just dropping the Enzyme AD mode: `prepare_device`
@@ -245,18 +287,18 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
     rpost = Comrade.prepare_device(post_cpu, Comrade.ComradeBase.ReactantEx())
     curvature = strategy.precond_refit_kind == "gauss_newton" ?
         gauss_newton_curvature(GaussNewtonKernels(post_cpu, rpost)) : nothing
-    adaptor = _metric_adaptor(strategy, curvature)
-    rounds = strategy.moves_per_chunk
-    sheet = "phase_sheet" in strategy.moves ? PhaseSheetMoves(post_cpu; rounds) : nothing
-    symnames = filter(!=("phase_sheet"), strategy.moves)
-    sym = isempty(symnames) ? nothing :
-        SymmetryMoves(post_cpu, symnames, xopt; rounds, space = latent_space(strategy))
-    isnothing(sheet) ||
-        @info "Phase sheet moves between NUTS chunks, $rounds proposal(s) each time over $(length(sheet.points)) site paths"
-    isnothing(sym) ||
-        @info "Moves between NUTS chunks, $rounds round(s) each time: $(join(move_name.(sym.moves), ", "))"
-    hooks = Tuple(h for h in (sheet, sym) if !isnothing(h))
-    moves = isempty(hooks) ? nothing : length(hooks) == 1 ? only(hooks) : ChainedMoves(hooks)
+    rows = strategy.precond_refit_kind == "gauss_newton" ?
+        gauss_newton_rows(post_cpu, strategy.precond_band_limit) : nothing
+    isnothing(rows) || @info "Gauss–Newton directions on $(length(rows)) of " *
+        "$(dimension(Comrade.transport_to(post_cpu, PT.StdNormal()))) latent coordinates " *
+        "(sky-field modes up to $(strategy.precond_band_limit) × the longest baseline)"
+    adaptor = _metric_adaptor(strategy, curvature; rows)
+    moves = isempty(strategy.moves) ? nothing : build_moves(
+        post_cpu, strategy.moves, xopt;
+        space = latent_space(strategy), output = joinpath(mkpath(out), "moves.jls")
+    )
+    isnothing(moves) || @info "Moves between NUTS chunks (proposals per call): " *
+        join(("$(Comrade.move_name(m)) ×$r" for (m, r) in zip(moves.moves, moves.rounds)), ", ")
     smplr = Comrade.ReactantNUTS(;
         n_adapts = strategy.nadapt, init_step_size = strategy.step_size,
         max_tree_depth = strategy.max_tree_depth,
@@ -269,23 +311,19 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
     if strategy.sample_checkpoint > 0
         # Post-warmup per-batch checkpoint: render the latest draw and save FITS+PNG+resid.
         # Tree depth is not exposed by the ProbProg backend (its diagnostics carry only
-        # the divergence flag), but wall time per draw divided by the benchmarked
-        # gradient time is the leapfrog count, and log2 of that is the depth. The first
-        # callback after a (re)compile is skipped — it includes compile time.
-        tlast = Ref(NaN)
-        depth_note = function (nsteps)
-            t = time()
-            dt = t - tlast[]
-            tlast[] = t
-            (isnan(dt) || isnothing(tgrad) || nsteps <= 0) && return ""
-            lf = dt / nsteps / tgrad
-            return " ~lf/step=$(round(Int, lf)) (depth≈$(round(log2(max(lf, 1)); digits = 1)))"
-        end
+        # the divergence flag), so `_depth_note` estimates it from the NUTS wall time
+        # between callbacks; each phase has its own clock.
+        movesec() = isnothing(moves) ? 0.0 : Comrade.move_seconds(moves)
+        tsample = _NUTSClock()
         cb = function (info)
-            params = Comrade.Adapt.adapt(Array, info.params)
+            t = time()
+            params = _check_finite_draw(Comrade.Adapt.adapt(Array, info.params), "sampling batch $(info.round)")
             save_checkpoint(post_cpu, params, gimg, imgbase, "sample_round$(info.round)")
             ndiv = count(info.numerical_error)
-            @info "sampling batch $(info.round)/$(info.nrounds): n_divergences=$ndiv$(depth_note(stride)) (checkpoint saved)"
+            tg = something(get(info.extras, :gradient_time, nothing), tgrad, Some(nothing))
+            note = _depth_note(tsample, t, movesec(), stride, tg; maxdepth = strategy.max_tree_depth)
+            @info "sampling batch $(info.round)/$(info.nrounds): n_divergences=$ndiv$note (checkpoint saved)"
+            _restart!(tsample, time(), movesec())
             return (; info.round, n_divergences = ndiv)
         end
         # Warmup now runs in chunks of the same `stride`, and its callback fires after EVERY
@@ -295,12 +333,16 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
         # `step`/`total` (steps done / n_adapts) plus host-side `step_size`/`params` — NOT the
         # sampling `round`/`nrounds` fields.
         wstep = Ref(0)
+        twarm = _NUTSClock()
         wcb = function (info)
-            params = Comrade.Adapt.adapt(Array, info.params)
+            t = time()
+            params = _check_finite_draw(Comrade.Adapt.adapt(Array, info.params), "warmup step $(info.step)")
             save_checkpoint(post_cpu, params, gimg, imgbase, "warmup_step$(info.step)")
-            note = depth_note(info.step - wstep[])
+            tg = something(get(info, :gradient_time, nothing), tgrad, Some(nothing))
+            note = _depth_note(twarm, t, movesec(), info.step - wstep[], tg; maxdepth = strategy.max_tree_depth)
             wstep[] = info.step
             @info "warmup $(info.step)/$(info.total): step_size=$(info.step_size)$note (checkpoint saved)"
+            _restart!(twarm, time(), movesec())
             return (; info.step, info.total, info.step_size)
         end
         # nutpie-style init: with in-run refits configured and no pilot transform, one
@@ -331,13 +373,17 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
             transport_method = transport_method, between_chunks = moves
         )
     end
-    isnothing(sheet) || @info "phase sheet moves: " * sheet_summary(sheet)
-    if !isnothing(sym)
-        @info "moves, warmup: " * move_summary(sym, :warmup)
-        @info "moves, sampling: " * move_summary(sym, :sampling)
+    isnothing(moves) || foreach(move_summary(moves)) do m
+        @info "move $(m.name): warmup $(m.warmup.accepted)/$(m.warmup.proposed), " *
+            "sampling $(m.sampling.accepted)/$(m.sampling.proposed) accepted" *
+            _scale_text(m.τ)
     end
     return trace.out, 1:10:strategy.nsample
 end
+
+_scale_text(::Nothing) = ""
+_scale_text(τ::Real) = ", τ = $(@sprintf("%.3g", τ))"
+_scale_text(τ::AbstractVector) = ", τ = $(@sprintf("%.3g", minimum(τ)))–$(@sprintf("%.3g", maximum(τ))) over $(length(τ)) components"
 
 """
     check_start(post, space, x) -> Float64

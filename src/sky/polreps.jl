@@ -16,7 +16,7 @@ struct PolExp <: PolModel end
 """Total-intensity (Stokes I only) imaging."""
 struct TotalIntensity <: PolRep end
 
-"""Matérn-process random-field base (`order == 0`)."""
+"""Matérn random-field base (`order == 0`), with the spectrum [`MaternSlopePS`](@ref)."""
 struct Matern end
 
 """Markov random field of explicit order `N` (`order < 0` selects `MarkovRF(abs(order))`)."""

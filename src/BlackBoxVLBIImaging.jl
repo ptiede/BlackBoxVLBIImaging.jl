@@ -67,9 +67,9 @@ include("config/fitting_config.jl")
 include("pipeline/output.jl")
 include("pipeline/fixed_scales.jl")
 include("pipeline/reactant_opt.jl")
-include("pipeline/moves.jl")
 include("pipeline/gauss_newton.jl")
-include("pipeline/sheet_moves.jl")
+include("pipeline/phase_chains.jl")
+include("pipeline/moves.jl")
 include("pipeline/imager.jl")
 include("pipeline/run.jl")
 
@@ -81,12 +81,12 @@ end
 
 # sky models (one @sky constructor per polrep × random-field base)
 export centroid, power_centroid
-export stokesi_gmrf, stokesi_ncmrf, stokesi_matern, stokesi_markovrf
-export poincare_gmrf, poincare_matern
-export polexp_gmrf, polexp_ncmrf, polexp_matern, polexp_markovrf
+export stokesi_gmrf, stokesi_ncmrf, stokesi_srf
+export poincare_gmrf, poincare_srf
+export polexp_gmrf, polexp_ncmrf, polexp_srf
 export sky_constructor, genmeanprior, gengaussprior, apply_sky_overrides
 export Poincare, PolExp, TotalIntensity, Matern, MarkovRF, NonCenteredMRF
-export UniformRhoPrior, LogNormalRhoPrior, markov_rho_prior
+export UniformRhoPrior, LogNormalRhoPrior, markov_rho_prior, spectrum_prior, MaternSlopePS
 export GaussMean, DblRingMean, DblRingWBkgd, TBlobMean, JetGauss, GaussBkgdMean, MimgPlusBkg
 # data layer
 export read_flagtable, parse_flagtable, apply_flagtable, corr_polbasis
@@ -96,8 +96,8 @@ export assemble_instrument, parse_dist, parse_process, parse_init
 # config layer
 export build_sky_config, build_instrument_config, build_data_config, build_fitting_config
 export FittingStrategy
-export SymmetryMoves, FluxGainMove, FieldScaleMove, RhoFieldMove, MeanFieldMove, PhaseOffsetMove, move_summary
+export MoveSpec, build_moves
 # pipeline
-export comrade_imager, best_image, reactant_opt, rescale_fields, held_scale_values, load_chain_and_post, load_posterior, saveimgs, image_from_toml, unwrap_phase_chains, PhaseSheetMoves
+export comrade_imager, best_image, reactant_opt, rescale_fields, held_scale_values, load_chain_and_post, load_posterior, saveimgs, image_from_toml, unwrap_phase_chains
 
 end

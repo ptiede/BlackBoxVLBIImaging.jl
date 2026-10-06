@@ -1,6 +1,24 @@
 # The fitting-strategy config. Replaces the ad-hoc CLI flags that controlled optimization,
 # the noise-tempering schedule, and the MCMC sampler (AdvancedHMC vs Reactant NUTS).
 
+const MOVE_KINDS = ("flux_gain", "field_scale", "rho_field", "mean_field", "phase_sheet", "chain_hyper")
+
+"""
+    MoveSpec
+
+One `[[sampler.moves]]` table of the fitting config: the move `kind` (one of
+`$(MOVE_KINDS)`), the parameters it acts on (`params`, `nothing` for all that apply), the
+proposals per call (`rounds`), the warmup acceptance target, and the initial step scale of a
+random-walk move (`nothing` for the kind's default). See [`build_moves`](@ref).
+"""
+Base.@kwdef struct MoveSpec
+    kind::String
+    params::Union{Nothing, Vector{String}} = nothing
+    rounds::Int = 1
+    target_accept::Float64 = 0.45
+    initial_scale::Union{Nothing, Float64} = nothing
+end
+
 """
     FittingStrategy
 
@@ -38,10 +56,8 @@ Base.@kwdef struct FittingStrategy
     # balance); with it off, the fitted preconditioner IS the metric and only the step
     # size adapts. Keep ON for pilot rounds with no preconditioner.
     adapt_mass_matrix::Bool = true
-    # Metropolis–Hastings moves run between the Reactant NUTS chunks (see
-    # `SymmetryMoves`), `moves_per_chunk` rounds of every move each time. Empty = none.
-    moves::Vector{String} = String[]
-    moves_per_chunk::Int = 1
+    # Metropolis–Hastings moves run between the Reactant NUTS chunks (see `build_moves`).
+    moves::Vector{MoveSpec} = MoveSpec[]
     # preconditioning: before sampling, fit a low-rank affine reparameterization of the
     # flat latent space from a pilot run's posterior draws (see `fit_preconditioner`),
     # and sample in the preconditioned coordinates. `precond_pilot` is the pilot's MCMC
@@ -75,11 +91,14 @@ Base.@kwdef struct FittingStrategy
     # Gauss–Newton curvature at the warmup draws; "stdnormal" space, Reactant only). For
     # "gauss_newton", `precond_rank` is the most directions a fit keeps, `precond_threshold`
     # the smallest curvature eigenvalue kept, `precond_oversample` the extra probe columns,
-    # and `precond_probes_per_draw` the probe columns applied per warmup draw (0 = all).
+    # `precond_probes_per_draw` the probe columns applied per warmup draw (0 = all), and
+    # `precond_band_limit` the highest wavenumber of a stationary random sky field's white
+    # coefficients the directions may use, in multiples of the longest baseline (Inf = all).
     precond_refit_kind::String = "fisher"
     precond_threshold::Float64 = 100.0
     precond_oversample::Int = 10
     precond_probes_per_draw::Int = 0
+    precond_band_limit::Float64 = 3.0
     # Start in the latent space stored in a transport.jls (a low-rank preconditioner of the
     # run's latent space). With in-run refits they refine it instead of the score-init
     # diagonal; without, it is the fixed transform. Exclusive with `precond_pilot`.
@@ -116,37 +135,49 @@ Parse a fitting-strategy TOML into a [`FittingStrategy`](@ref). Sections: `[opti
 `[optimizer] fix_scales` lists scalar sky parameters (e.g. `["σb", "σc", "σd"]`) that every
 optimization stage holds at the median of their prior; the other parameters are optimized
 as usual. After the last stage, every non-centered sky field `X` with scale `σX` (in
-`polexp_markovrf`: `a`, `b`, `c`, `d`) is rescaled to `σX * rms(X)` and `X / rms(X)`, which
+`polexp_srf`: `a`, `b`, `c`, `d`) is rescaled to `σX * rms(X)` and `X / rms(X)`, which
 leaves the image unchanged and puts the white coefficients at the radius the prior's typical
 set has (`rms(X) = 1`); see [`rescale_fields`](@ref). The sampler starts from that point
 with every parameter free. Empty (the default) changes nothing. A name that is not a scalar
 sky parameter of the model is an error when optimization starts.
 
-`[sampler] moves` lists Metropolis–Hastings moves run between the Reactant NUTS chunks (see
-[`SymmetryMoves`](@ref)):
+`[[sampler.moves]]` tables list Metropolis–Hastings moves run between the Reactant NUTS
+chunks (see [`build_moves`](@ref)), each table one move kind:
 
-  - `"flux_gain"`: total flux against a common gain log-amplitude `lg1`;
-  - `"field_scale"`: each non-centered sky field against its scale `σX`;
-  - `"rho_field"`: each correlation length of each Markov RF field against the field's
-    white coefficients;
+```toml
+[[sampler.moves]]
+kind = "mean_field"
+params = ["fwhm"]     # optional: a subset of the parameters the kind acts on
+rounds = 10           # optional: proposals of each move per call (default 1)
+target_accept = 0.45  # optional: warmup acceptance target (default 0.45)
+initial_scale = 0.01  # optional: initial random-walk step scale (default per kind)
+```
+
+The kinds, all of which leave the likelihood unchanged:
+
+  - `"flux_gain"`: total flux against a common gain log-amplitude `lg1` (no `params`);
+  - `"field_scale"`: each non-centered sky field against its scale `σX` (`params`: fields);
+  - `"rho_field"`: each spectral parameter of each stationary random field (Markov RF
+    correlation lengths, Matérn outer scale and slope) against the field's white
+    coefficients (`params`: fields);
   - `"mean_field"`: each mean-model parameter against the log-intensity field `a` (PolExp
-    Markov RF models);
-  - `"phase_offset"`: a random-walk step of each free site's gain phase offset `gp1μ`;
+    stationary random-field models; `params`: mean-model parameters);
   - `"phase_sheet"`: a `±2π` shift of a real-line Gauss–Markov phase chain from a point on
-    (see [`PhaseSheetMoves`](@ref)); `"stdnormal"` space only.
+    (`params`: chain terms; no `initial_scale`); `"stdnormal"` space only;
+  - `"chain_hyper"`: each fitted hyperparameter field (`σ`, `τ`, `D`) of a Gauss–Markov
+    instrument chain against the chain's whitened innovations, with the chain values fixed;
+    one move per term and field, which steps every site's hyperparameter and accepts each
+    site on its own, so a round is one sweep over the sites (`params`: chain terms);
+    `"stdnormal"` space only.
 
-In the `"stdnormal"` space only `"phase_sheet"` and `"mean_field"` run, alone or together.
-
-The first four and `"phase_sheet"` leave the likelihood unchanged. `[sampler] moves_per_chunk` (an integer ≥ 1,
-default 1) is the number of rounds of every move made between two chunks. Absent or empty
-`moves` runs no moves. Unknown names, repeated names, moves on the AdvancedHMC path
-(`use_reactant = false`), and `moves_per_chunk` without `moves` are errors.
+A kind may appear more than once only with disjoint `params`. Moves need the Reactant sampler
+(`use_reactant = true`). Unknown kinds and keys are errors, as are the list form
+`moves = [...]` and `moves_per_chunk`.
 
 `[run] latent_space` picks the space the optimizer and sampler work in: `"flat"` (default,
 `asflat`) or `"stdnormal"` (the `StdNormal` transport, where the prior is exactly N(0, I);
-required by priors without a flat transform such as `AngularProjectedNormal`). Moves other
-than `"phase_sheet"` need the flat space; the low-rank preconditioner acts in front of
-either. In the `"stdnormal"` space the start point's real-line phase chains are re-wrapped
+required by priors without a flat transform such as `AngularProjectedNormal`). The
+low-rank preconditioner acts in front of either. In the `"stdnormal"` space the start point's real-line phase chains are re-wrapped
 to their shortest steps (see [`unwrap_phase_chains`](@ref)) before sampling.
 """
 function build_fitting_config(cfg::AbstractDict)
@@ -178,7 +209,7 @@ function build_fitting_config(cfg::AbstractDict)
         (
             "pilot", "rank", "nsamples", "discard", "augment",
             "refit_at", "refit_schedule", "refit_carry", "seed_transport",
-            "refit_kind", "threshold", "oversample", "probes_per_draw",
+            "refit_kind", "threshold", "oversample", "probes_per_draw", "band_limit",
         ),
         "[precondition]"
     )
@@ -208,26 +239,12 @@ function build_fitting_config(cfg::AbstractDict)
         error("optimizer.fix_scales must be a list of sky parameter names, got $(repr(fix_scales))")
     allunique(fix_scales) || error("optimizer.fix_scales lists a name twice: $fix_scales")
 
-    moves = get(samp, "moves", String[])
-    (moves isa AbstractVector && all(v -> v isa AbstractString, moves)) ||
-        error("sampler.moves must be a list of move names, got $(repr(moves))")
-    unknown_moves = setdiff(moves, (SYMMETRY_MOVES..., "phase_sheet"))
-    isempty(unknown_moves) ||
-        error("unknown sampler.moves $(unknown_moves). Allowed: $(collect(SYMMETRY_MOVES)), phase_sheet")
-    allunique(moves) || error("sampler.moves lists a move twice: $moves")
-    isempty(moves) || use_reactant ||
-        error("sampler.moves needs the Reactant sampler (run.use_reactant = true); got $moves")
-    moves_per_chunk = get(samp, "moves_per_chunk", 1)
-    (moves_per_chunk isa Integer && moves_per_chunk >= 1) || error(
-        "sampler.moves_per_chunk must be an integer ≥ 1, got $(repr(moves_per_chunk))"
+    haskey(samp, "moves_per_chunk") && error(
+        "sampler.moves_per_chunk is not a fitting-config key; set `rounds` in each [[sampler.moves]] table"
     )
-    (haskey(samp, "moves_per_chunk") && isempty(moves)) &&
-        error("sampler.moves_per_chunk is set but sampler.moves lists no moves")
-    flat_moves = filter(m -> !(m in ("phase_sheet", "mean_field")), moves)
-    (latent_space == "stdnormal" && !isempty(flat_moves)) &&
-        error("sampler.moves $(flat_moves) act on the flat latent space; they cannot run with run.latent_space = \"stdnormal\"")
-    ("phase_sheet" in moves && latent_space != "stdnormal") &&
-        error("sampler.moves \"phase_sheet\" needs run.latent_space = \"stdnormal\" (the flat space's wrapped chains have no sheets)")
+    moves = _parse_move_specs(get(samp, "moves", Any[]), latent_space)
+    isempty(moves) || use_reactant ||
+        error("sampler.moves needs the Reactant sampler (run.use_reactant = true)")
 
     pilotval = get(prec, "pilot", "")
     precond_pilot = (pilotval == "") ? nothing : String(pilotval)
@@ -239,7 +256,10 @@ function build_fitting_config(cfg::AbstractDict)
     refit_kind = get(prec, "refit_kind", "fisher")
     refit_kind in ("fisher", "gauss_newton") ||
         error("precondition.refit_kind must be \"fisher\" or \"gauss_newton\", got $(repr(refit_kind))")
-    gn_keys = filter(k -> haskey(prec, k), ["threshold", "oversample", "probes_per_draw"])
+    gn_keys = filter(k -> haskey(prec, k), ["threshold", "oversample", "probes_per_draw", "band_limit"])
+    band_limit = get(prec, "band_limit", 3.0)
+    (band_limit isa Real && band_limit > 0) ||
+        error("precondition.band_limit must be a positive multiple of the longest baseline (inf for no limit), got $(repr(band_limit))")
     if refit_kind == "gauss_newton"
         use_reactant || error("precondition.refit_kind = \"gauss_newton\" needs run.use_reactant = true")
         latent_space == "stdnormal" ||
@@ -256,7 +276,7 @@ function build_fitting_config(cfg::AbstractDict)
         isempty(gn_keys) ||
             error("precondition.$(join(gn_keys, ", ")) apply to refit_kind = \"gauss_newton\" only")
     end
-    return FittingStrategy(
+    return FittingStrategy(;
         opt_method = opt_method,
         maxiters = Int(get(opt, "maxiters", 10_000)),
         ntrials = Int(get(opt, "ntrials", 5)),
@@ -274,8 +294,7 @@ function build_fitting_config(cfg::AbstractDict)
         chunk_size = Int(get(samp, "chunk_size", 100)),
         base_window = Int(get(samp, "base_window", 25)),
         adapt_mass_matrix = Bool(get(samp, "adapt_mass_matrix", true)),
-        moves = String.(moves),
-        moves_per_chunk = Int(moves_per_chunk),
+        moves,
         precond_pilot = precond_pilot,
         precond_rank = Int(get(prec, "rank", 16)),
         precond_nsamples = Int(get(prec, "nsamples", 2000)),
@@ -288,6 +307,7 @@ function build_fitting_config(cfg::AbstractDict)
         precond_threshold = Float64(get(prec, "threshold", 100.0)),
         precond_oversample = Int(get(prec, "oversample", 10)),
         precond_probes_per_draw = Int(get(prec, "probes_per_draw", 0)),
+        precond_band_limit = Float64(band_limit),
         precond_seed_transport = String(get(prec, "seed_transport", "")),
         latent_space = latent_space,
         use_reactant = use_reactant,
@@ -301,3 +321,52 @@ end
 
 # The `space` argument of `Comrade.maybe_transport` for a strategy: `nothing` is the flat space.
 latent_space(strategy::FittingStrategy) = strategy.latent_space == "stdnormal" ? PT.StdNormal() : nothing
+
+const _MOVE_KEYS = ("kind", "params", "rounds", "target_accept", "initial_scale")
+
+function _parse_move_specs(tables, latent_space)
+    (tables isa AbstractVector && all(t -> t isa AbstractDict, tables)) || error(
+        "sampler.moves must be [[sampler.moves]] tables, each naming a move kind, e.g.\n" *
+            "[[sampler.moves]]\nkind = \"mean_field\"\nrounds = 10\ngot $(repr(tables))"
+    )
+    specs = map(enumerate(tables)) do (i, t)
+        where_ = "[[sampler.moves]] table $i"
+        check_config_keys(t, _MOVE_KEYS, where_)
+        kind = get(t, "kind", nothing)
+        kind isa AbstractString || error("$where_ needs a kind (one of $(collect(MOVE_KINDS)))")
+        kind in MOVE_KINDS || error("unknown move kind \"$kind\" in $where_. Allowed: $(collect(MOVE_KINDS))")
+        params = get(t, "params", nothing)
+        isnothing(params) || (params isa AbstractVector && !isempty(params) && all(p -> p isa AbstractString, params)) ||
+            error("$where_: params must be a non-empty list of names, got $(repr(params))")
+        rounds = get(t, "rounds", 1)
+        (rounds isa Integer && rounds >= 1) || error("$where_: rounds must be an integer ≥ 1, got $(repr(rounds))")
+        target_accept = get(t, "target_accept", 0.45)
+        (target_accept isa Real && 0 < target_accept < 1) ||
+            error("$where_: target_accept must lie in (0, 1), got $(repr(target_accept))")
+        initial_scale = get(t, "initial_scale", nothing)
+        isnothing(initial_scale) || (initial_scale isa Real && initial_scale > 0) ||
+            error("$where_: initial_scale must be positive, got $(repr(initial_scale))")
+        (kind == "phase_sheet" && !isnothing(initial_scale)) &&
+            error("$where_: phase_sheet takes discrete ±2π steps and has no initial_scale")
+        (kind == "flux_gain" && !isnothing(params)) && error("$where_: flux_gain takes no params")
+        (kind == "phase_sheet" && latent_space != "stdnormal") && error(
+            "$where_: phase_sheet needs run.latent_space = \"stdnormal\" (the flat space's wrapped chains have no sheets)"
+        )
+        (kind == "chain_hyper" && latent_space != "stdnormal") && error(
+            "$where_: chain_hyper needs run.latent_space = \"stdnormal\" (its sites are accepted without the likelihood)"
+        )
+        MoveSpec(;
+            kind = String(kind), params = isnothing(params) ? nothing : String.(params),
+            rounds = Int(rounds), target_accept = Float64(target_accept),
+            initial_scale = isnothing(initial_scale) ? nothing : Float64(initial_scale),
+        )
+    end
+    for kind in unique(s.kind for s in specs)
+        same = [s.params for s in specs if s.kind == kind]
+        length(same) == 1 && continue
+        (any(isnothing, same) || !allunique(reduce(vcat, same))) && error(
+            "sampler.moves lists kind \"$kind\" more than once with overlapping params; give each table disjoint params"
+        )
+    end
+    return MoveSpec[specs...]
+end

@@ -12,6 +12,25 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
 
 @testset "BlackBoxVLBIImaging.jl" begin
 
+    @testset "a draw with non-finite parameters is an error" begin
+        good = (sky = (σa = 1.0, ρa = (2.0, 3.0), a = ones(2, 2)), instrument = (lg = [0.1, 0.2],))
+        @test BlackBoxVLBIImaging._check_finite_draw(good, "warmup step 10") === good
+        bad = (sky = (σa = 1.0, σd = Inf, ρa = (2.0, NaN), a = [1.0 -Inf; 0.0 1.0]), instrument = (lg = [0.1, 0.2],))
+        @test BlackBoxVLBIImaging._nonfinite_paths(bad) == [".sky.σd = Inf", ".sky.ρa[2] = NaN", ".sky.a (1 of 4 entries, e.g. -Inf)"]
+        @test_throws "the warmup step 140 draw has non-finite parameters: .sky.σd = Inf" BlackBoxVLBIImaging._check_finite_draw(bad, "warmup step 140")
+    end
+
+    @testset "NUTS depth estimate from wall time" begin
+        c = BlackBoxVLBIImaging._NUTSClock()
+        @test BlackBoxVLBIImaging._depth_note(c, 10.0, 0.0, 10, 1.0e-3) == ""
+        BlackBoxVLBIImaging._restart!(c, 10.0, 1.0)
+        # 10 s of wall time, 2 s of it in moves: 8 s over 10 draws of 1 ms gradients
+        @test BlackBoxVLBIImaging._depth_note(c, 20.0, 3.0, 10, 1.0e-3) == " ~lf/step=800 (depth≈9.6)"
+        @test BlackBoxVLBIImaging._depth_note(c, 20.0, 3.0, 10, nothing) == ""
+        @test BlackBoxVLBIImaging._depth_note(c, 20.0, 3.0, 10, 1.0e-3; maxdepth = 10) == " ~lf/step=800 (depth≈9.6)"
+        @test BlackBoxVLBIImaging._depth_note(c, 20.0, 3.0, 10, 0.78e-3; maxdepth = 10) == " ~lf/step=1026 (depth≈10.0), at the depth cap 10"
+    end
+
     @testset "distribution spec parser" begin
         # parse_dist emits the Reactant-friendly VLBI* variants (also CPU-compatible); the
         # VLBI* constructors return AffineDistribution-wrapped Std* distributions.
@@ -394,27 +413,51 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test isempty(s.moves)
         cfg4 = exconfig("fitting.toml")
         cfg4["run"]["use_reactant"] = true
-        cfg4["sampler"]["moves"] = ["flux_gain", "field_scale"]
-        @test build_fitting_config(cfg4).moves == ["flux_gain", "field_scale"]
-        cfg4["sampler"]["moves"] = ["flux_gain", "gain_phase"]
-        @test_throws "unknown sampler.moves [\"gain_phase\"]" build_fitting_config(cfg4)
-        cfg4["sampler"]["moves"] = ["flux_gain", "flux_gain"]
-        @test_throws "lists a move twice" build_fitting_config(cfg4)
-        cfg4["sampler"]["moves"] = "flux_gain"
-        @test_throws "must be a list of move names" build_fitting_config(cfg4)
-        cfg4["sampler"]["moves"] = ["rho_field", "mean_field", "phase_offset"]
-        @test build_fitting_config(cfg4).moves_per_chunk == 1
-        cfg4["sampler"]["moves_per_chunk"] = 10
-        @test build_fitting_config(cfg4).moves_per_chunk == 10
-        for bad in (0, -1, 1.5, "3")
-            cfg4["sampler"]["moves_per_chunk"] = bad
-            @test_throws "sampler.moves_per_chunk must be an integer ≥ 1" build_fitting_config(cfg4)
+        cfg4["sampler"]["moves"] = [
+            Dict{String, Any}("kind" => "flux_gain"),
+            Dict{String, Any}("kind" => "mean_field", "params" => ["fwhm"], "rounds" => 10, "target_accept" => 0.3, "initial_scale" => 0.02),
+            Dict{String, Any}("kind" => "mean_field", "params" => ["fb"]),
+        ]
+        ms4 = build_fitting_config(cfg4).moves
+        @test ms4[1] == MoveSpec(; kind = "flux_gain")
+        @test (ms4[2].params, ms4[2].rounds, ms4[2].target_accept, ms4[2].initial_scale) == (["fwhm"], 10, 0.3, 0.02)
+        @test (ms4[3].rounds, ms4[3].target_accept, ms4[3].initial_scale) == (1, 0.45, nothing)
+        # the tables parse from TOML as written in the docs
+        toml = TOML.parse("""
+            [sampler]
+            [[sampler.moves]]
+            kind = "field_scale"
+            params = ["a"]
+            [[sampler.moves]]
+            kind = "rho_field"
+            [run]
+            use_reactant = true
+            """)
+        @test [m.kind for m in build_fitting_config(toml).moves] == ["field_scale", "rho_field"]
+        for (moves, msg) in (
+                (["flux_gain", "field_scale"], "sampler.moves must be [[sampler.moves]] tables"),
+                ("flux_gain", "sampler.moves must be [[sampler.moves]] tables"),
+                ([Dict{String, Any}("kind" => "phase_offset")], "unknown move kind \"phase_offset\""),
+                ([Dict{String, Any}("rounds" => 2)], "table 1 needs a kind"),
+                ([Dict{String, Any}("kind" => "flux_gain", "every" => 2)], "unknown key(s) [\"every\"] in [[sampler.moves]] table 1"),
+                ([Dict{String, Any}("kind" => "flux_gain", "params" => ["ftot"])], "flux_gain takes no params"),
+                ([Dict{String, Any}("kind" => "rho_field", "params" => "a")], "params must be a non-empty list"),
+                ([Dict{String, Any}("kind" => "rho_field", "rounds" => 0)], "rounds must be an integer ≥ 1"),
+                ([Dict{String, Any}("kind" => "rho_field", "rounds" => 1.5)], "rounds must be an integer ≥ 1"),
+                ([Dict{String, Any}("kind" => "rho_field", "target_accept" => 1.0)], "target_accept must lie in (0, 1)"),
+                ([Dict{String, Any}("kind" => "rho_field", "initial_scale" => -1)], "initial_scale must be positive"),
+                ([Dict{String, Any}("kind" => "mean_field"), Dict{String, Any}("kind" => "mean_field", "params" => ["fb"])], "kind \"mean_field\" more than once"),
+                ([Dict{String, Any}("kind" => "mean_field", "params" => ["fb"]), Dict{String, Any}("kind" => "mean_field", "params" => ["fb"])], "kind \"mean_field\" more than once"),
+                ([Dict{String, Any}("kind" => "phase_sheet")], "phase_sheet needs run.latent_space = \"stdnormal\""),
+                ([Dict{String, Any}("kind" => "chain_hyper")], "chain_hyper needs run.latent_space = \"stdnormal\""),
+            )
+            c = deepcopy(cfg4)
+            c["sampler"]["moves"] = moves
+            @test_throws msg build_fitting_config(c)
         end
-        cfg4["sampler"]["moves_per_chunk"] = 2
-        cfg4["sampler"]["moves"] = String[]
-        @test_throws "moves_per_chunk is set but sampler.moves lists no moves" build_fitting_config(cfg4)
+        cfg4["sampler"]["moves_per_chunk"] = 10
+        @test_throws "set `rounds` in each [[sampler.moves]] table" build_fitting_config(cfg4)
         delete!(cfg4["sampler"], "moves_per_chunk")
-        cfg4["sampler"]["moves"] = ["field_scale"]
         cfg4["run"]["use_reactant"] = false
         @test_throws "needs the Reactant sampler" build_fitting_config(cfg4)
 
@@ -428,9 +471,6 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         cfg5["run"]["latent_space"] = "cube"
         @test_throws "unknown run.latent_space 'cube'" build_fitting_config(cfg5)
         cfg5["run"]["latent_space"] = "stdnormal"
-        cfg5["sampler"]["moves"] = ["flux_gain"]
-        @test_throws "cannot run with run.latent_space" build_fitting_config(cfg5)
-        delete!(cfg5["sampler"], "moves")
         cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan")
         @test build_fitting_config(cfg5).precond_refit_schedule == "stan"
         @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).carry === :none
@@ -454,6 +494,13 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test ga isa Comrade.GaussNewtonLowRank && ga.curvature === H && ga.probes_per_draw == 610 && ga.schedule === :stan
         cfg5["precondition"]["probes_per_draw"] = 70
         @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5), H).probes_per_draw == 70
+        @test build_fitting_config(cfg5).precond_band_limit == 3.0
+        @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5), H; rows = [1, 4, 9]).rows == [1, 4, 9]
+        cfg5["precondition"]["band_limit"] = Inf
+        @test build_fitting_config(cfg5).precond_band_limit == Inf
+        cfg5["precondition"]["band_limit"] = 0.0
+        @test_throws "band_limit must be a positive multiple" build_fitting_config(cfg5)
+        delete!(cfg5["precondition"], "band_limit")
         @test_throws "need a curvature function" BlackBoxVLBIImaging._metric_adaptor(sg)
         for (edit, msg) in (
                 (c -> c["precondition"]["refit_kind"] = "hessian", "precondition.refit_kind must be"),
@@ -470,17 +517,10 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
             @test_throws msg build_fitting_config(c)
         end
         delete!(cfg5, "precondition")
-        cfg5["sampler"]["moves"] = ["phase_sheet"]
-        @test build_fitting_config(cfg5).moves == ["phase_sheet"]
-        cfg5["sampler"]["moves"] = ["phase_sheet", "flux_gain"]
-        @test_throws "act on the flat latent space" build_fitting_config(cfg5)
-        cfg5["sampler"]["moves"] = ["phase_sheet", "mean_field"]
-        @test build_fitting_config(cfg5).moves == ["phase_sheet", "mean_field"]
-        cm = BlackBoxVLBIImaging.ChainedMoves(((s, _...) -> s + 1, (s, _...) -> 2s))
-        @test cm(3, nothing, nothing, nothing) == 8
-        cfg5["sampler"]["moves"] = ["phase_sheet"]
-        cfg5["run"]["latent_space"] = "flat"
-        @test_throws "\"phase_sheet\" needs run.latent_space = \"stdnormal\"" build_fitting_config(cfg5)
+        cfg5["sampler"]["moves"] = [Dict{String, Any}("kind" => k) for k in ("phase_sheet", "flux_gain", "mean_field")]
+        @test [m.kind for m in build_fitting_config(cfg5).moves] == ["phase_sheet", "flux_gain", "mean_field"]
+        cfg5["sampler"]["moves"] = [Dict{String, Any}("kind" => "phase_sheet", "initial_scale" => 0.1)]
+        @test_throws "phase_sheet takes discrete ±2π steps" build_fitting_config(cfg5)
 
         cfg6 = exconfig("fitting.toml")
         cfg6["dili"] = Dict{String, Any}()
@@ -666,23 +706,28 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         end
 
         # lognormal: term 1 about half the larger grid dimension with log-sd 1.0, terms
-        # n ≥ 2 about the data beam in pixels with log-sd 0.7
+        # n ≥ 2 about the data beam in pixels with log-sd 0.7, each truncated to [1, 32] pixels
         skyl, _ = build_sky_config(markovcfg(rho_prior = "lognormal"))
         beam_px = μas2rad(20.0) / step(skyl.grid.X)
-        @test logpdf(skyl.prior.ρa[1], 7.0) ≈ logpdf(LogNormal(log(16.0), 1.0), 7.0)
+        @test logpdf(skyl.prior.ρa[1], 7.0) ≈ logpdf(BlackBoxVLBIImaging.Distributions.truncated(LogNormal(log(16.0), 1.0); lower = 1.0, upper = 32.0), 7.0)
         for n in 2:3
-            @test logpdf(skyl.prior.ρa[n], 7.0) ≈ logpdf(LogNormal(log(beam_px), 0.7), 7.0)
+            @test logpdf(skyl.prior.ρa[n], 7.0) ≈ logpdf(BlackBoxVLBIImaging.Distributions.truncated(LogNormal(log(beam_px), 0.7); lower = 1.0, upper = 32.0), 7.0)
+            @test logpdf(skyl.prior.ρa[n], 0.9) == -Inf
+            @test logpdf(skyl.prior.ρa[n], 33.0) == -Inf
         end
         @test skyl.prior.ρb == skyl.prior.ρc == skyl.prior.ρd == skyl.prior.ρa
 
         # the Stokes-I Markov constructor takes the same option (its field is `ρs`)
         skyi, _ = build_sky_config(markovcfg(polrep = "TotalIntensity", rho_prior = "lognormal"))
-        @test logpdf(skyi.prior.ρs[1], 7.0) ≈ logpdf(LogNormal(log(16.0), 1.0), 7.0)
+        @test logpdf(skyi.prior.ρs[1], 7.0) ≈ logpdf(BlackBoxVLBIImaging.Distributions.truncated(LogNormal(log(16.0), 1.0); lower = 1.0, upper = 32.0), 7.0)
 
-        # the sampler's unconstrained coordinate of a log-normal ρ is log ρ
-        t = BlackBoxVLBIImaging.PT.transport_node(skyl.prior.ρa[1], BlackBoxVLBIImaging.PT.TVFlat())
-        @test BlackBoxVLBIImaging.TV.transform(t, [log(7.0)]) ≈ 7.0
-        @test only(BlackBoxVLBIImaging.TV.inverse(t, 7.0)) ≈ log(7.0)
+        # the flat and StdNormal transports map the whole real line onto [1, 32]
+        for sp in (BlackBoxVLBIImaging.PT.TVFlat(), BlackBoxVLBIImaging.PT.StdNormal())
+            t = BlackBoxVLBIImaging.PT.transport_node(skyl.prior.ρa[2], sp)
+            @test BlackBoxVLBIImaging.PT.latent_pfwd(t, [-30.0]) >= 1.0
+            @test BlackBoxVLBIImaging.PT.latent_pfwd(t, [30.0]) <= 32.0
+            @test BlackBoxVLBIImaging.PT.latent_pfwd(t, BlackBoxVLBIImaging.PT.latent_pback(t, 2.5)) ≈ 2.5
+        end
 
         # the model still evaluates at a draw from the log-normal prior
         pr = Comrade.NamedDist(skyl.prior)
@@ -694,9 +739,60 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws "unknown rho_prior 'loggaussian'" build_sky_config(
             markovcfg(rho_prior = "loggaussian")
         )
-        @test_throws "rho_prior sets the correlation-length prior" build_sky_config(
+        @test_throws "rho_prior sets the spectral-parameter prior" build_sky_config(
             markovcfg(rho_prior = "lognormal", order = 1)
         )
+
+        @test_throws "is not inside [50.0, 64.0]" markov_rho_prior(LogNormalRhoPrior(), skyl.grid, μas2rad(20.0), 3; lower = 50.0, upper = 64.0)
+    end
+
+    @testset "Matérn spectrum and prior" begin
+        BB = BlackBoxVLBIImaging
+        function materncfg(; kwargs...)
+            cfg = exconfig("image.toml")
+            cfg["grid"]["nx"] = 32
+            cfg["grid"]["ny"] = 32
+            cfg["model"]["order"] = 0
+            for (k, v) in kwargs
+                cfg["model"][String(k)] = v
+            end
+            return cfg
+        end
+
+        # (ℓ, α) is the Matérn (ρ, ν) spectrum with α = 2(ν + 1), ℓ = ρ/√(8ν); genfield
+        # normalizes the spectrum, so the two give the same field
+        plan = BB.StationaryRandomFieldPlan(imagepixels(1.0, 1.0, 32, 32))
+        z = randn(Random.Xoshiro(3), 32, 32)
+        ν = 1.5
+        ℓ = 5.0
+        fslope = BB.genfield(BB.StationaryRandomField(MaternSlopePS(ℓ, 2(ν + 1)), plan), z)
+        fmatern = BB.genfield(BB.StationaryRandomField(BB.MaternPS(ℓ * sqrt(8ν), ν), plan), z)
+        @test fslope ≈ fmatern rtol = 1.0e-10
+
+        # the moves' amplitude factor is the one genfield applies
+        k2, dk = BB._plan_wavenumbers(plan)
+        la = BB._log_amplitude(Matern(), (ℓ, 2(ν + 1)), collect(k2), dk)
+        @test fslope ≈ real.(BB._hartley(exp.(la) .* z)) ./ 32 rtol = 1.0e-10
+
+        skyl, _ = build_sky_config(materncfg(rho_prior = "lognormal"))
+        @test length(skyl.prior.ρa) == 2
+        @test logpdf(skyl.prior.ρa[1], 7.0) ≈ logpdf(BB.Distributions.truncated(LogNormal(log(16.0), 1.0); lower = 1.0, upper = 32.0), 7.0)
+        @test logpdf(skyl.prior.ρa[2], 3.0) ≈ logpdf(BB.Distributions.truncated(LogNormal(log(2.5), 0.4); lower = 1.0, upper = 8.0), 3.0)
+        @test logpdf(skyl.prior.ρa[2], 0.9) == -Inf
+        @test logpdf(skyl.prior.ρa[2], 8.1) == -Inf
+
+        skyu, _ = build_sky_config(materncfg())
+        @test minimum(skyu.prior.ρa[2]) == 1.0
+        @test maximum(skyu.prior.ρa[2]) == 8.0
+
+        @testset "polrep $polrep evaluates at a prior draw" for polrep in ("PolExp", "TotalIntensity", "Poincare")
+            sky, _ = build_sky_config(materncfg(polrep = polrep, rho_prior = "lognormal"))
+            pr = Comrade.NamedDist(sky.prior)
+            x = rand(Random.Xoshiro(4), pr)
+            @test isfinite(logpdf(pr, x))
+            img = intensitymap(sky.f(x, sky.metadata), sky.grid)
+            @test all(isfinite, polrep == "TotalIntensity" ? baseimage(img) : stokes(img, :I))
+        end
     end
 
     @testset "sky prior overrides" begin
@@ -1008,133 +1104,54 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                 tpm = asflat(postm)
                 grid = postm.skymodel.grid
                 θs = [prior_sample(Random.Xoshiro(k), postm) for k in 1:2]
-                allnames = ["flux_gain", "field_scale", "rho_field", "mean_field", "phase_offset"]
-                sm = SymmetryMoves(postm, allnames, θs[1]; rounds = 2)
-                names = BB.move_name.(sm.moves)
-                gpμ = θs[1].instrument[Symbol("gp1μ")]
-                freesites = [s for (s, v) in zip(gpμ.sites, gpμ) if v != 0]
-                @test collect(names) == [
+                kinds = ("flux_gain", "field_scale", "rho_field", "mean_field")
+                ms = build_moves(postm, [MoveSpec(; kind) for kind in kinds], θs[1])
+                @test collect(Comrade.move_name.(ms.moves)) == [
                     "flux_gain",
                     "field_scale[a]", "field_scale[b]", "field_scale[c]", "field_scale[d]",
                     "rho_field[a,1]", "rho_field[a,2]", "rho_field[b,1]", "rho_field[b,2]",
                     "rho_field[c,1]", "rho_field[c,2]", "rho_field[d,1]", "rho_field[d,2]",
                     "mean_field[fwhm]", "mean_field[fb]",
-                    ["phase_offset[$s]" for s in freesites]...,
                 ]
-                J = length(sm.moves)
-                ustep(::BB.PhaseOffsetMove) = 0.7
-                ustep(::BB.FieldScaleMove) = 0.2
-                ustep(::BB.SymmetryMove) = 0.1
+                tpm = ms.ctx.view.tbase
                 stokesmap(θ) = baseimage(intensitymap(skymodel(postm, θ), grid))
                 rel(a, b) = maximum(abs, a .- b) / maximum(abs, b)
 
-                @testset "invariance, reversibility: $(BB.move_name(m)), draw $i" for (i, θ) in enumerate(θs), m in sm.moves
-                    x = Comrade.inverse(tpm, θ)
-                    u = ustep(m)
-                    x′, ld = BB.propose(m, x, u, tpm, sm.ctx)
-                    xb, ldb = BB.propose(m, x′, -u, tpm, sm.ctx)
-                    @test xb ≈ x rtol = 1.0e-10
-                    @test ldb ≈ -ld atol = 1.0e-9
-                    θ′ = Comrade.transform(tpm, x′)
-                    l0 = Comrade.loglikelihood(postm, θ)
-                    l1 = Comrade.loglikelihood(postm, θ′)
-                    if m isa BB.PhaseOffsetMove
-                        a0 = atan(x[m.i], x[m.i + 1])
-                        a1 = atan(x′[m.i], x′[m.i + 1])
-                        @test rem2pi(a1 - a0 - u, RoundNearest) ≈ 0 atol = 1.0e-12
-                        @test hypot(x′[m.i], x′[m.i + 1]) ≈ hypot(x[m.i], x[m.i + 1]) rtol = 1.0e-14
-                        @test l1 != l0
-                    else
-                        @test l1 ≈ l0 rtol = 1.0e-10
-                    end
-                    if !(m isa BB.FluxGainMove || m isa BB.PhaseOffsetMove)
-                        # the polarized image itself is unchanged, pixel by pixel
-                        s0, s1 = stokesmap(θ), stokesmap(θ′)
-                        for p in (:I, :Q, :U, :V)
-                            @test rel(stokes(s1, p), stokes(s0, p)) < 1.0e-10
-                        end
-                    end
+                # reversal, log-determinant against finite differences and likelihood
+                # invariance at every move; prior stationarity of one move per kind
+                ksmoves = ("flux_gain", "field_scale[a]", "rho_field[a,1]", "mean_field[fwhm]")
+                @testset "check_move: $(Comrade.move_name(m))" for m in ms.moves
+                    nprior = Comrade.move_name(m) in ksmoves ? 300 : 0
+                    r = check_move(m, postm, θs; nprior, rng = Random.Xoshiro(21))
+                    @test r.loglikelihood < 1.0e-8 * abs(Comrade.loglikelihood(postm, θs[1]))
                 end
 
-                # The move is x ↦ M_u(x) and changes only the coordinates `S`, so
-                # log|det ∂M/∂x| = log|det ∂M_S/∂x_S|; compare with central differences.
-                @testset "log-determinant: $(BB.move_name(m))" for m in sm.moves[[1, 2, 6, 9, 14, 15, 16]]
+                @testset "the polarized image is unchanged pixel by pixel: $(Comrade.move_name(m))" for m in ms.moves[2:end]
                     x = Comrade.inverse(tpm, θs[2])
-                    u = ustep(m)
-                    M(y) = first(BB.propose(m, y, u, tpm, sm.ctx))
-                    S = findall(M(x) .!= x)
-                    @test !isempty(S)
-                    Jac = zeros(length(S), length(S))
-                    for (k, j) in pairs(S)
-                        h = 1.0e-6 * max(1.0, abs(x[j]))
-                        xp = copy(x)
-                        xp[j] += h
-                        xm = copy(x)
-                        xm[j] -= h
-                        Jac[:, k] = (M(xp)[S] .- M(xm)[S]) ./ (2h)
+                    x′, _ = Comrade.propose(m, x, 0.1, ms.ctx)
+                    s0, s1 = stokesmap(θs[2]), stokesmap(Comrade.transform(tpm, x′))
+                    for p in (:I, :Q, :U, :V)
+                        @test rel(stokes(s1, p), stokes(s0, p)) < 1.0e-10
                     end
-                    @test first(logabsdet(Jac)) ≈ last(BB.propose(m, x, u, tpm, sm.ctx)) atol = 1.0e-5
                 end
 
-                # Under a prior-only target the move kernel alone must leave the prior
-                # invariant: start from exact prior draws, apply the kernel, and compare the
-                # moved coordinates with fresh prior draws (two-sample Kolmogorov–Smirnov).
-                # The same run with one move's Jacobian dropped must fail the comparison.
-                @testset "prior stationarity of the move kernel" begin
-                    ldprior(tp, z) = last(BB.PT.latent_pfwd_and_logdensity(tp.transform, vec(z)))
-                    function ks(a, b)
-                        grid_ = sort(vcat(a, b))
-                        Fa = [count(<=(g), a) / length(a) for g in grid_]
-                        Fb = [count(<=(g), b) / length(b) for g in grid_]
-                        return maximum(abs, Fa .- Fb)
-                    end
-                    scale(::BB.FluxGainMove) = 0.5
-                    scale(::BB.FieldScaleMove) = 0.1
-                    scale(::BB.RhoFieldMove) = 0.5
-                    scale(::BB.MeanFieldMove) = 0.05
-                    scale(::BB.PhaseOffsetMove) = 1.5
-                    stats(θ) = (
-                        ftot = θ.sky.flux.ftot, σa = θ.sky.σa, σd = θ.sky.σd,
-                        ρa1 = θ.sky.ρa[1], ρb2 = θ.sky.ρb[2],
-                        fwhm = θ.sky.mean.fwhm, fb = θ.sky.mean.fb,
-                        cosφ = cos(θ.instrument[Symbol("gp1μ")][findfirst(==(freesites[1]), gpμ.sites)]),
-                    )
-                    ndraw, R = 400, 3
-                    rng = Random.Xoshiro(21)
-                    run(moves) = map(1:ndraw) do _
-                        z = Comrade.inverse(tpm, prior_sample(rng, postm))
-                        steps = [scale(m) * randn(rng) for m in moves, _ in 1:R]
-                        logu = log.(rand(rng, length(moves), R))
-                        z′, logα = BB.run_moves(tpm, moves, sm.ctx, z, steps, logu; ldf = ldprior)
-                        stats(Comrade.transform(tpm, z′)), logu .< logα
-                    end
-                    moved = run(sm.moves)
-                    fresh = [stats(prior_sample(rng, postm)) for _ in 1:ndraw]
-                    accept = mean(last.(moved))
-                    @test all(>(0.02), accept)
-                    Dcrit = 1.95 * sqrt(2 / ndraw)   # α ≈ 0.001 per statistic
-                    for k in keys(first(fresh))
-                        @test ks(getproperty.(first.(moved), k), getproperty.(fresh, k)) < Dcrit
-                    end
-                    # field_scale[a] with its Jacobian dropped drifts σa off its prior
-                    nojac = (BB.FieldScaleMove(:a, sm.moves[2].coeffs, sm.moves[2].iscale, sm.moves[2].tscale),)
-                    wrong = map(1:ndraw) do _
-                        z = Comrade.inverse(tpm, prior_sample(rng, postm))
-                        for _ in 1:R
-                            u = scale(nojac[1]) * randn(rng)
-                            z′, _ = BB.propose(nojac[1], z, u, tpm, sm.ctx)
-                            if log(rand(rng)) < ldprior(tpm, z′) - ldprior(tpm, z)
-                                z = z′
-                            end
-                        end
-                        Comrade.transform(tpm, z).sky.σa
-                    end
-                    @test ks(wrong, getproperty.(fresh, :σa)) > Dcrit
-                end
+                # field_scale[a] with its Jacobian dropped
+                fa = ms.moves[2]
+                nojac = Comrade.CompensatedMove(
+                    fa.name, fa.ishift, fa.block, fa.compensate, (vb, x, x′, ctx) -> 0.0, fa.initial_scale,
+                    fa.invariant, fa.context, fa.traceable
+                )
+                @test_throws "reports logdet = 0.0" check_move(nojac, postm, θs[1:1])
 
-                # The compiled device step and the host step take the same proposals and
-                # decisions on the same random numbers, through a preconditioner.
-                @testset "device step matches the host step" begin
+                sub = build_moves(
+                    postm, [MoveSpec(; kind = "rho_field", params = ["b"], rounds = 3, target_accept = 0.3)], θs[1]
+                )
+                @test collect(Comrade.move_name.(sub.moves)) == ["rho_field[b,1]", "rho_field[b,2]"]
+                @test sub.rounds == [3, 3] && sub.target_accept == [0.3, 0.3]
+
+                # The hook through a preconditioner makes the same proposals and decisions on
+                # the host and on the device, and writes its statistics.
+                @testset "MoveSet hook, host and device" begin
                     n = dimension(tpm)
                     prng = Random.Xoshiro(11)
                     V = Matrix(qr(randn(prng, n, 3)).Q)[:, 1:3]
@@ -1142,78 +1159,81 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                     tph = BB.PT.transport_to(postm, pre)
                     postc = BB.ConstructionBase.setproperties(postm, (; admode = nothing))
                     rpost = Comrade.prepare_device(postc, Comrade.ComradeBase.ReactantEx())
-                    devpre = Comrade._device_pre(pre)
-                    tpd = BB.PT.transport_to(rpost, devpre)
+                    tpd = BB.PT.transport_to(rpost, Comrade._device_pre(pre))
                     z0 = Comrade._affine_inv(pre, Comrade.inverse(tpm, θs[1]))
-                    steps = [0.3 * ustep(m) * randn(prng) for m in sm.moves, _ in 1:2]
-                    logu = log.(rand(prng, J, 2))
-                    zh, αh = BB.run_moves(tph, sm.moves, sm.ctx, z0, steps, logu)
-                    zd, αd = BB._device_moves(sm, tpd, BB.Reactant.to_rarray(z0), steps, logu)
-                    @test (logu .< αd) == (logu .< αh)
-                    @test count(logu .< αh) > 0
-                    # the device and host log densities agree to rounding of their magnitude
-                    @test αd ≈ αh atol = 1.0e-11 * abs(logdensityof(tph, z0))
-                    @test Array(zd) ≈ zh rtol = 1.0e-9
-                    # same tpost, no recompile; a new one recompiles
-                    c = sm.compiled[]
-                    BB._device_moves(sm, tpd, zd, steps, logu)
-                    @test sm.compiled[] === c
-
-                    # a refit that overwrites the device preconditioner in place is seen by
-                    # the compiled step without a recompile: it proposes and accepts in the
-                    # new coordinates exactly as the host step does with the new transform
-                    V2 = Matrix(qr(randn(prng, n, 3)).Q)[:, 1:3]
-                    pre2 = LowRankPreconditioner(randn(prng, n), exp.(0.3 .* randn(prng, n)), V2, [0.2, 4.0, 1.3])
-                    Comrade._update_device_pre!(devpre, pre2)
-                    tph2 = BB.PT.transport_to(postm, pre2)
-                    z2 = Comrade._affine_inv(pre2, Comrade.inverse(tpm, θs[2]))
-                    zh2, αh2 = BB.run_moves(tph2, sm.moves, sm.ctx, z2, steps, logu)
-                    zd2, αd2 = BB._device_moves(sm, tpd, BB.Reactant.to_rarray(z2), steps, logu)
-                    @test sm.compiled[] === c
-                    @test (logu .< αd2) == (logu .< αh2)
-                    @test αd2 ≈ αh2 atol = 1.0e-11 * abs(logdensityof(tph2, z2))
-                    @test Array(zd2) ≈ zh2 rtol = 1.0e-9
-
-                    # the hook on the device: moves the position, records every proposal
-                    state = ProbProg.MCMCState(BB.Reactant.to_rarray(z0), nothing, nothing, 0.1, nothing, nothing)
-                    info = (; phase = :warmup, step = 10, total = 100, pre = BB.Comrade._transport_pre(tpd))
-                    state = sm(state, tpd, info, Random.Xoshiro(12))
-                    @test Array(state.position) != z0
-                    @test all(t -> t.nwarmup == 2, sm.tuners)
-                    @test occursin("flux_gain acc=", move_summary(sm, :warmup))
-                    @test occursin("(0/0)", move_summary(sm, :sampling))
+                    info = (; phase = :warmup, step = 10, total = 100)
+                    specs = [MoveSpec(; kind, rounds = 2) for kind in kinds]
+                    out = tempname()
+                    msh = build_moves(postm, specs, θs[1]; output = out)
+                    msd = build_moves(postm, specs, θs[1])
+                    sh = msh(ProbProg.MCMCState(copy(z0), nothing, nothing, 0.1, nothing, nothing), tph, info, Random.Xoshiro(12))
+                    sd = msd(ProbProg.MCMCState(BB.Reactant.to_rarray(z0), nothing, nothing, 0.1, nothing, nothing), tpd, info, Random.Xoshiro(12))
+                    @test sh.position != z0
+                    @test Array(sd.position) ≈ sh.position rtol = 1.0e-9
+                    summary = move_summary(msh)
+                    @test [m.warmup for m in move_summary(msd)] == [m.warmup for m in summary]
+                    @test all(m -> m.warmup.proposed == 2, summary)
+                    @test any(m -> m.warmup.accepted > 0, summary)
+                    @test BB.Serialization.deserialize(out) == summary
                 end
 
                 @testset "moves that do not apply are rejected up front" begin
-                    @test_throws "unknown move \"gain_phase\"" SymmetryMoves(postm, ["gain_phase"], θs[1])
-                    @test_throws "rounds must be at least 1" SymmetryMoves(postm, ["flux_gain"], θs[1]; rounds = 0)
+                    @test_throws "unknown move kind \"gain_phase\"" build_moves(postm, [MoveSpec(; kind = "gain_phase")], θs[1])
+                    @test_throws "params [\"z\"] are not among the non-centered sky fields" build_moves(
+                        postm, [MoveSpec(; kind = "field_scale", params = ["z"])], θs[1]
+                    )
                     fcfg = deepcopy(icfg)
                     fcfg["flux"]["ftot"] = [0.8]
                     skyfix, imgfix = build_sky_config(fcfg)
                     postfix = VLBIPosterior(skyfix, intg, dcoh; imgdata = imgfix)
-                    @test_throws "needs a sampled total flux" SymmetryMoves(
-                        postfix, ["flux_gain"], prior_sample(Random.Xoshiro(1), postfix)
+                    @test_throws "needs a sampled total flux" build_moves(
+                        postfix, [MoveSpec(; kind = "flux_gain")], prior_sample(Random.Xoshiro(1), postfix)
                     )
                     # a first-stamp pin on lg1 cannot follow the common shift
                     pcfg = deepcopy(instr)
                     pcfg["priors"]["lg1"]["init"] = Dict("kind" => "fixed", "value" => 0.0)
                     postpin = VLBIPosterior(skym, build_instrument_config(pcfg), dcoh; imgdata = imgm)
-                    @test_throws "move flux_gain changed the log-likelihood" SymmetryMoves(
-                        postpin, ["flux_gain"], prior_sample(Random.Xoshiro(1), postpin)
+                    @test_throws "move flux_gain changed the log-likelihood" build_moves(
+                        postpin, [MoveSpec(; kind = "flux_gain")], prior_sample(Random.Xoshiro(1), postpin)
                     )
-                    # a GMRF sky has neither correlation lengths nor the PolExp Markov mean
+                    # a GMRF sky has neither spectral parameters nor the PolExp stationary-field mean
                     gcfg = deepcopy(icfg)
                     gcfg["model"]["order"] = 1
                     delete!(gcfg["model"], "rho_prior")
                     skyg, imgg = build_sky_config(gcfg)
                     postg = VLBIPosterior(skyg, intg, dcoh; imgdata = imgg)
                     θg = prior_sample(Random.Xoshiro(1), postg)
-                    @test_throws "needs a Markov RF sky model" SymmetryMoves(postg, ["rho_field"], θg)
-                    @test_throws "needs the PolExp Markov RF sky model" SymmetryMoves(postg, ["mean_field"], θg)
-                    postgm = VLBIPosterior(skym, build_instrument_config(exconfig("instrument_gaussmarkov.toml")), dcoh; imgdata = imgm)
-                    @test_throws "needs a gain phase offset `gp1μ`" SymmetryMoves(
-                        postgm, ["phase_offset"], prior_sample(Random.Xoshiro(1), postgm)
-                    )
+                    @test_throws "needs a stationary random-field sky model" build_moves(postg, [MoveSpec(; kind = "rho_field")], θg)
+                    @test_throws "needs the PolExp stationary random-field sky model" build_moves(postg, [MoveSpec(; kind = "mean_field")], θg)
+                end
+
+                @testset "Matérn sky: spectral-parameter and mean-field moves" begin
+                    mcfg = deepcopy(icfg)
+                    mcfg["model"]["order"] = 0
+                    skyw, imgw = build_sky_config(mcfg)
+                    postw = VLBIPosterior(skyw, intg, dcoh; imgdata = imgw)
+                    θw = [prior_sample(Random.Xoshiro(k), postw) for k in 1:2]
+                    mw = build_moves(postw, [MoveSpec(; kind) for kind in ("rho_field", "mean_field")], θw[1])
+                    @test collect(Comrade.move_name.(mw.moves)) == [
+                        "rho_field[a,1]", "rho_field[a,2]", "rho_field[b,1]", "rho_field[b,2]",
+                        "rho_field[c,1]", "rho_field[c,2]", "rho_field[d,1]", "rho_field[d,2]",
+                        "mean_field[fwhm]", "mean_field[fb]",
+                    ]
+                    @testset "check_move: $(Comrade.move_name(m))" for m in mw.moves
+                        nprior = Comrade.move_name(m) in ("rho_field[a,2]", "mean_field[fwhm]") ? 300 : 0
+                        r = check_move(m, postw, θw; nprior, rng = Random.Xoshiro(21))
+                        @test r.loglikelihood < 1.0e-8 * abs(Comrade.loglikelihood(postw, θw[1]))
+                    end
+                    tpw = mw.ctx.view.tbase
+                    @testset "the polarized image is unchanged pixel by pixel: $(Comrade.move_name(m))" for m in mw.moves
+                        x = Comrade.inverse(tpw, θw[2])
+                        x′, _ = Comrade.propose(m, x, 0.1, mw.ctx)
+                        s0 = baseimage(intensitymap(skymodel(postw, θw[2]), grid))
+                        s1 = baseimage(intensitymap(skymodel(postw, Comrade.transform(tpw, x′)), grid))
+                        for p in (:I, :Q, :U, :V)
+                            @test rel(stokes(s1, p), stokes(s0, p)) < 1.0e-10
+                        end
+                    end
                 end
 
                 @testset "StdNormal posterior and Gauss–Newton kernels" begin
@@ -1275,43 +1295,30 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                     @test all(abs.(diff(parent(xw.instrument.gprat.params)[Iaa])) .<= π + 1.0e-12)
                     @test ll(xw) ≈ ll(xb) rtol = 1.0e-10
                     @test logdensityof(tps, Comrade.inverse(tps, xw)) >= logdensityof(tps, Comrade.inverse(tps, xb))
-                    sm = BB.PhaseSheetMoves(posts; rounds = 3)
-                    fx = sm.fixed[:gprat]
-                    term, Ip = sm.points[findfirst(p -> length(p[2]) > 3 && !fx[p[2][3]], sm.points)]
-                    span = BB._shift_span(fx, Ip, 3)
-                    u1 = BB.sheet_proposal(sm, us[1], term, Ip, 3, 1)
-                    d = parent(Comrade.transform(tps, u1).instrument.gprat.params) .- parent(xs1.instrument.gprat.params)
-                    @test all(≈(2π; atol = 1.0e-9), d[span])
-                    @test maximum(abs, d[setdiff(eachindex(d), span)]) < 1.0e-9
-                    @test ll(Comrade.transform(tps, u1)) ≈ ll(xs1) rtol = 1.0e-10
-                    @test BB.sheet_proposal(sm, u1, term, Ip, 3, -1) ≈ us[1] atol = 1.0e-10
-                    # unit Jacobian: the latent shift is the same at another path with the same hyperparameters
-                    rg, gn = sm.ranges[term], BB._term_node(sm.node, term)
-                    u2 = copy(us[1])
-                    xg = BB.PT.latent_pfwd(gn, u2[rg])
-                    xg2 = BB.PT.latent_pfwd(gn, u2[rg] .+ 0.3 .* randn(Random.Xoshiro(9), length(rg)))
-                    u2[rg] = BB.PT.latent_pback(gn, (; params = xg2.params, hyperparams = xg.hyperparams))
-                    @test BB.sheet_proposal(sm, us[1], term, Ip, 3, 1) .- us[1] ≈
-                        BB.sheet_proposal(sm, u2, term, Ip, 3, 1) .- u2 atol = 1.0e-9
 
-                    # the mean-field move in the StdNormal space: the likelihood is unchanged, the
-                    # move is reversed by the opposite step, and only the mean-model coordinate and
-                    # the white coefficients of `a` change, by a shift that does not depend on `a`
-                    smn = BB.SymmetryMoves(posts, ["mean_field"], θd[1]; space = BB.PT.StdNormal())
-                    @test collect(BB.move_name.(smn.moves)) == ["mean_field[fwhm]", "mean_field[fb]"]
-                    for m in smn.moves, u in us
-                        u′, ld = BB.propose(m, u, 0.1, tps, smn.ctx)
-                        @test ld == 0
-                        @test first(BB.propose(m, u′, -0.1, tps, smn.ctx)) ≈ u rtol = 1.0e-10
-                        @test ll(Comrade.transform(tps, u′)) ≈ ll(Comrade.transform(tps, u)) rtol = 1.0e-10
-                        @test all(i -> i in m.coeffs || i == m.mean[m.imean], findall(u′ .!= u))
-                        ua = copy(u)
-                        ua[m.coeffs] .+= randn(Random.Xoshiro(4), length(m.coeffs))
-                        @test first(BB.propose(m, ua, 0.1, tps, smn.ctx)) .- ua ≈ u′ .- u atol = 1.0e-10
+                    # every move kind in the StdNormal space, including the ±2π sheet move and the
+                    # chain-hyperparameter moves
+                    std = BB.PT.StdNormal()
+                    allkinds = ("phase_sheet", kinds..., "chain_hyper")
+                    sms = build_moves(posts, [MoveSpec(; kind) for kind in allkinds], θd[1]; space = std)
+                    @test Comrade.move_name.(sms.moves)[[1, 2, 3, 7, 15, 16]] ==
+                        ("phase_sheet", "flux_gain", "field_scale[a]", "rho_field[a,1]", "mean_field[fwhm]", "mean_field[fb]")
+                    hnames = filter(startswith("chain_hyper"), Comrade.move_name.(sms.moves))
+                    @test "chain_hyper[lg1.σ]" in hnames && "chain_hyper[lg1.τ]" in hnames
+                    @test all(sms.free)
+                    @testset "check_move (StdNormal): $(Comrade.move_name(m))" for m in sms.moves
+                        nprior = Comrade.move_name(m) in ("phase_sheet", "chain_hyper[lg1.σ]", ksmoves...) ? 200 : 0
+                        check_move(m, posts, θd; space = std, nprior, rng = Random.Xoshiro(22))
                     end
-                    @test_throws "in the StdNormal space only \"mean_field\" runs" BB.SymmetryMoves(
-                        posts, ["flux_gain"], θd[1]; space = BB.PT.StdNormal()
-                    )
+                    # a sheet move shifts one path by 2π from its start point up to the next fixed point
+                    sheet = sms.moves[1]
+                    p = findfirst(q -> length(q[4]) > 1, sheet.points)
+                    _, _, Ip, free = sheet.points[p]
+                    u1, _ = Comrade.propose(sheet, us[1], (p, free[2], 1), sms.ctx)
+                    d = parent(Comrade.transform(tps, u1).instrument.gprat.params) .- parent(xs1.instrument.gprat.params)
+                    moved = findall(>(1.0e-9) ∘ abs, d)
+                    @test !isempty(moved) && all(≈(2π; atol = 1.0e-9), d[moved])
+                    @test Ip[free[2]] in moved && issubset(moved, Ip)
 
                     rm = BB.ResidualMap(posts)
                     Φ = [sum(abs2, BB.whitened_residuals(rm, tps, u)) / 2 for u in us]
@@ -1363,6 +1370,25 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                     foreach(x -> Comrade.observe_draw!(ga, st, nothing, x, zero(x)), us)
                     fit = Comrade.metric_refit(ga, st)
                     @test 1 ./ fit.s .^ 2 .- 1 ≈ Ed.values[1:6] rtol = 1.0e-6
+
+                    # directions confined to the sky-field modes within a band of the data
+                    @test isnothing(BB.gauss_newton_rows(posts, Inf))
+                    @test isnothing(BB.gauss_newton_rows(posts, 1.0e6))
+                    rws = BB.gauss_newton_rows(posts, 0.5)
+                    vs = Comrade.CoordinateView(posts, BB.PT.StdNormal())
+                    fieldc = reduce(vcat, [collect(Comrade.coords(vs, (:sky, X))) for X in (:a, :b, :c, :d)])
+                    @test issorted(rws) && issubset(setdiff(1:n, fieldc), rws)
+                    mdp = posts.skymodel.metadata
+                    km = hypot.(mdp.base.plan.kx, mdp.base.plan.ky') ./ (π * abs(step(mdp.grid.X)))
+                    umaxp = maximum(hypot.(Comrade.datatable(posts.data[1]).baseline.U, Comrade.datatable(posts.data[1]).baseline.V))
+                    ca = collect(Comrade.coords(vs, (:sky, :a)))
+                    @test intersect(rws, ca) == ca[vec(km .<= 0.5 * umaxp)]
+                    @test 0 < count(in(rws), ca) < length(ca)
+                    gr = Comrade.GaussNewtonLowRank(curv; rank = 6, oversample = 4, threshold = thr, min_draws = 2, rows = rws)
+                    sr = Comrade.init_metric_adaptation(gr)
+                    foreach(x -> Comrade.observe_draw!(gr, sr, nothing, x, zero(x)), us)
+                    fr = Comrade.metric_refit(gr, sr)
+                    @test fr.V isa Comrade.RowSupportedMatrix && fr.V.rows == rws
                 end
             end
         else

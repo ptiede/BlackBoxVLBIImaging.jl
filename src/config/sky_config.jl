@@ -73,9 +73,9 @@ end
 """
     _parse_rho_prior(s) -> rho-prior marker
 
-Parse `[model] rho_prior`: the prior family for the correlation lengths of a Markov RF
-expansion (`order < 0`). Allowed: `uniform` (default), `lognormal`. See
-[`markov_rho_prior`](@ref) for what each family is.
+Parse `[model] rho_prior`: the prior family for the spectral parameters of a Markov RF
+expansion (`order < 0`) or a Matérn field (`order = 0`). Allowed: `uniform` (default),
+`lognormal`. See [`spectrum_prior`](@ref) for what each family is.
 """
 function _parse_rho_prior(s::AbstractString)
     s == "uniform" && return UniformRhoPrior()
@@ -253,17 +253,18 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
     creg = Bool(get(model, "creg", false))
     pulse = _parse_pulse(String(get(model, "pulse", "delta")))
 
-    # `rho_prior` only reaches the Markov-expansion constructors; with any other base it
-    # would be accepted and then silently ignored.
-    if haskey(model, "rho_prior") && !(base isa MarkovRF)
+    # `rho_prior` only reaches the stationary-random-field constructors; with any other base
+    # it would be accepted and then silently ignored.
+    issrf = base isa Union{MarkovRF, Matern}
+    if haskey(model, "rho_prior") && !issrf
         error(
-            "[model] rho_prior sets the correlation-length prior of a Markov RF expansion " *
-                "(order < 0), but order = $order selects $base, which has no such parameter"
+            "[model] rho_prior sets the spectral-parameter prior of a Markov RF expansion " *
+                "(order < 0) or a Matérn field (order = 0), but order = $order selects $base, " *
+                "which has no such parameter"
         )
     end
     rhoprior = _parse_rho_prior(String(get(model, "rho_prior", "uniform")))
-    base isa MarkovRF &&
-        @info "Markov RF correlation-length prior: $(nameof(typeof(rhoprior)))"
+    issrf && @info "Random-field spectral-parameter prior: $(nameof(typeof(rhoprior)))"
 
     # Random-field correlation length: from the data beam by default (× `beamsize_beams`),
     # `model.beamsize` (μas) overrides, 20 μas fallback only when no beam is available.
@@ -342,7 +343,7 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
             g; meanmodel = mmodel, ftot = ftotpr, beamsize = corr_beam, order = order,
             gaussprior = gaussp, center = Val(docenter), center_power = cpower, pulse
         )
-    elseif base isa MarkovRF
+    elseif issrf
         ctor(
             g; base = prepare_base(base, g, order), meanmodel = mmodel, ftot = ftotpr,
             beamsize = corr_beam, gaussprior = gaussp, center = Val(docenter),

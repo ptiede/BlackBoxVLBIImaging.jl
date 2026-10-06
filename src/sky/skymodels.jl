@@ -99,10 +99,32 @@ end
 # `@sky` constructors as their `base` keyword. `GMRF` (order 1) needs no plan — the prior
 # carries it — so it has no method here.
 prepare_base(::NonCenteredMRF, grid, order) = standardize(MarkovRandomFieldGraph(grid; order); flag = Comrade.VLBISkyModels.FFTW.EXHAUSTIVE)
-prepare_base(::Matern, grid, order) = first(matern(size(grid)))
-prepare_base(ps::MarkovRF, grid, order) = SRF(ps, StationaryRandomFieldPlan(grid))
+prepare_base(ps::Union{Matern, MarkovRF}, grid, order) = SRF(ps, StationaryRandomFieldPlan(grid))
 
 markov_order(::MarkovRF{N}) where {N} = N
+
+"""
+    MaternSlopePS(ℓ, α)
+
+The Matérn power spectrum `S(k) ∝ (1 + ℓ² k²)^(-α/2)` written by its outer scale `ℓ` (in
+pixels) and its high-`k` slope `α`: `MaternPS(ρ, ν)` with `α = 2(ν + 1)` and
+`ℓ = ρ / √(8ν)`. `α = 2` gives equal power per log `k` below the outer scale, the limit
+`ν → 0` that the `(ρ, ν)` form reaches only at its edge.
+"""
+struct MaternSlopePS{T} <: VLBIImagePriors.AbstractPowerSpectrum
+    ℓ::T
+    α::T
+end
+
+@inline function VLBIImagePriors.ampspectrum(ps::MaternSlopePS, ks)
+    kx, ky = ks
+    return (1 + ps.ℓ^2 * (kx^2 + ky^2))^(-ps.α / 4)
+end
+
+# The power spectrum of a field from its spectral parameters: the `N` correlation lengths of
+# an order-`N` Markov RF, or the outer scale and slope `(ℓ, α)` of a Matérn field.
+field_spectrum(::MarkovRF, ρs) = MarkovPS(ρs)
+field_spectrum(::Matern, ρs) = MaternSlopePS(ρs[1], ρs[2])
 
 # --- Markov-field correlation-length priors -----------------------------------------------
 # A `MarkovRF` field of order `N` has amplitude spectrum `1/sqrt(1 + Σₙ (ρₙ² k²)ⁿ)`, so each
@@ -119,11 +141,17 @@ sampler sees a Gaussian.
 """
 struct LogNormalRhoPrior end
 
-# `LogNormal(log(med), logsd)`, built as the `exp` pushforward of a `VLBIGaussian` rather than
-# `Distributions.LogNormal`: the pushforward's flat transform is `exp` wrapped around the
-# Gaussian's own (identity) transform, so the unconstrained coordinate is exactly `log ρ`, and
-# both the density and that transform are branchless and trace under Reactant.
-_lognormal(med, logsd) = PT.PushforwardDistribution(exp, VLBIGaussian(log(med), logsd))
+# `LogNormal(log(med), logsd)` truncated to `[lower, upper]` pixels, built as the `exp`
+# pushforward of a truncated `VLBIGaussian` rather than from `Distributions.LogNormal`, so the
+# density and the transform are branchless and trace under Reactant.
+function _lognormal(med, logsd, lower, upper)
+    lower < med < upper || error(
+        "the log-normal prior median $med is not inside [$lower, $upper]"
+    )
+    return PT.PushforwardDistribution(
+        exp, VLBITruncated(VLBIGaussian(log(med), logsd); lower = log(lower), upper = log(upper))
+    )
+end
 
 """
     markov_rho_prior(kind, grid, beamsize, order::Int; kwargs...) -> NTuple{order}
@@ -136,7 +164,10 @@ pixels. `kind` is the family marker:
     larger grid dimension, the largest structure the field can carry — and log-sd
     `logsd_first`; terms `n ≥ 2` are log-normal with median `median_rest`, the data beam
     `beamsize` in pixels, and the tighter log-sd `logsd_rest`. The unconstrained coordinate
-    of every term is `log ρ`.
+    of every term is `log ρ`. Every term is truncated to `[lower, upper]` pixels (default 1
+    pixel to the larger grid dimension): a correlation length under a pixel is not resolved
+    by the grid and makes the white coefficients of the data-constrained modes stiff, and one
+    longer than the grid leaves the field nearly constant across it.
 """
 function markov_rho_prior(::UniformRhoPrior, grid, beamsize, order::Int; lower = 0.1)
     return ntuple(Returns(VLBIUniform(lower, 1.0 * max(size(grid)...))), order)
@@ -145,11 +176,33 @@ end
 function markov_rho_prior(
         ::LogNormalRhoPrior, grid, beamsize, order::Int;
         median_first = max(size(grid)...) / 2, logsd_first = 1.0,
-        median_rest = beamsize / step(grid.X), logsd_rest = 0.7
+        median_rest = beamsize / step(grid.X), logsd_rest = 0.7, lower = 1.0,
+        upper = 1.0 * max(size(grid)...)
     )
     return ntuple(order) do n
-        return n == 1 ? _lognormal(median_first, logsd_first) : _lognormal(median_rest, logsd_rest)
+        return n == 1 ? _lognormal(median_first, logsd_first, lower, upper) :
+            _lognormal(median_rest, logsd_rest, lower, upper)
     end
+end
+
+"""
+    spectrum_prior(base, kind, grid, beamsize) -> Tuple
+
+The priors of a field's spectral parameters. For `MarkovRF{N}`, the `N` correlation lengths of
+[`markov_rho_prior`](@ref). For `Matern`, the outer scale `ℓ` and slope `α` of
+[`MaternSlopePS`](@ref): with [`LogNormalRhoPrior`](@ref), `ℓ` takes the first Markov term's
+prior and `α` is log-normal with median 2.5 and log-sd 0.4 on `[1, 8]`; with
+[`UniformRhoPrior`](@ref), `ℓ` is uniform on `[0.1, max(size(grid)...)]` pixels and `α`
+uniform on `[1, 8]`.
+"""
+spectrum_prior(::MarkovRF{N}, kind, grid, beamsize) where {N} = markov_rho_prior(kind, grid, beamsize, N)
+
+function spectrum_prior(::Matern, kind::LogNormalRhoPrior, grid, beamsize)
+    return (first(markov_rho_prior(kind, grid, beamsize, 1)), _lognormal(2.5, 0.4, 1.0, 8.0))
+end
+
+function spectrum_prior(::Matern, kind::UniformRhoPrior, grid, beamsize)
+    return (first(markov_rho_prior(kind, grid, beamsize, 1)), VLBIUniform(1.0, 8.0))
 end
 
 # --- shared image builders (unchanged math) ------------------------------------------------
@@ -229,39 +282,18 @@ end
     return _add_gauss(ms, f, gauss)
 end
 
-# Stokes-I imaging with a stationary Matérn fluctuation field (`order == 0`).
-@sky function stokesi_matern(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
-    c ~ VLBIImagePriors.std_dist(base)
-    σ ~ VLBITruncated(VLBIGaussian(0.0, 1.0); lower = 0.0)
-    ρ ~ VLBITruncated(
-        VLBIInverseGamma(1.0, -log(0.1) * beamsize / step(grid.X));
-        lower = 4.0, upper = 2 * max(size(grid)...)
-    )
-    ν ~ VLBITruncated(VLBIInverseGamma(5.0, 9.0); lower = 0.1)
-    mean ~ genmeanprior(meanmodel)
-    flux ~ _flux_prior(ftot)
-    gauss ~ gaussprior
-    mimg = make_mean(meanmodel, grid, mean)
-    f = _get_ftot(ftot, flux)
-    # NOTE: σ is sampled but not applied to δ — this reproduces the pre-macro behavior
-    # (make_image(TotalIntensity, StationaryMatern) never multiplied by σ).
-    δ = base(c, ρ, ν)
-    pmap = make_stokesi(_img_flux(f, gauss), mimg, δ)
-    ms = _center_model(pmap, center, pulse, center_power)
-    return _add_gauss(ms, f, gauss)
-end
-
-# Stokes-I imaging with an order-`N` Markov power-spectrum stationary field (`order < 0`).
-@sky function stokesi_markovrf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
+# Stokes-I imaging with a stationary random field: an order-`N` Markov power spectrum
+# (`order < 0`) or a Matérn one (`order == 0`); `base.ps` selects it.
+@sky function stokesi_srf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     c ~ VLBIImagePriors.std_dist(base.plan)
     σ ~ VLBITruncated(VLBIGaussian(0.0, 1.0); lower = 0.0)
-    ρs ~ markov_rho_prior(rhoprior, grid, beamsize, markov_order(base.ps))
+    ρs ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
     mean ~ genmeanprior(meanmodel)
     flux ~ _flux_prior(ftot)
     gauss ~ gaussprior
     mimg = make_mean(meanmodel, grid, mean)
     f = _get_ftot(ftot, flux)
-    δ = genfield(StationaryRandomField(MarkovPS(ρs), base.plan), c)
+    δ = genfield(StationaryRandomField(field_spectrum(base.ps, ρs), base.plan), c)
     δ .*= σ
     pmap = make_stokesi(_img_flux(f, gauss), mimg, δ)
     ms = _center_model(pmap, center, pulse, center_power)
@@ -290,23 +322,14 @@ end
     return _add_gauss(ms, f, gauss)
 end
 
-# Poincaré-sphere polarized imaging with a stationary Matérn field (`order == 0`).
-# The polarized-field hyperparameters are named `pρ`/`pν` (matching the `p0`/`pσ` style);
-# the pre-macro code disagreed with itself (prior `ρp`/`νp` vs body `pρ`/`pν`) and errored.
-@sky function poincare_matern(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
-    c ~ VLBIImagePriors.std_dist(base)
+# Poincaré-sphere polarized imaging with stationary random fields: order-`N` Markov power
+# spectra (`order < 0`) or Matérn ones (`order == 0`); `base.ps` selects them.
+@sky function poincare_srf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
+    c ~ VLBIImagePriors.std_dist(base.plan)
     σ ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    ρ ~ VLBITruncated(
-        VLBIInverseGamma(1.0, -log(0.1) * beamsize / step(grid.X));
-        lower = 4.0, upper = 2 * max(size(grid)...)
-    )
-    ν ~ VLBITruncated(VLBIInverseGamma(5.0, 9.0); lower = 0.1)
-    p ~ VLBIImagePriors.std_dist(base)
-    pρ ~ VLBITruncated(
-        VLBIInverseGamma(1.0, -log(0.1) * beamsize / step(grid.X));
-        lower = 4.0, upper = 2 * max(size(grid)...)
-    )
-    pν ~ VLBITruncated(VLBIInverseGamma(5.0, 9.0); lower = 0.1)
+    ρ ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
+    p ~ VLBIImagePriors.std_dist(base.plan)
+    pρ ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
     p0 ~ VLBIGaussian(-1.0, 2.0)
     pσ ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
     angparams ~ ImageSphericalUniform(size(grid)...)
@@ -315,8 +338,8 @@ end
     gauss ~ gaussprior
     mimg = make_mean(meanmodel, grid, mean)
     f = _get_ftot(ftot, flux)
-    δ = base(c, ρ, ν)
-    pδ = base(p, pρ, pν)
+    δ = genfield(StationaryRandomField(field_spectrum(base.ps, ρ), base.plan), c)
+    pδ = genfield(StationaryRandomField(field_spectrum(base.ps, pρ), base.plan), p)
     δ .*= σ
     pmap = make_poincare(_img_flux(f, gauss), mimg, δ, p0, pσ, pδ, angparams)
     ms = _center_model(pmap, center, pulse, center_power)
@@ -399,56 +422,9 @@ end
     return _add_gauss(ms, f, gauss)
 end
 
-# PolExp polarized imaging with stationary Matérn fields (`order == 0`).
-@sky function polexp_matern(grid; base, meanmodel, ftot, beamsize, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
-    a ~ VLBIImagePriors.std_dist(base)
-    b ~ VLBIImagePriors.std_dist(base)
-    c ~ VLBIImagePriors.std_dist(base)
-    d ~ VLBIImagePriors.std_dist(base)
-    σa ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    σb ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    σc ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    σd ~ VLBITruncated(VLBIGaussian(0.0, 0.1); lower = 0.0)
-    ρa ~ VLBITruncated(
-        VLBIInverseGamma(1.0, -log(0.1) * beamsize / step(grid.X));
-        lower = 4.0, upper = 2 * max(size(grid)...)
-    )
-    νa ~ VLBITruncated(VLBIInverseGamma(5.0, 9.0); lower = 0.1)
-    ρb ~ VLBITruncated(
-        VLBIInverseGamma(1.0, -log(0.1) * beamsize / step(grid.X));
-        lower = 4.0, upper = 2 * max(size(grid)...)
-    )
-    νb ~ VLBITruncated(VLBIInverseGamma(5.0, 9.0); lower = 0.1)
-    ρc ~ VLBITruncated(
-        VLBIInverseGamma(1.0, -log(0.1) * beamsize / step(grid.X));
-        lower = 4.0, upper = 2 * max(size(grid)...)
-    )
-    νc ~ VLBITruncated(VLBIInverseGamma(5.0, 9.0); lower = 0.1)
-    ρd ~ VLBITruncated(
-        VLBIInverseGamma(1.0, -log(0.1) * beamsize / step(grid.X));
-        lower = 4.0, upper = 2 * max(size(grid)...)
-    )
-    νd ~ VLBITruncated(VLBIInverseGamma(5.0, 9.0); lower = 0.1)
-    mean ~ genmeanprior(meanmodel)
-    flux ~ _flux_prior(ftot)
-    gauss ~ gaussprior
-    mimg = make_mean(meanmodel, grid, mean)
-    f = _get_ftot(ftot, flux)
-    δa = base(a, ρa, νa)
-    δb = base(b, ρb, νb)
-    δc = base(c, ρc, νc)
-    δd = base(d, ρd, νd)
-    δa .*= σa
-    δb .*= σb
-    δc .*= σc
-    δd .*= σd
-    pmap = make_pol2expimage(_img_flux(f, gauss), δa, δb, δc, δd, mimg)
-    ms = _center_model(pmap, center, pulse, center_power)
-    return _add_gauss(ms, f, gauss)
-end
-
-# PolExp polarized imaging with order-`N` Markov power-spectrum stationary fields (`order < 0`).
-@sky function polexp_markovrf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
+# PolExp polarized imaging with stationary random fields: order-`N` Markov power spectra
+# (`order < 0`) or Matérn ones (`order == 0`); `base.ps` selects them.
+@sky function polexp_srf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     a ~ VLBIImagePriors.std_dist(base.plan)
     b ~ VLBIImagePriors.std_dist(base.plan)
     c ~ VLBIImagePriors.std_dist(base.plan)
@@ -457,19 +433,19 @@ end
     σb ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
     σc ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
     σd ~ VLBITruncated(VLBIGaussian(0.0, 0.1); lower = 0.0)
-    ρa ~ markov_rho_prior(rhoprior, grid, beamsize, markov_order(base.ps))
-    ρb ~ markov_rho_prior(rhoprior, grid, beamsize, markov_order(base.ps))
-    ρc ~ markov_rho_prior(rhoprior, grid, beamsize, markov_order(base.ps))
-    ρd ~ markov_rho_prior(rhoprior, grid, beamsize, markov_order(base.ps))
+    ρa ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
+    ρb ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
+    ρc ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
+    ρd ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
     mean ~ genmeanprior(meanmodel)
     flux ~ _flux_prior(ftot)
     gauss ~ gaussprior
     mimg = make_mean(meanmodel, grid, mean)
     f = _get_ftot(ftot, flux)
-    δa = genfield(StationaryRandomField(MarkovPS(ρa), base.plan), a)
-    δb = genfield(StationaryRandomField(MarkovPS(ρb), base.plan), b)
-    δc = genfield(StationaryRandomField(MarkovPS(ρc), base.plan), c)
-    δd = genfield(StationaryRandomField(MarkovPS(ρd), base.plan), d)
+    δa = genfield(StationaryRandomField(field_spectrum(base.ps, ρa), base.plan), a)
+    δb = genfield(StationaryRandomField(field_spectrum(base.ps, ρb), base.plan), b)
+    δc = genfield(StationaryRandomField(field_spectrum(base.ps, ρc), base.plan), c)
+    δd = genfield(StationaryRandomField(field_spectrum(base.ps, ρd), base.plan), d)
     δa .*= σa
     δb .*= σb
     δc .*= σc
@@ -491,14 +467,12 @@ Map a polarization representation and a random-field base *marker* (from
 """
 sky_constructor(::TotalIntensity, ::Type{<:VLBIImagePriors.MarkovRandomField}) = stokesi_gmrf
 sky_constructor(::TotalIntensity, ::NonCenteredMRF) = stokesi_ncmrf
-sky_constructor(::TotalIntensity, ::Matern) = stokesi_matern
-sky_constructor(::TotalIntensity, ::MarkovRF) = stokesi_markovrf
+sky_constructor(::TotalIntensity, ::Union{Matern, MarkovRF}) = stokesi_srf
 sky_constructor(::Poincare, ::Type{<:VLBIImagePriors.MarkovRandomField}) = poincare_gmrf
-sky_constructor(::Poincare, ::Matern) = poincare_matern
+sky_constructor(::Poincare, ::Union{Matern, MarkovRF}) = poincare_srf
 sky_constructor(::PolExp, ::Type{<:VLBIImagePriors.MarkovRandomField}) = polexp_gmrf
 sky_constructor(::PolExp, ::NonCenteredMRF) = polexp_ncmrf
-sky_constructor(::PolExp, ::Matern) = polexp_matern
-sky_constructor(::PolExp, ::MarkovRF) = polexp_markovrf
+sky_constructor(::PolExp, ::Union{Matern, MarkovRF}) = polexp_srf
 sky_constructor(p::PolRep, base) =
     error("no sky model for polrep $(typeof(p)) with random-field base $(base); see sky_constructor methods for the supported combinations")
 

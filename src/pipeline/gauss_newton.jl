@@ -297,3 +297,35 @@ function gauss_newton_subspace(k::GaussNewtonKernels, us; rank::Integer, kwargs.
         "basis $(Base.format_bytes(sizeof(s.V))), $(length(us)) draws, $(round(t; digits = 1)) s"
     return s
 end
+
+"""
+    gauss_newton_rows(post::VLBIPosterior, band) -> Union{Nothing, Vector{Int}}
+
+The StdNormal latent coordinates of `post` the Gauss–Newton directions may use: all of them
+except the white coefficients of the stationary random sky fields at wavenumbers above `band` times
+the longest baseline of the data. The coefficients of a field are its Fourier modes, and the
+data constrain a field mode only through the image spectrum it is convolved with, so the
+curvature on modes far above the data's band is small. `nothing` (no restriction) when every
+coordinate is kept, `band` is infinite, or the sky has no stationary random fields.
+"""
+function gauss_newton_rows(post::VLBIPosterior, band::Real)
+    isinf(band) && return nothing
+    md = _sky_metadata(post)
+    (hasproperty(md, :base) && md.base isa SRF) || return nothing
+    plan = md.base.plan
+    view = Comrade.CoordinateView(post, PT.StdNormal())
+    n = dimension(view.tbase)
+    θ = Comrade.transform(view.tbase, zeros(n))
+    # `plan.kx` is π × the DFT frequency in cycles per pixel
+    pix = abs(step(md.grid.X))
+    kmag = hypot.(plan.kx, plan.ky') ./ (π * pix)
+    umax = maximum(d -> maximum(hypot.(Comrade.datatable(d).baseline.U, Comrade.datatable(d).baseline.V)), post.data)
+    drop = Int[]
+    for X in _scaled_fields(θ.sky)
+        size(θ.sky[X]) == size(kmag) || continue
+        c = Comrade.coords(view, _white_field(view, X))
+        append!(drop, c[vec(kmag .> band * umax)])
+    end
+    isempty(drop) && return nothing
+    return setdiff(1:n, drop)
+end

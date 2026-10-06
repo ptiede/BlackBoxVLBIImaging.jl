@@ -24,8 +24,8 @@
 # width π.
 #
 # `LogNormal` takes `args = [mu, sigma]` (mu = log of the median) and is built as the `exp`
-# pushforward of a `VLBIGaussian`, matching `markov_rho_prior`'s own log-normal ρ priors: the
-# unconstrained coordinate is exactly `log` of the sampled value.
+# pushforward of a `VLBIGaussian`: the unconstrained coordinate is exactly `log` of the
+# sampled value.
 
 const _DIST_ALLOWLIST = Dict{String, Function}(
     "Normal" => (a...) -> VLBIImagePriors.VLBIGaussian(a...),

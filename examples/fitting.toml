@@ -26,14 +26,18 @@ term_buffer = 500
 max_tree_depth = 10
 chunk_size = 100
 base_window = 25
-# Metropolis–Hastings moves between the Reactant NUTS chunks: "flux_gain" (total flux against
-# a common gain amplitude), "field_scale" (each non-centered sky field against its scale),
-# "rho_field" (each Markov RF correlation length against its field), "mean_field" (each
-# mean-model parameter against the log-intensity field), and "phase_offset" (a random-walk
-# step of each site's gain phase offset gp1μ). Absent or empty: none. `moves_per_chunk`
-# rounds of every move run between two chunks.
-# moves = ["flux_gain", "field_scale", "rho_field", "mean_field", "phase_offset"]
-# moves_per_chunk = 10
+
+# Metropolis–Hastings moves between the Reactant NUTS chunks, one [[sampler.moves]] table
+# per move kind: "flux_gain" (total flux against a common gain amplitude), "field_scale"
+# (each non-centered sky field against its scale), "rho_field" (each Markov RF correlation
+# length against its field), "mean_field" (each mean-model parameter against the
+# log-intensity field), and "phase_sheet" (±2π shifts of real-line phase chains; stdnormal
+# latent space only). Optional keys: params (a subset of what the kind acts on), rounds
+# (proposals per call, default 1), target_accept (default 0.45), initial_scale.
+# [[sampler.moves]]
+# kind = "mean_field"
+# params = ["fwhm"]
+# rounds = 10
 
 [run]
 use_reactant = false
