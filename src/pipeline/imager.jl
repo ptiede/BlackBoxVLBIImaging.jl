@@ -255,24 +255,15 @@ function _check_finite_draw(x, where)
     return x
 end
 
-# The wall time and the moves' total time (`Comrade.move_seconds`) at the end of the last
-# sampler callback of a phase; `t = NaN` before the first.
-mutable struct _NUTSClock
-    t::Float64
-    moved::Float64
-end
-_NUTSClock() = _NUTSClock(NaN, 0.0)
-_restart!(c::_NUTSClock, t, moved) = (c.t = t; c.moved = moved; c)
-
-# Leapfrog steps per draw over the `nsteps` draws since the clock was restarted: the wall
-# time to `t` less the moves' time in between, divided by the time of one gradient
-# `tgrad`. Empty before the first restart (that interval includes compile time) or without
-# `tgrad`. With `maxdepth`, a mean of at least 95% of the `2^maxdepth − 1` leapfrog steps
-# of a full tree is flagged: the trajectories end at the depth cap, not at a U-turn.
-function _depth_note(c::_NUTSClock, t, moved, nsteps, tgrad; maxdepth = nothing)
-    dt = t - c.t - (moved - c.moved)
-    (isnan(dt) || isnothing(tgrad) || nsteps <= 0) && return ""
-    lf = dt / nsteps / tgrad
+# Leapfrog steps per draw over a chunk of `nsteps` NUTS draws that took `nuts_seconds` on the
+# device (the NUTS kernel alone, without moves, refits or checkpoints), divided by the
+# steady-state time `tgrad` of one gradient. Empty without `tgrad`, or for a chunk that ran a
+# freshly compiled kernel (`fresh`), whose first run pays one-time device setup. With
+# `maxdepth`, a mean of at least 95% of the `2^maxdepth − 1` leapfrog steps of a full tree is
+# flagged: the trajectories end at the depth cap, not at a U-turn.
+function _depth_note(nuts_seconds, nsteps, tgrad; fresh::Bool = false, maxdepth = nothing)
+    (fresh || isnothing(tgrad) || nsteps <= 0) && return ""
+    lf = nuts_seconds / nsteps / tgrad
     capped = !isnothing(maxdepth) && lf >= 0.95 * (2^maxdepth - 1)
     return " ~lf/step=$(round(Int, lf)) (depth≈$(round(log2(max(lf, 1)); digits = 1)))" *
         (capped ? ", at the depth cap $maxdepth" : "")
@@ -311,19 +302,17 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
     if strategy.sample_checkpoint > 0
         # Post-warmup per-batch checkpoint: render the latest draw and save FITS+PNG+resid.
         # Tree depth is not exposed by the ProbProg backend (its diagnostics carry only
-        # the divergence flag), so `_depth_note` estimates it from the NUTS wall time
-        # between callbacks; each phase has its own clock.
-        movesec() = isnothing(moves) ? 0.0 : Comrade.move_seconds(moves)
-        tsample = _NUTSClock()
+        # the divergence flag), so `_depth_note` estimates it from the NUTS kernel's time.
         cb = function (info)
-            t = time()
             params = _check_finite_draw(Comrade.Adapt.adapt(Array, info.params), "sampling batch $(info.round)")
             save_checkpoint(post_cpu, params, gimg, imgbase, "sample_round$(info.round)")
             ndiv = count(info.numerical_error)
             tg = something(get(info.extras, :gradient_time, nothing), tgrad, Some(nothing))
-            note = _depth_note(tsample, t, movesec(), stride, tg; maxdepth = strategy.max_tree_depth)
+            note = _depth_note(
+                info.time, info.num_samples, tg;
+                fresh = info.extras.fresh_kernel, maxdepth = strategy.max_tree_depth
+            )
             @info "sampling batch $(info.round)/$(info.nrounds): n_divergences=$ndiv$note (checkpoint saved)"
-            _restart!(tsample, time(), movesec())
             return (; info.round, n_divergences = ndiv)
         end
         # Warmup now runs in chunks of the same `stride`, and its callback fires after EVERY
@@ -332,17 +321,15 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
         # chunk (making warmup itself resumable via `restart`). The warmup `info` carries
         # `step`/`total` (steps done / n_adapts) plus host-side `step_size`/`params` — NOT the
         # sampling `round`/`nrounds` fields.
-        wstep = Ref(0)
-        twarm = _NUTSClock()
         wcb = function (info)
-            t = time()
             params = _check_finite_draw(Comrade.Adapt.adapt(Array, info.params), "warmup step $(info.step)")
             save_checkpoint(post_cpu, params, gimg, imgbase, "warmup_step$(info.step)")
             tg = something(get(info, :gradient_time, nothing), tgrad, Some(nothing))
-            note = _depth_note(twarm, t, movesec(), info.step - wstep[], tg; maxdepth = strategy.max_tree_depth)
-            wstep[] = info.step
+            note = _depth_note(
+                info.nuts_seconds, info.nsteps, tg;
+                fresh = info.fresh_kernel, maxdepth = strategy.max_tree_depth
+            )
             @info "warmup $(info.step)/$(info.total): step_size=$(info.step_size)$note (checkpoint saved)"
-            _restart!(twarm, time(), movesec())
             return (; info.step, info.total, info.step_size)
         end
         # nutpie-style init: with in-run refits configured and no pilot transform, one

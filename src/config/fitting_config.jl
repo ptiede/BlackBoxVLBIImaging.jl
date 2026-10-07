@@ -155,7 +155,8 @@ initial_scale = 0.01  # optional: initial random-walk step scale (default per ki
 
 The kinds, all of which leave the likelihood unchanged:
 
-  - `"flux_gain"`: total flux against a common gain log-amplitude `lg1` (no `params`);
+  - `"flux_gain"`: total flux against a common shift of the gain log-amplitudes, `lg1μ` when
+    the gain scheme has it and the `lg1` chain otherwise (no `params`);
   - `"field_scale"`: each non-centered sky field against its scale `σX` (`params`: fields);
   - `"rho_field"`: each spectral parameter of each stationary random field (Markov RF
     correlation lengths, Matérn outer scale and slope) against the field's white

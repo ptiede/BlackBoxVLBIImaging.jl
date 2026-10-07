@@ -80,21 +80,28 @@ _reshaped(v, w) = reshape(vec(w), size(v))
 
 function _flux_gain_moves(post, view, θ, spec)
     isnothing(spec.params) ||
-        error("move \"flux_gain\" takes no params; it trades sky.flux.ftot against instrument.lg1")
+        error("move \"flux_gain\" takes no params; it trades sky.flux.ftot against the gain log-amplitudes")
     (haskey(θ.sky, :flux) && haskey(θ.sky.flux, :ftot)) || error(
         "move \"flux_gain\" needs a sampled total flux (a two-value [flux] ftot in the sky " *
             "config); the sky parameters are $(keys(θ.sky))"
     )
-    haskey(θ.instrument, :lg1) || error(
-        "move \"flux_gain\" needs a gain log-amplitude `lg1`; the instrument parameters " *
-            "are $(keys(θ.instrument))"
-    )
-    _is_chain(θ.instrument.lg1) || error(
-        "move \"flux_gain\" needs `lg1` to be a Gauss–Markov chain with fitted hyperparameters"
-    )
+    # A per-station constant lg1μ carries a common shift for the cost of its own prior; the
+    # lg1 chain would have to shift every integration of every site.
+    gains = if haskey(θ.instrument, :lg1μ)
+        (:instrument, :lg1μ)
+    else
+        haskey(θ.instrument, :lg1) || error(
+            "move \"flux_gain\" needs a gain log-amplitude `lg1μ` or `lg1`; the instrument " *
+                "parameters are $(keys(θ.instrument))"
+        )
+        _is_chain(θ.instrument.lg1) || error(
+            "move \"flux_gain\" needs `lg1` to be a Gauss–Markov chain with fitted hyperparameters"
+        )
+        (:instrument, :lg1)
+    end
     return [
         Comrade.flux_gain_move(
-            view; flux = (:sky, :flux, :ftot), gains = (:instrument, :lg1),
+            view; flux = (:sky, :flux, :ftot), gains,
             initial_scale = something(spec.initial_scale, 0.05)
         ),
     ]

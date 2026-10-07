@@ -238,6 +238,33 @@ end
     end
 end
 
+#     gain_offsets(; priors)
+#
+# `gain_offsetphase` with the feed-1 amplitude split the same way as its phase:
+#   amplitude:  lg1μ (per-track constant log-amplitude, one value per site) + lg1 (a
+#               zero-mean stationary chain about it).
+#   phase, ratio: identical to `gain_offsetphase`.
+# lg1μ holds each site's calibration offset, so a constant offset does not have to be
+# carried by lg1's fitted σ. Without it, sites whose common level the data leave free (e.g.
+# co-located stations, whose difference alone is measured) give a posterior with one mode
+# per choice of which site's σ collapses. A common shift of every site's lg1μ trades exactly
+# against the total flux, so the lg1μ prior width sets the flux uncertainty.
+@instrument function gain_offsets(; priors)
+    return @jones begin
+        lg1μ ~ priors.lg1μ     # amplitude: per-station constant log-amplitude (track)
+        lg1 ~ priors.lg1       # amplitude: zero-mean stationary chain about it
+        gp1μ ~ priors.gp1μ     # phase: per-station WRAPPED offset (arbitrary, on circle)
+        gp1 ~ priors.gp1       # phase: per-stamp value about it (first stamp pinned via init)
+        lgratμ ~ priors.lgratμ # ratio amplitude: per-station mean (OU cannot fit its own)
+        lgrat ~ priors.lgrat   # ratio amplitude: residual about that mean
+        gpratμ ~ priors.gpratμ # ratio phase: per-station WRAPPED offset (arbitrary, on circle)
+        gprat ~ priors.gprat   # ratio phase: mean-reverting circular drift about it
+        g1 = exp(complex(lg1μ + lg1, gp1μ + gp1))
+        g2 = g1 * exp(complex((lgratμ + lgrat), (gpratμ + gprat)))
+        return JonesG((g1, g2))
+    end
+end
+
 #     gain_hier(; priors)
 #
 # Hierarchical gain model: the feed-1 amplitude and the feed-2 gain ratio are each given by a
@@ -350,6 +377,7 @@ const GAIN_SCHEMES = Dict{String, Any}(
     "gain_gaussmarkov" => gain_gaussmarkov,
     "gain_wrappedphase" => gain_wrappedphase,
     "gain_offsetphase" => gain_offsetphase,
+    "gain_offsets" => gain_offsets,
     "gain_centered" => gain_centered,
     "gain_hier" => gain_hier,
     "gain_noratio" => gain_noratio,

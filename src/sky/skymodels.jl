@@ -246,7 +246,7 @@ end
 # Stokes-I imaging with a first-order GMRF fluctuation field (`order == 1`).
 @sky function stokesi_gmrf(grid; meanmodel, ftot, beamsize, order = 1, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     c ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
-    σ ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
+    σ ~ VLBIExponential(1.0)
     mean ~ genmeanprior(meanmodel)
     flux ~ _flux_prior(ftot)
     gauss ~ gaussprior
@@ -266,7 +266,7 @@ end
         ),
         params = VLBIImagePriors.StdNormal(size(grid)),
     )
-    σ ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
+    σ ~ VLBIExponential(1.0)
     mean ~ genmeanprior(meanmodel)
     flux ~ _flux_prior(ftot)
     gauss ~ gaussprior
@@ -286,7 +286,7 @@ end
 # (`order < 0`) or a Matérn one (`order == 0`); `base.ps` selects it.
 @sky function stokesi_srf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     c ~ VLBIImagePriors.std_dist(base.plan)
-    σ ~ VLBITruncated(VLBIGaussian(0.0, 1.0); lower = 0.0)
+    σ ~ VLBIExponential(1.0)
     ρs ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
     mean ~ genmeanprior(meanmodel)
     flux ~ _flux_prior(ftot)
@@ -307,10 +307,10 @@ end
 # Poincaré-sphere polarized imaging with a first-order GMRF field (`order == 1`).
 @sky function poincare_gmrf(grid; meanmodel, ftot, beamsize, order = 1, gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     c ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
-    σ ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
+    σ ~ VLBIExponential(1.0)
     p ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
     p0 ~ VLBIGaussian(-1.0, 2.0)
-    pσ ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
+    pσ ~ VLBIExponential(0.5)
     angparams ~ ImageSphericalUniform(size(grid)...)
     mean ~ genmeanprior(meanmodel)
     flux ~ _flux_prior(ftot)
@@ -326,12 +326,12 @@ end
 # spectra (`order < 0`) or Matérn ones (`order == 0`); `base.ps` selects them.
 @sky function poincare_srf(grid; base, meanmodel, ftot, beamsize, rhoprior = UniformRhoPrior(), gaussprior = NamedTuple(), center = Val(true), center_power = 1, pulse = DeltaPulse())
     c ~ VLBIImagePriors.std_dist(base.plan)
-    σ ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
+    σ ~ VLBIExponential(1.0)
     ρ ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
     p ~ VLBIImagePriors.std_dist(base.plan)
     pρ ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
     p0 ~ VLBIGaussian(-1.0, 2.0)
-    pσ ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
+    pσ ~ VLBIExponential(0.5)
     angparams ~ ImageSphericalUniform(size(grid)...)
     mean ~ genmeanprior(meanmodel)
     flux ~ _flux_prior(ftot)
@@ -356,10 +356,10 @@ end
     b ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
     c ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
     d ~ corr_image_prior(grid, beamsize; base = GMRF, order = order, lower = 4.0)
-    σa ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    σb ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    σc ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    σd ~ VLBITruncated(VLBIGaussian(0.0, 0.05); lower = 0.0)
+    σa ~ VLBIExponential(1.0)
+    σb ~ VLBIExponential(0.5)
+    σc ~ VLBIExponential(0.5)
+    σd ~ VLBIExponential(0.05)
     mean ~ genmeanprior(meanmodel)
     flux ~ _flux_prior(ftot)
     gauss ~ gaussprior
@@ -400,10 +400,10 @@ end
         ),
         params = VLBIImagePriors.StdNormal(size(grid)),
     )
-    σa ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    σb ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    σc ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    σd ~ VLBITruncated(VLBIGaussian(0.0, 0.05); lower = 0.0)
+    σa ~ VLBIExponential(1.0)
+    σb ~ VLBIExponential(0.5)
+    σc ~ VLBIExponential(0.5)
+    σd ~ VLBIExponential(0.05)
     mean ~ genmeanprior(meanmodel)
     flux ~ _flux_prior(ftot)
     gauss ~ gaussprior
@@ -429,10 +429,10 @@ end
     b ~ VLBIImagePriors.std_dist(base.plan)
     c ~ VLBIImagePriors.std_dist(base.plan)
     d ~ VLBIImagePriors.std_dist(base.plan)
-    σa ~ VLBITruncated(VLBIGaussian(0.0, 1.0); lower = 0.0)
-    σb ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    σc ~ VLBITruncated(VLBIGaussian(0.0, 0.5); lower = 0.0)
-    σd ~ VLBITruncated(VLBIGaussian(0.0, 0.1); lower = 0.0)
+    σa ~ VLBIExponential(1.0)
+    σb ~ VLBIExponential(0.5)
+    σc ~ VLBIExponential(0.5)
+    σd ~ VLBIExponential(0.05)
     ρa ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
     ρb ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)
     ρc ~ spectrum_prior(base.ps, rhoprior, grid, beamsize)

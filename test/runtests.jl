@@ -20,15 +20,14 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws "the warmup step 140 draw has non-finite parameters: .sky.σd = Inf" BlackBoxVLBIImaging._check_finite_draw(bad, "warmup step 140")
     end
 
-    @testset "NUTS depth estimate from wall time" begin
-        c = BlackBoxVLBIImaging._NUTSClock()
-        @test BlackBoxVLBIImaging._depth_note(c, 10.0, 0.0, 10, 1.0e-3) == ""
-        BlackBoxVLBIImaging._restart!(c, 10.0, 1.0)
-        # 10 s of wall time, 2 s of it in moves: 8 s over 10 draws of 1 ms gradients
-        @test BlackBoxVLBIImaging._depth_note(c, 20.0, 3.0, 10, 1.0e-3) == " ~lf/step=800 (depth≈9.6)"
-        @test BlackBoxVLBIImaging._depth_note(c, 20.0, 3.0, 10, nothing) == ""
-        @test BlackBoxVLBIImaging._depth_note(c, 20.0, 3.0, 10, 1.0e-3; maxdepth = 10) == " ~lf/step=800 (depth≈9.6)"
-        @test BlackBoxVLBIImaging._depth_note(c, 20.0, 3.0, 10, 0.78e-3; maxdepth = 10) == " ~lf/step=1026 (depth≈10.0), at the depth cap 10"
+    @testset "NUTS depth estimate from the kernel time" begin
+        dn = BlackBoxVLBIImaging._depth_note
+        # 8 s over 10 draws of 1 ms gradients
+        @test dn(8.0, 10, 1.0e-3) == " ~lf/step=800 (depth≈9.6)"
+        @test dn(8.0, 10, nothing) == ""
+        @test dn(8.0, 10, 1.0e-3; fresh = true) == ""
+        @test dn(8.0, 10, 1.0e-3; maxdepth = 10) == " ~lf/step=800 (depth≈9.6)"
+        @test dn(8.0, 10, 0.78e-3; maxdepth = 10) == " ~lf/step=1026 (depth≈10.0), at the depth cap 10"
     end
 
     @testset "distribution spec parser" begin
