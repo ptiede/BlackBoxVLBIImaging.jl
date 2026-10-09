@@ -265,6 +265,31 @@ end
     end
 end
 
+#     gain_ampoffsets(; priors)
+#
+# `gain_offsets` without the feed-1 phase split:
+#   amplitude:  lg1μ + lg1, as in `gain_offsets`.
+#   phase:      gp1 — one phase per stamp carrying both the level and the drift, as in
+#               `gain_wrappedphase`.
+#   ratio:      identical to `gain_offsets`.
+# With no per-track phase offset, no latent direction moves every stamp of a site at once,
+# so the likelihood curvature along any feed-1 phase coordinate is that of a single stamp
+# rather than the sum over the track.
+@instrument function gain_ampoffsets(; priors)
+    return @jones begin
+        lg1μ ~ priors.lg1μ     # amplitude: per-station constant log-amplitude (track)
+        lg1 ~ priors.lg1       # amplitude: zero-mean stationary chain about it
+        gp1 ~ priors.gp1       # phase: per-stamp value (level and drift)
+        lgratμ ~ priors.lgratμ # ratio amplitude: per-station mean (OU cannot fit its own)
+        lgrat ~ priors.lgrat   # ratio amplitude: residual about that mean
+        gpratμ ~ priors.gpratμ # ratio phase: per-station WRAPPED offset (arbitrary, on circle)
+        gprat ~ priors.gprat   # ratio phase: mean-reverting circular drift about it
+        g1 = exp(complex(lg1μ + lg1, gp1))
+        g2 = g1 * exp(complex((lgratμ + lgrat), (gpratμ + gprat)))
+        return JonesG((g1, g2))
+    end
+end
+
 #     gain_hier(; priors)
 #
 # Hierarchical gain model: the feed-1 amplitude and the feed-2 gain ratio are each given by a
@@ -378,6 +403,7 @@ const GAIN_SCHEMES = Dict{String, Any}(
     "gain_wrappedphase" => gain_wrappedphase,
     "gain_offsetphase" => gain_offsetphase,
     "gain_offsets" => gain_offsets,
+    "gain_ampoffsets" => gain_ampoffsets,
     "gain_centered" => gain_centered,
     "gain_hier" => gain_hier,
     "gain_noratio" => gain_noratio,

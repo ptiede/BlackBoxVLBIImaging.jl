@@ -198,7 +198,7 @@ end
 # transform is supplied up front, since diagonal adaptation renormalizes the marginals the
 # transform deliberately set). Gauss–Newton refits need `curvature`, the function
 # `gauss_newton_curvature` builds.
-function _metric_adaptor(strategy::FittingStrategy, curvature = nothing; rows = nothing)
+function _metric_adaptor(strategy::FittingStrategy, curvature = nothing; rows = nothing, prior = nothing)
     sched = if strategy.precond_refit_schedule == "stan"
         :stan
     elseif strategy.precond_refit_schedule == "nutpie"
@@ -216,7 +216,8 @@ function _metric_adaptor(strategy::FittingStrategy, curvature = nothing; rows = 
         return Comrade.GaussNewtonLowRank(
             curvature; rank = strategy.precond_rank, oversample = strategy.precond_oversample,
             probes_per_draw = strategy.precond_probes_per_draw == 0 ? k : strategy.precond_probes_per_draw,
-            threshold = strategy.precond_threshold, schedule = sched, rows
+            threshold = strategy.precond_threshold, schedule = sched, rows, prior,
+            max_eigenvalue = strategy.precond_max_eigenvalue
         )
     end
     return Comrade.FisherLowRank(;
@@ -283,7 +284,9 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
     isnothing(rows) || @info "Gauss–Newton directions on $(length(rows)) of " *
         "$(dimension(Comrade.transport_to(post_cpu, PT.StdNormal()))) latent coordinates " *
         "(sky-field modes up to $(strategy.precond_band_limit) × the longest baseline)"
-    adaptor = _metric_adaptor(strategy, curvature; rows)
+    prior = strategy.precond_refit_kind == "gauss_newton" ? gauss_newton_prior(post_cpu) : nothing
+    isnothing(prior) || @info "Gauss–Newton refits include the partially centered field-a prior"
+    adaptor = _metric_adaptor(strategy, curvature; rows, prior)
     moves = isempty(strategy.moves) ? nothing : build_moves(
         post_cpu, strategy.moves, xopt;
         space = latent_space(strategy), output = joinpath(mkpath(out), "moves.jls")

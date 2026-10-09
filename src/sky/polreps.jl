@@ -33,3 +33,15 @@ struct SRF{PS, P}
     ps::PS
     plan::P
 end
+
+"""
+A standardized stationary random field paired with its FFT plan, whose field-`a`
+coefficients are partially centered by `pcenter` (a [`PartialCentering`](@ref)).
+"""
+struct PartiallyCenteredSRF{PS, P, C}
+    ps::PS
+    plan::P
+    pcenter::C
+end
+
+const StationaryBase = Union{SRF, PartiallyCenteredSRF}

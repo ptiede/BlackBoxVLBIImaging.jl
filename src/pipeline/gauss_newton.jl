@@ -311,21 +311,65 @@ coordinate is kept, `band` is infinite, or the sky has no stationary random fiel
 function gauss_newton_rows(post::VLBIPosterior, band::Real)
     isinf(band) && return nothing
     md = _sky_metadata(post)
-    (hasproperty(md, :base) && md.base isa SRF) || return nothing
-    plan = md.base.plan
+    (hasproperty(md, :base) && md.base isa StationaryBase) || return nothing
     view = Comrade.CoordinateView(post, PT.StdNormal())
     n = dimension(view.tbase)
     θ = Comrade.transform(view.tbase, zeros(n))
-    # `plan.kx` is π × the DFT frequency in cycles per pixel
-    pix = abs(step(md.grid.X))
-    kmag = hypot.(plan.kx, plan.ky') ./ (π * pix)
-    umax = maximum(d -> maximum(hypot.(Comrade.datatable(d).baseline.U, Comrade.datatable(d).baseline.V)), post.data)
+    kb = _field_wavenumbers(post)
     drop = Int[]
     for X in _scaled_fields(θ.sky)
-        size(θ.sky[X]) == size(kmag) || continue
+        size(θ.sky[X]) == size(kb) || continue
         c = Comrade.coords(view, _white_field(view, X))
-        append!(drop, c[vec(kmag .> band * umax)])
+        append!(drop, c[vec(kb .> band)])
     end
     isempty(drop) && return nothing
     return setdiff(1:n, drop)
+end
+
+"""
+    gauss_newton_prior(post::VLBIPosterior)
+
+The `prior` argument of `Comrade.GaussNewtonLowRank` for `post`: `nothing` when the
+StdNormal latent prior of `post` is exactly N(0, I), and otherwise a function of a latent
+point `x` returning `(; d, A, B)`.
+
+With partially centered field-`a` coefficients `w` ([`PartiallyCenteredSRF`](@ref)), the
+prior Gauss–Newton residuals are `w ⊘ s` together with the other latent coordinates, where
+the scale `s` depends on the latent coordinates `u` of `σa` and `ρa`. Then `d` is `s` on the
+coordinates of `w` and 1 elsewhere, `B` holds one unit column per coordinate of `u`, and the
+matching column of `A` is `-(w ⊘ s) ⊙ ∂ log s / ∂u` on the coordinates of `w` (central
+differences in `u`).
+"""
+function gauss_newton_prior(post::VLBIPosterior)
+    md = _sky_metadata(post)
+    (hasproperty(md, :base) && md.base isa PartiallyCenteredSRF) || return nothing
+    base = md.base
+    view = Comrade.CoordinateView(post, PT.StdNormal())
+    tb = view.tbase
+    n = dimension(tb)
+    ia = Comrade.coords(view, _white_field(view, :a))
+    hyper = vcat(Comrade.coords(view, (:sky, :σa)), Comrade.coords(view, (:sky, :ρa)))
+    m = length(hyper)
+    function logscale(x)
+        sky = Comrade.transform(tb, x).sky
+        rf = StationaryRandomField(field_spectrum(base.ps, sky.ρa), base.plan)
+        return vec(log.(_pc_scale(base.pcenter, rf, sky.σa, sky.a)))
+    end
+    return function (x)
+        length(x) == n || throw(DimensionMismatch("latent point has length $(length(x)), expected $n"))
+        ls = logscale(x)
+        z = x[ia] .* exp.(-ls)
+        d = ones(n)
+        d[ia] .= exp.(ls)
+        A = zeros(n, m)
+        B = zeros(n, m)
+        δ = 1.0e-4
+        for (j, h) in pairs(hyper)
+            xp = copy(x); xp[h] += δ
+            xm = copy(x); xm[h] -= δ
+            A[ia, j] .= .-z .* (logscale(xp) .- logscale(xm)) ./ (2δ)
+            B[h, j] = 1
+        end
+        return (; d, A, B)
+    end
 end

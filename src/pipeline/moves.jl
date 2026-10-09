@@ -38,7 +38,7 @@ end
 
 function _srf_base(post, kind)
     md = _sky_metadata(post)
-    (hasproperty(md, :base) && md.base isa SRF) ||
+    (hasproperty(md, :base) && md.base isa StationaryBase) ||
         error("move \"$kind\" needs a stationary random-field sky model (Markov RF, order < 0, or Matérn, order = 0)")
     return md.base
 end
@@ -64,6 +64,31 @@ function _white_field(view, field)
 end
 
 _space_label(view) = isnothing(Comrade.space(view)) ? "flat" : "StdNormal"
+
+# Wavenumber magnitude of each white coefficient of a stationary random sky field (its
+# Fourier mode), in units of the longest baseline of the data.
+function _field_wavenumbers(post)
+    md = _sky_metadata(post)
+    plan = md.base.plan
+    # `plan.kx` is π × the DFT frequency in cycles per pixel
+    pix = abs(step(md.grid.X))
+    umax = maximum(d -> maximum(hypot.(Comrade.datatable(d).baseline.U, Comrade.datatable(d).baseline.V)), post.data)
+    return hypot.(plan.kx, plan.ky') ./ (π * pix * umax)
+end
+
+# 1.0 at the white coefficients of field `f` that a field move compensates, 0.0 elsewhere:
+# every coefficient for `band = Inf`, else those with wavenumber at most `band` times the
+# longest baseline.
+function _band_mask(post, θ, f, band, kind)
+    isinf(band) && return ones(size(θ.sky[f]))
+    _srf_base(post, kind)
+    kb = _field_wavenumbers(post)
+    size(kb) == size(θ.sky[f]) ||
+        error("move \"$kind\": field $f is not on the random-field plan grid $(size(kb))")
+    m = Float64.(kb .<= band)
+    any(isone, m) || error("move \"$kind\": band_limit = $band keeps no coefficient of field $f")
+    return m
+end
 
 function _selected(spec::MoveSpec, available, what)
     isnothing(spec.params) && return available
@@ -110,11 +135,17 @@ end
 """
     _field_scale_moves(post, view, θ, spec)
 
-`"field_scale"` moves: trade each non-centered sky field `X` against its scale `σX`: the latent coordinate of `σX`
-moves by `u` and `X → X · σX / σX′`. The image depends on `σX .* X` only, so the likelihood
-is unchanged, and `log|det ∂x′/∂x| = n log(σX / σX′)` with `n = length(X)`. The default
-initial scale, `2.4 / √(2n)`, is the usual random-walk scale for the scale step's
-conditional width near `1/√(2n)`.
+`"field_scale"` moves: trade each non-centered sky field `X` against its scale `σX`: the
+latent coordinate of `σX` moves by `u` and each compensated coefficient `X_k → X_k · σX / σX′`,
+with `log|det ∂x′/∂x| = n_c log(σX / σX′)` for `n_c` compensated coefficients.
+
+With `spec.band_limit = Inf` every coefficient is compensated; the image depends on `σX .* X`
+only, so the likelihood is unchanged and the move is accepted on the prior alone. A finite
+`band_limit` (stationary random fields only) compensates only the coefficients with
+wavenumber up to `band_limit` times the longest baseline. The rest keep their values, so the
+image changes at those wavenumbers and the move is accepted on the full posterior; in exchange
+the scale's conditional width given the coefficients is near `1/√(2n_c)` instead of
+`1/√(2n)`. The default initial scale is `2.4 / √(2n_c)`.
 """
 function _field_scale_moves(post, view, θ, spec)
     fields = _selected(spec, _scaled_fields(θ.sky), "non-centered sky fields")
@@ -125,12 +156,17 @@ function _field_scale_moves(post, view, θ, spec)
     return map(fields) do f
         path = _white_field(view, f)
         spath = (:sky, Symbol(:σ, f))
-        ratio(x, x′, ctx) = Comrade.value(ctx.view, x, spath) / Comrade.value(ctx.view, x′, spath)
-        n = length(Comrade.coords(view, path))
+        logratio(x, x′, ctx) = log(Comrade.value(ctx.view, x, spath) / Comrade.value(ctx.view, x′, spath))
+        mask = _band_mask(post, θ, f, spec.band_limit, "field_scale")
+        key = Symbol(:field_scale_mask_, f)
+        nc = sum(mask)
         Comrade.CompensatedMove(
-            "field_scale[$f]", view, spath, path, (vX, x, x′, ctx) -> vX .* ratio(x, x′, ctx);
-            logdet = (vX, x, x′, ctx) -> n * log(ratio(x, x′, ctx)),
-            initial_scale = something(spec.initial_scale, 2.4 / sqrt(2n)), traceable = true
+            "field_scale[$f]", view, spath, path,
+            (vX, x, x′, ctx) -> vX .* exp.(_reshaped(vX, getfield(ctx, key)) .* logratio(x, x′, ctx));
+            logdet = (vX, x, x′, ctx) -> nc * logratio(x, x′, ctx),
+            initial_scale = something(spec.initial_scale, 2.4 / sqrt(2nc)),
+            invariant = isinf(spec.band_limit), context = NamedTuple{(key,)}((mask,)),
+            traceable = true
         )
     end
 end
@@ -140,11 +176,16 @@ end
 
 `"rho_field"` moves: trade one spectral parameter `ρₙ` of a stationary random field `X` (a
 Markov RF correlation length, or the Matérn outer scale `ℓ = ρ₁` or slope `α = ρ₂`) against its
-white coefficients: the latent coordinate of `ρₙ` moves by `u` and every coefficient is multiplied
-by `A_k(ρ) rtnrm(ρ) / (A_k(ρ′) rtnrm(ρ′))`, the ratio of the factors `genfield` applies to
-it, so the field and the likelihood are unchanged.
-`log|det ∂x′/∂x| = Σ_k log(A_k(ρ) rtnrm(ρ)) − log(A_k(ρ′) rtnrm(ρ′))`. Each term of each
-field is its own move.
+white coefficients: the latent coordinate of `ρₙ` moves by `u` and each compensated
+coefficient is multiplied by `A_k(ρ) rtnrm(ρ) / (A_k(ρ′) rtnrm(ρ′))`, the ratio of the
+factors `genfield` applies to it, with
+`log|det ∂x′/∂x| = Σ_k log(A_k(ρ) rtnrm(ρ)) − log(A_k(ρ′) rtnrm(ρ′))` over the compensated
+coefficients. Each term of each field is its own move.
+
+With `spec.band_limit = Inf` every coefficient is compensated, so the field and the
+likelihood are unchanged and the move is accepted on the prior alone. A finite `band_limit`
+compensates only the coefficients with wavenumber up to `band_limit` times the longest
+baseline and is accepted on the full posterior, as for `"field_scale"`.
 """
 function _rho_field_moves(post, view, θ, spec)
     base = _srf_base(post, "rho_field")
@@ -163,12 +204,16 @@ function _rho_field_moves(post, view, θ, spec)
         length(Comrade.coords(view, rpath)) == nterms ||
             error("the spectral parameters ρ$f do not have one latent coordinate each")
         la(x, ctx) = _log_amplitude(base.ps, Comrade.value(ctx.view, x, rpath), ctx.k2, dk)
+        mask = _band_mask(post, θ, f, spec.band_limit, "rho_field")
+        key = Symbol(:rho_field_mask_, f)
+        dla(x, x′, ctx) = getfield(ctx, key) .* (la(x, ctx) .- la(x′, ctx))
         map(1:nterms) do n
             Comrade.CompensatedMove(
                 "rho_field[$f,$n]", view, rpath, path,
-                (vX, x, x′, ctx) -> vX .* _reshaped(vX, exp.(la(x, ctx) .- la(x′, ctx)));
-                index = n, logdet = (vX, x, x′, ctx) -> sum(la(x, ctx)) - sum(la(x′, ctx)),
-                initial_scale = something(spec.initial_scale, 0.05), context = (; k2),
+                (vX, x, x′, ctx) -> vX .* _reshaped(vX, exp.(dla(x, x′, ctx)));
+                index = n, logdet = (vX, x, x′, ctx) -> sum(dla(x, x′, ctx)),
+                initial_scale = something(spec.initial_scale, 0.05),
+                invariant = isinf(spec.band_limit), context = merge((; k2), NamedTuple{(key,)}((mask,))),
                 traceable = true
             )
         end

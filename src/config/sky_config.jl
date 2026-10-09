@@ -186,7 +186,8 @@ end
     build_sky_config(cfg::AbstractDict; beam=nothing) -> (SkyModel, imgdata)
 
 Construct the `SkyModel` and (optional) centroid-regularizer image data from a parsed
-image/sky TOML. `imgdata` is `nothing` unless `model.creg = true`.
+image/sky TOML. `imgdata` is `nothing` unless `model.creg = true` or `model.partial_centering`
+is set.
 
 `beam` is the observation's nominal resolution in radians (`beamsize(dcoh)`); the driver
 passes it so the random-field correlation length and the mean-Gaussian width are set from the
@@ -209,6 +210,12 @@ mechanisms use, `1` (the center of light) by default. `p = 2` follows the bright
 structure and barely responds to faint diffuse flux. The power reaches the model only through
 re-centering or the centroid regularizer, so setting it while neither is in effect is an error.
 
+`model.partial_centering` is the path of a serialized `(λ, ref)` named tuple of
+`nx × ny` arrays that partially centers the field-`a` coefficients of a PolExp model with a
+stationary random-field base (see [`PartialCentering`](@ref)); its density correction joins
+`imgdata` as a `Comrade.ParamLogDensity`. Moves that rescale field `a` are not invariant
+under it.
+
 `[overrides]` replaces individual sky-prior entries by name (see [`apply_sky_overrides`](@ref)
 for the matching rules). A value is a distribution spec table (`{ dist = "Normal", args =
 [...] }`, parsed by [`parse_dist`](@ref)) for a scalar prior entry (`σa`, ...), or an array of
@@ -226,7 +233,7 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
         model,
         (
             "polrep", "order", "addgauss", "creg", "center", "center_power",
-            "beamsize_beams", "beamsize", "pulse", "rho_prior",
+            "beamsize_beams", "beamsize", "pulse", "rho_prior", "partial_centering",
         ),
         "[model]"
     )
@@ -328,6 +335,23 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
         imgdata = nothing
     end
 
+    # Partial centering of field a: a serialized `(λ, ref)` named tuple, one entry per
+    # coefficient of the field (see `PartialCentering`).
+    pcenter = nothing
+    if haskey(model, "partial_centering")
+        (polrep isa PolExp && issrf) || error(
+            "[model] partial_centering applies to field a of a PolExp model with a stationary " *
+                "random-field base (order <= 0), not polrep $(typeof(polrep)) with $base"
+        )
+        pcfile = String(model["partial_centering"])
+        pcnt = deserialize(pcfile)
+        pcenter = PartialCentering(pcnt.λ, pcnt.ref)
+        size(pcenter.λ) == (nx, ny) || throw(
+            DimensionMismatch("partial_centering arrays in $pcfile are $(size(pcenter.λ)), the grid is $((nx, ny))")
+        )
+        @info "Partially centering field a from $pcfile (mean λ = $(round(sum(pcenter.λ) / length(pcenter.λ), digits = 3)))"
+    end
+
     if haskey(model, "center_power") && !docenter && !creg
         error(
             "[model] center_power sets the intensity weighting of the centroid the image " *
@@ -344,8 +368,14 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
             gaussprior = gaussp, center = Val(docenter), center_power = cpower, pulse
         )
     elseif issrf
+        pbase = prepare_base(base, g, order)
+        if !isnothing(pcenter)
+            pbase = PartiallyCenteredSRF(pbase.ps, pbase.plan, pcenter)
+            pcterm = partial_centering_logdensity(pbase)
+            imgdata = isnothing(imgdata) ? (pcterm,) : (imgdata..., pcterm)
+        end
         ctor(
-            g; base = prepare_base(base, g, order), meanmodel = mmodel, ftot = ftotpr,
+            g; base = pbase, meanmodel = mmodel, ftot = ftotpr,
             beamsize = corr_beam, gaussprior = gaussp, center = Val(docenter),
             center_power = cpower, pulse, rhoprior
         )

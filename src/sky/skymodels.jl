@@ -442,7 +442,8 @@ end
     gauss ~ gaussprior
     mimg = make_mean(meanmodel, grid, mean)
     f = _get_ftot(ftot, flux)
-    δa = genfield(StationaryRandomField(field_spectrum(base.ps, ρa), base.plan), a)
+    rfa = StationaryRandomField(field_spectrum(base.ps, ρa), base.plan)
+    δa = genfield(rfa, _std_coefficients(base, rfa, σa, a))
     δb = genfield(StationaryRandomField(field_spectrum(base.ps, ρb), base.plan), b)
     δc = genfield(StationaryRandomField(field_spectrum(base.ps, ρc), base.plan), c)
     δd = genfield(StationaryRandomField(field_spectrum(base.ps, ρd), base.plan), d)
@@ -453,6 +454,66 @@ end
     pmap = make_pol2expimage(_img_flux(f, gauss), δa, δb, δc, δd, mimg)
     ms = _center_model(pmap, center, pulse, center_power)
     return _add_gauss(ms, f, gauss)
+end
+
+# --- partial centering of a stationary random field --------------------------------------
+
+"""
+    PartialCentering(λ, ref)
+
+Partial centering of the coefficients of a stationary random field `σ ⋅ genfield(rf, z)`,
+`z ~ N(0, I)`. The sampled coefficients are `w = s ⊙ z` with per-coefficient scale
+`s = (r / ref) .^ λ`, where `r = σ ⋅ A(ρ)` is the field's coefficient amplitude at the current
+scale `σ` and spectral parameters `ρ`. `λ = 0` keeps a coefficient non-centered (`w = z`);
+`λ = 1` centers it, so the field depends on `w` through the fixed amplitude `ref` alone. At
+`r = ref` the two parameterizations coincide.
+
+The sky prior still assigns `w` a standard-normal density; [`partial_centering_logdensity`](@ref)
+supplies the difference to the density `w` actually has.
+"""
+struct PartialCentering{L, R}
+    λ::L
+    ref::R
+    function PartialCentering(λ::AbstractArray, ref::AbstractArray)
+        size(λ) == size(ref) ||
+            throw(DimensionMismatch("λ and ref must have the same size: $(size(λ)) vs $(size(ref))"))
+        all(x -> 0 <= x <= 1, λ) || throw(ArgumentError("every λ must lie in [0, 1]"))
+        all(>(0), ref) || throw(ArgumentError("every ref amplitude must be positive"))
+        return new{typeof(λ), typeof(ref)}(λ, ref)
+    end
+end
+
+# Coefficient amplitudes σ ⋅ A(ρ) of `σ ⋅ genfield(rf, z)`, with the normalization `genfield` uses.
+function field_amplitude(rf::StationaryRandomField, σ, like)
+    ns = similar(like, complex(eltype(like)))
+    VLBIImagePriors.ampspectrum!(Comrade.ComradeBase.executor(rf.plan), ns, rf.ps, (rf.plan.kx, rf.plan.ky), one.(like))
+    return σ .* real.(ns)
+end
+
+_pc_scale(pc::PartialCentering, rf, σ, w) = (field_amplitude(rf, σ, w) ./ pc.ref) .^ pc.λ
+
+# The standard-normal field-`a` coefficients `genfield` takes, from the sampled ones.
+_std_coefficients(::SRF, rf, σ, w) = w
+_std_coefficients(base::PartiallyCenteredSRF, rf, σ, w) = w ./ _pc_scale(base.pcenter, rf, σ, w)
+
+"""
+    partial_centering_logdensity(base::PartiallyCenteredSRF)
+
+The log-density term (a `Comrade.ParamLogDensity`) that turns the standard-normal prior the sky
+model assigns to the field-`a` coefficients `w` into their density under `base.pcenter`:
+`log N(w ⊘ s; 0, I) - Σ log s - log N(w; 0, I)`.
+"""
+partial_centering_logdensity(base::PartiallyCenteredSRF) = Comrade.ParamLogDensity(_PCLogDensity(base))
+
+struct _PCLogDensity{B}
+    base::B
+end
+
+function (t::_PCLogDensity)(θ)
+    (; a, σa, ρa) = θ.sky
+    rf = StationaryRandomField(field_spectrum(t.base.ps, ρa), t.base.plan)
+    s = _pc_scale(t.base.pcenter, rf, σa, a)
+    return sum(@. (abs2(a) - abs2(a / s)) / 2 - log(s))
 end
 
 # =========================================================================================

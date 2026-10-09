@@ -17,6 +17,7 @@ Base.@kwdef struct MoveSpec
     rounds::Int = 1
     target_accept::Float64 = 0.45
     initial_scale::Union{Nothing, Float64} = nothing
+    band_limit::Float64 = Inf
 end
 
 """
@@ -90,12 +91,15 @@ Base.@kwdef struct FittingStrategy
     # scores) or "gauss_newton" (`Comrade.GaussNewtonLowRank`, from the likelihood's
     # Gauss–Newton curvature at the warmup draws; "stdnormal" space, Reactant only). For
     # "gauss_newton", `precond_rank` is the most directions a fit keeps, `precond_threshold`
-    # the smallest curvature eigenvalue kept, `precond_oversample` the extra probe columns,
+    # the smallest curvature eigenvalue kept, `precond_max_eigenvalue` the largest one a
+    # direction is whitened for (stiffer directions are whitened as if at it),
+    # `precond_oversample` the extra probe columns,
     # `precond_probes_per_draw` the probe columns applied per warmup draw (0 = all), and
     # `precond_band_limit` the highest wavenumber of a stationary random sky field's white
     # coefficients the directions may use, in multiples of the longest baseline (Inf = all).
     precond_refit_kind::String = "fisher"
     precond_threshold::Float64 = 100.0
+    precond_max_eigenvalue::Float64 = Inf
     precond_oversample::Int = 10
     precond_probes_per_draw::Int = 0
     precond_band_limit::Float64 = 3.0
@@ -151,9 +155,10 @@ params = ["fwhm"]     # optional: a subset of the parameters the kind acts on
 rounds = 10           # optional: proposals of each move per call (default 1)
 target_accept = 0.45  # optional: warmup acceptance target (default 0.45)
 initial_scale = 0.01  # optional: initial random-walk step scale (default per kind)
+band_limit = 3.0      # optional, field_scale and rho_field only (default inf), see below
 ```
 
-The kinds, all of which leave the likelihood unchanged:
+The kinds, all of which leave the likelihood unchanged unless `band_limit` is finite:
 
   - `"flux_gain"`: total flux against a common shift of the gain log-amplitudes, `lg1μ` when
     the gain scheme has it and the `lg1` chain otherwise (no `params`);
@@ -161,6 +166,10 @@ The kinds, all of which leave the likelihood unchanged:
   - `"rho_field"`: each spectral parameter of each stationary random field (Markov RF
     correlation lengths, Matérn outer scale and slope) against the field's white
     coefficients (`params`: fields);
+    for these two kinds a finite `band_limit` compensates only the white coefficients with
+    wavenumber up to `band_limit` times the longest baseline (stationary random fields
+    only); the image then changes at higher wavenumbers and the move is accepted on the
+    full posterior;
   - `"mean_field"`: each mean-model parameter against the log-intensity field `a` (PolExp
     stationary random-field models; `params`: mean-model parameters);
   - `"phase_sheet"`: a `±2π` shift of a real-line Gauss–Markov phase chain from a point on
@@ -210,7 +219,8 @@ function build_fitting_config(cfg::AbstractDict)
         (
             "pilot", "rank", "nsamples", "discard", "augment",
             "refit_at", "refit_schedule", "refit_carry", "seed_transport",
-            "refit_kind", "threshold", "oversample", "probes_per_draw", "band_limit",
+            "refit_kind", "threshold", "max_eigenvalue", "oversample", "probes_per_draw",
+            "band_limit",
         ),
         "[precondition]"
     )
@@ -257,7 +267,7 @@ function build_fitting_config(cfg::AbstractDict)
     refit_kind = get(prec, "refit_kind", "fisher")
     refit_kind in ("fisher", "gauss_newton") ||
         error("precondition.refit_kind must be \"fisher\" or \"gauss_newton\", got $(repr(refit_kind))")
-    gn_keys = filter(k -> haskey(prec, k), ["threshold", "oversample", "probes_per_draw", "band_limit"])
+    gn_keys = filter(k -> haskey(prec, k), ["threshold", "max_eigenvalue", "oversample", "probes_per_draw", "band_limit"])
     band_limit = get(prec, "band_limit", 3.0)
     (band_limit isa Real && band_limit > 0) ||
         error("precondition.band_limit must be a positive multiple of the longest baseline (inf for no limit), got $(repr(band_limit))")
@@ -306,6 +316,7 @@ function build_fitting_config(cfg::AbstractDict)
         precond_refit_carry = refit_carry,
         precond_refit_kind = refit_kind,
         precond_threshold = Float64(get(prec, "threshold", 100.0)),
+        precond_max_eigenvalue = Float64(get(prec, "max_eigenvalue", Inf)),
         precond_oversample = Int(get(prec, "oversample", 10)),
         precond_probes_per_draw = Int(get(prec, "probes_per_draw", 0)),
         precond_band_limit = Float64(band_limit),
@@ -323,7 +334,7 @@ end
 # The `space` argument of `Comrade.maybe_transport` for a strategy: `nothing` is the flat space.
 latent_space(strategy::FittingStrategy) = strategy.latent_space == "stdnormal" ? PT.StdNormal() : nothing
 
-const _MOVE_KEYS = ("kind", "params", "rounds", "target_accept", "initial_scale")
+const _MOVE_KEYS = ("kind", "params", "rounds", "target_accept", "initial_scale", "band_limit")
 
 function _parse_move_specs(tables, latent_space)
     (tables isa AbstractVector && all(t -> t isa AbstractDict, tables)) || error(
@@ -350,6 +361,12 @@ function _parse_move_specs(tables, latent_space)
         (kind == "phase_sheet" && !isnothing(initial_scale)) &&
             error("$where_: phase_sheet takes discrete ±2π steps and has no initial_scale")
         (kind == "flux_gain" && !isnothing(params)) && error("$where_: flux_gain takes no params")
+        band_limit = get(t, "band_limit", Inf)
+        (band_limit isa Real && band_limit > 0) || error(
+            "$where_: band_limit must be a positive multiple of the longest baseline (inf for no limit), got $(repr(band_limit))"
+        )
+        (isfinite(band_limit) && !(kind in ("field_scale", "rho_field"))) &&
+            error("$where_: band_limit applies only to field_scale and rho_field")
         (kind == "phase_sheet" && latent_space != "stdnormal") && error(
             "$where_: phase_sheet needs run.latent_space = \"stdnormal\" (the flat space's wrapped chains have no sheets)"
         )
@@ -360,6 +377,7 @@ function _parse_move_specs(tables, latent_space)
             kind = String(kind), params = isnothing(params) ? nothing : String.(params),
             rounds = Int(rounds), target_accept = Float64(target_accept),
             initial_scale = isnothing(initial_scale) ? nothing : Float64(initial_scale),
+            band_limit = Float64(band_limit),
         )
     end
     for kind in unique(s.kind for s in specs)
