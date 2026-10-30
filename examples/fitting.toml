@@ -22,6 +22,12 @@ step_size = 0.01
 target_accept = 0.9   # AdvancedHMC only, like init_buffer and term_buffer
 init_buffer = 200
 term_buffer = 500
+# algorithm = "mclmc"   # KineticSamplers MCLMC (needs run.use_reactant and
+#                        # run.latent_space = "stdnormal"): nadapt is warmup gradients per
+#                        # chain, nsample draws per chain, one per chunk_size steps; drop
+#                        # step_size and max_tree_depth
+# chains = 4             # MCLMC only
+# max_step_halvings = 3  # MCLMC only
 # reactant-only knobs:
 max_tree_depth = 10
 chunk_size = 100

@@ -564,13 +564,13 @@ function comrade_imager(
         nsheet > 0 && @info "Re-wrapped $nsheet phase-chain step(s) of the start point to their shortest form"
     end
     check_start(post, latent_space(strategy), xopt)
-    if strategy.use_reactant
-        trace, range = _sample_reactant(out, post, xopt, strategy, resume, gimg, imgbase, transport_method, tgrad)
+    chain = if strategy.algorithm == "mclmc"
+        sample_mclmc(out, post, xopt, strategy, rng)
+    elseif strategy.use_reactant
+        load_samples(_sample_reactant(out, post, xopt, strategy, resume, gimg, imgbase, transport_method, tgrad)...)
     else
-        trace, range = _sample_ahmc(out, post, tpost, xopt, strategy, rng, resume, transport_method)
+        load_samples(_sample_ahmc(out, post, tpost, xopt, strategy, rng, resume, transport_method)...)
     end
-
-    chain = load_samples(trace, range)
     nchain = length(Comrade.postsamples(chain))
 
     nres = min(10, nchain)

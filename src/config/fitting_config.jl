@@ -50,6 +50,10 @@ Base.@kwdef struct FittingStrategy
     term_buffer::Int = 500
     max_tree_depth::Int = 10
     chunk_size::Int = 100
+    # "nuts", or "mclmc" for KineticSamplers MCLMC with `chains` chains and a pooled warmup
+    algorithm::String = "nuts"
+    chains::Int = 4
+    max_step_halvings::Int = 3
     # Welford diagonal metric adaptation during warmup (Reactant path). Turn OFF for
     # preconditioned rounds: the metric adapts to marginal variances, which undoes any
     # transform component that trades marginal against conditional width (gradient
@@ -178,8 +182,14 @@ end
     build_fitting_config(cfg::AbstractDict) -> FittingStrategy
 
 Parse a fitting-strategy TOML into a [`FittingStrategy`](@ref). Sections: `[optimizer]`,
-`[tempering]`, `[sampler]` (NUTS tuning), `[run]`. The sampler is always NUTS; the backend
-(AdvancedHMC NUTS vs Reactant NUTS) follows `run.use_reactant`.
+`[tempering]`, `[sampler]`, `[run]`. `sampler.algorithm` is `"nuts"` (default), whose backend
+(AdvancedHMC NUTS vs Reactant NUTS) follows `run.use_reactant`, or `"mclmc"`, which runs
+`sampler.chains` chains of KineticSamplers MCLMC (see [`sample_mclmc`](@ref)) and needs
+`run.use_reactant = true` and `run.latent_space = "stdnormal"`. For MCLMC, `nadapt` is the
+warmup's gradients per chain, `nsample` the draws kept per chain, one per `chunk_size` steps,
+and `max_step_halvings` (default 3) the halvings of a step whose energy error is too large;
+the NUTS settings (`step_size`, `max_tree_depth`, `adapt_mass_matrix`, `diagonal`,
+`[precondition]`, run checkpoints) are errors with it.
 
 `[optimizer] fix_scales` lists scalar sky parameters (e.g. `["σb", "σc", "σd"]`) that every
 optimization stage holds at the median of their prior; the other parameters are optimized
@@ -227,8 +237,9 @@ The kinds, all of which leave the likelihood unchanged unless `band_limit` is fi
 
 A kind may appear more than once only with disjoint `params`. Moves need the Reactant sampler
 (`use_reactant = true`). Unknown kinds and keys are errors, as are the list form
-`moves = [...]` and `moves_per_chunk`. The moves run once per sampler chunk (`chunk_size`, or
-`sample_checkpoint` when set).
+`moves = [...]` and `moves_per_chunk`. With NUTS the moves run once per sampler chunk
+(`chunk_size`, or `sample_checkpoint` when set); with MCLMC on every chain once per 50 blocks
+of `chunk_size` steps.
 
 `[run] latent_space` picks the space the optimizer and sampler work in: `"flat"` (default,
 `asflat`) or `"stdnormal"` (the `StdNormal` transport, where the prior is exactly N(0, I);
@@ -257,6 +268,7 @@ function build_fitting_config(cfg::AbstractDict)
             "nsample", "nadapt", "step_size", "target_accept", "init_buffer",
             "term_buffer", "max_tree_depth", "chunk_size",
             "adapt_mass_matrix", "diagonal", "moves", "moves_per_chunk",
+            "algorithm", "chains", "max_step_halvings",
         ),
         "[sampler]"
     )
@@ -313,6 +325,35 @@ function build_fitting_config(cfg::AbstractDict)
         error("sampler.diagonal must be \"none\" or \"nutpie\", got $(repr(diagonal))")
     diagonal == "none" || use_reactant ||
         error("sampler.diagonal needs the Reactant sampler (run.use_reactant = true)")
+
+    algorithm = String(get(samp, "algorithm", "nuts"))
+    algorithm in ("nuts", "mclmc") ||
+        error("sampler.algorithm must be \"nuts\" or \"mclmc\", got $(repr(algorithm))")
+    if algorithm == "mclmc"
+        use_reactant || error("sampler.algorithm = \"mclmc\" needs run.use_reactant = true")
+        latent_space == "stdnormal" ||
+            error("sampler.algorithm = \"mclmc\" needs run.latent_space = \"stdnormal\"")
+        nuts_only = filter(
+            k -> haskey(samp, k), ["step_size", "max_tree_depth", "adapt_mass_matrix", "diagonal"]
+        )
+        isempty(nuts_only) || error(
+            "sampler.$(join(nuts_only, ", sampler.")) apply to NUTS only; MCLMC adapts its " *
+                "own step size and mass"
+        )
+        isempty(prec) || error("[precondition] applies to NUTS only; MCLMC adapts its own mass")
+        run_nuts_only = filter(
+            k -> get(run, k, 0) != 0, ["sample_checkpoint", "checkpoint", "warmup_checkpoint"]
+        )
+        isempty(run_nuts_only) ||
+            error("run.$(join(run_nuts_only, ", run.")) apply to NUTS only")
+    else
+        mclmc_only = filter(k -> haskey(samp, k), ["chains", "max_step_halvings"])
+        isempty(mclmc_only) || error(
+            "sampler.$(join(mclmc_only, ", sampler.")) apply to sampler.algorithm = \"mclmc\" only"
+        )
+    end
+    chains = Int(get(samp, "chains", 4))
+    chains >= 1 || error("sampler.chains must be at least 1, got $chains")
 
     pilotval = get(prec, "pilot", "")
     precond_pilot = (pilotval == "") ? nothing : String(pilotval)
@@ -395,6 +436,9 @@ function build_fitting_config(cfg::AbstractDict)
         adapt_mass_matrix = Bool(get(samp, "adapt_mass_matrix", true)),
         diagonal,
         moves,
+        algorithm,
+        chains,
+        max_step_halvings = Int(get(samp, "max_step_halvings", 3)),
         precond_pilot = precond_pilot,
         precond_rank = Int(get(prec, "rank", 16)),
         precond_nsamples = Int(get(prec, "nsamples", 2000)),

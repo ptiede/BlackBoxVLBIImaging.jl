@@ -23,6 +23,8 @@ using OptimizationOptimisers: Adam, AdamW
 using OptimizationOptimJL: LBFGS
 import Optimisers
 using LogDensityProblems
+import ADTypes
+import KineticSamplers
 using FillArrays
 import ProbabilityTransports as PT
 import TransformVariables as TV
@@ -71,6 +73,7 @@ include("pipeline/gauss_newton.jl")
 include("pipeline/phase_chains.jl")
 include("pipeline/moves.jl")
 include("pipeline/pnc_moves.jl")
+include("pipeline/mclmc.jl")
 include("pipeline/imager.jl")
 include("pipeline/run.jl")
 

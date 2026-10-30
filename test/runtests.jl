@@ -514,6 +514,26 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws "unknown run.latent_space 'cube'" build_fitting_config(cfg5)
         cfg5["run"]["latent_space"] = "stdnormal"
 
+        mc = deepcopy(cfg5)
+        foreach(k -> delete!(mc["sampler"], k), ("step_size", "max_tree_depth"))
+        @test build_fitting_config(mc).algorithm == "nuts"
+        mc["sampler"]["algorithm"] = "mclmc"
+        smc = build_fitting_config(mc)
+        @test (smc.algorithm, smc.chains, smc.max_step_halvings) == ("mclmc", 4, 3)
+        mc["sampler"]["chains"] = 2
+        mc["sampler"]["max_step_halvings"] = 0
+        @test (build_fitting_config(mc).chains, build_fitting_config(mc).max_step_halvings) == (2, 0)
+        mc["sampler"]["chains"] = 0
+        @test_throws "sampler.chains must be at least 1" build_fitting_config(mc)
+        mc["sampler"]["chains"] = 2
+        @test_throws "apply to NUTS only" build_fitting_config(merge(mc, Dict("sampler" => merge(mc["sampler"], Dict("step_size" => 0.1)))))
+        @test_throws "[precondition] applies to NUTS only" build_fitting_config(merge(mc, Dict("precondition" => Dict{String, Any}("rank" => 10))))
+        @test_throws "needs run.latent_space = \"stdnormal\"" build_fitting_config(merge(mc, Dict("run" => merge(mc["run"], Dict("latent_space" => "flat")))))
+        @test_throws "needs run.use_reactant = true" build_fitting_config(merge(mc, Dict("run" => merge(mc["run"], Dict("use_reactant" => false)))))
+        @test_throws "sampler.algorithm must be" build_fitting_config(merge(mc, Dict("sampler" => merge(mc["sampler"], Dict("algorithm" => "hmc")))))
+        mc["sampler"]["algorithm"] = "nuts"
+        @test_throws "sampler.chains, sampler.max_step_halvings apply to sampler.algorithm = \"mclmc\" only" build_fitting_config(mc)
+
         cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan")
         @test build_fitting_config(cfg5).precond_refit_schedule == "stan"
         @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).carry === :none
