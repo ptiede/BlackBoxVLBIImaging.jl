@@ -70,6 +70,7 @@ include("pipeline/reactant_opt.jl")
 include("pipeline/gauss_newton.jl")
 include("pipeline/phase_chains.jl")
 include("pipeline/moves.jl")
+include("pipeline/pnc_moves.jl")
 include("pipeline/imager.jl")
 include("pipeline/run.jl")
 
@@ -87,7 +88,7 @@ export polexp_gmrf, polexp_ncmrf, polexp_srf
 export sky_constructor, genmeanprior, gengaussprior, apply_sky_overrides
 export Poincare, PolExp, TotalIntensity, Matern, MarkovRF, NonCenteredMRF
 export UniformRhoPrior, LogNormalRhoPrior, markov_rho_prior, spectrum_prior, MaternSlopePS
-export GaussMean, DblRingMean, DblRingWBkgd, TBlobMean, JetGauss, GaussBkgdMean, MimgPlusBkg
+export GaussMean, DblRingMean, DblRingWBkgd, TBlobMean, AnisotropicPowerLawMean, JetGauss, GaussBkgdMean, FixedGaussBkgdMean, MimgPlusBkg
 # data layer
 export read_flagtable, parse_flagtable, apply_flagtable, corr_polbasis
 export read_dlist, read_array_table, build_data_uvfits, build_data_dlist, conjugate_data

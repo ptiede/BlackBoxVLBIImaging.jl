@@ -127,9 +127,11 @@ function _build_array_prior(pcfg::AbstractDict, name::AbstractString)
 end
 
 """
-    assemble_instrument(cfg::AbstractDict) -> InstrumentModel
+    assemble_instrument(cfg::AbstractDict) -> AbstractInstrumentModel
 
-Build a Comrade `InstrumentModel` from a parsed instrument TOML. `cfg` must contain a
+Build a Comrade `InstrumentModel` from a parsed instrument TOML; a gain scheme with a
+self-calibrated station phase (`gain_selfcal`) gives a model with `selfcal = true`. `cfg`
+must contain a
 `[gain]` section with a `scheme`, an optional `[leakage]` section, an optional
 `frcal` flag, an optional `gaugefix` (`"error"` or `"pin"`, what to do when the priors
 declared `gauge = "phase"` leave the station phase under-determined), and a `[priors]`
@@ -187,13 +189,14 @@ function assemble_instrument(cfg::AbstractDict)
     @info "Instrument: gain=$gname leakage=$lname frcal=$frcal nparams=$(length(required))"
 
     gm = gctor(; priors = intprior)
-    lctor === nothing &&
-        return InstrumentModel(gm.jones, gm.prior; refbasis = gm.refbasis, gaugefix)
-
-    # Compose the gain and leakage pieces (each an InstrumentModel over its own tilde
-    # parameters) into G*D*R with the feed-rotation term, merging their priors.
-    dm = lctor(; priors = intprior)
-    sw = frcal ? sandwich_withfrcal : sandwich
-    J = JonesSandwich(sw, gm.jones, dm.jones, JonesR(; add_fr = true))
-    return InstrumentModel(J, merge(gm.prior, dm.prior); refbasis = gm.refbasis, gaugefix)
+    return if lctor === nothing
+        InstrumentModel(gm.jones, gm.prior; refbasis = gm.refbasis, gaugefix, selfcal = gm.selfcal)
+    else
+        # Compose the gain and leakage pieces (each an InstrumentModel over its own tilde
+        # parameters) into G*D*R with the feed-rotation term, merging their priors.
+        dm = lctor(; priors = intprior)
+        sw = frcal ? sandwich_withfrcal : sandwich
+        J = JonesSandwich(sw, gm.jones, dm.jones, JonesR(; add_fr = true))
+        InstrumentModel(J, merge(gm.prior, dm.prior); refbasis = gm.refbasis, gaugefix, selfcal = gm.selfcal)
+    end
 end

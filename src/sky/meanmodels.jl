@@ -219,22 +219,61 @@ function genmeanprior(::LyapunovRingJSUMean)
 end
 
 # --- Student-t blob mean ---------------------------------------------------------------
-struct TBlobMean end
+# A `TBlob(ν)` core, I ∝ (1 + r²/ν)^(-(ν+2)/2), whose tail falls as a power law. The tail is
+# sampled as `logη = -log ν`, so logη → -∞ is a Gaussian, and `fwhm` is the core's actual FWHM
+# at every ν. `fwhm0` and `beam` (radians) set the FWHM prior as in `GaussBkgdMean`.
+struct TBlobMean{T}
+    fwhm0::T
+    beam::T
+    TBlobMean(fwhm0, beam) = (p = promote(fwhm0, beam); new{eltype(p)}(p...))
+end
 centerfix(::Type{<:TBlobMean}) = true
 
+# Half-maximum radius of the unit-scale `TBlob(ν)`.
+_tblob_halfwidth(ν) = sqrt(ν * (2^(2 / (ν + 2)) - 1))
+
+# ν from 0.1 to 100; `TBlob`'s normalization overflows past ν ≈ 340.
+_tblob_tail_prior() = VLBIUniform(log(0.01), log(10.0))
+
+function _tblob_core(fwhm, logη)
+    ν = exp(-logη)
+    return modify(TBlob(ν), Stretch(fwhm / (2 * _tblob_halfwidth(ν))))
+end
+
 function make_mean(::TBlobMean, grid, θ)
-    (; fwhm, s) = θ
-    m = modify(TBlob(s), Stretch(fwhm / fwhmfac))
-    mimg = intensitymap(m, grid)
+    mimg = intensitymap(_tblob_core(θ.fwhm, θ.logη), grid)
     pmimg = baseimage(mimg)
     pmimg ./= sum(pmimg)
     return mimg
 end
 
-function genmeanprior(::TBlobMean)
+genmeanprior(p::TBlobMean) = (fwhm = _core_fwhm_prior(p.fwhm0, p.beam), logη = _tblob_tail_prior())
+
+# --- Anisotropic power law -------------------------------------------------------------
+# VLBISkyModels' `AnisotropicPowerLaw` with core radius `rcore` (radians), its n = 1, 2 slope
+# modes (α1, β1, α2, β2) and the taper written as `taper r²/r_t²`, with r_t a quarter of the
+# smaller field of view, normalized to unit flux. log m is linear in every parameter, so its
+# curvature along them does not change across the posterior.
+struct AnisotropicPowerLawMean{T}
+    rcore::T
+    rtaper::T
+end
+AnisotropicPowerLawMean(grid::RectiGrid, rcore) = AnisotropicPowerLawMean(promote(rcore, minimum(fieldofview(grid)) / 4)...)
+
+function make_mean(p::AnisotropicPowerLawMean, grid, θ)
+    (; slope, α1, β1, α2, β2, taper) = θ
+    apl = AnisotropicPowerLaw(slope, (α1, α2), (β1, β2), taper * (p.rcore / p.rtaper)^2)
+    mimg = intensitymap(modify(apl, Stretch(p.rcore)), grid)
+    pmimg = baseimage(mimg)
+    pmimg ./= sum(pmimg)
+    return mimg
+end
+
+function genmeanprior(::AnisotropicPowerLawMean)
+    harmonic = VLBIGaussian(0.0, 0.4)
     return (
-        fwhm = VLBITruncated(VLBIGaussian(μas2rad(50.0), μas2rad(20.0)); lower = μas2rad(10.0), upper = μas2rad(100.0)),
-        s = VLBIUniform(1.0, 10.0),
+        slope = VLBIGaussian(1.0, 0.5), α1 = harmonic, β1 = harmonic, α2 = harmonic, β2 = harmonic,
+        taper = VLBIGaussian(1.0, 0.5),
     )
 end
 
@@ -278,30 +317,48 @@ struct GaussBkgdMean{M, T}
     fwhm0::T
     beam::T
     function GaussBkgdMean(grid::RectiGrid, fwhm0, beam)
-        x0, y0 = phasecenter(grid)
-        fovx, fovy = fieldofview(grid)
-        pa = posang(grid)
-        bkgd = intensitymap(modify(VLBISkyModels.GaussDisk(0.3), Stretch(fovx / 2, fovy / 2), Shift(-x0, -y0), Rotate(pa)), grid)
+        bkgd = _disk_background(grid)
         f0, b = promote(fwhm0, beam)
-        return new{typeof(bkgd), typeof(f0)}(bkgd ./ Comrade.flux(bkgd), f0, b)
+        return new{typeof(bkgd), typeof(f0)}(bkgd, f0, b)
     end
 end
 centerfix(::Type{<:GaussBkgdMean}) = true
 
-function make_mean(p::GaussBkgdMean, grid, θ)
-    (; fwhm, fb) = θ
-    m = modify(Gaussian(), Stretch(fwhm / fwhmfac))
-    mimg = intensitymap(m, grid)
+# The unit-flux disk background of the Gaussian background means, filling the field of view.
+function _disk_background(grid::RectiGrid)
+    x0, y0 = phasecenter(grid)
+    fovx, fovy = fieldofview(grid)
+    pa = posang(grid)
+    bkgd = intensitymap(modify(VLBISkyModels.GaussDisk(0.3), Stretch(fovx / 2, fovy / 2), Shift(-x0, -y0), Rotate(pa)), grid)
+    return bkgd ./ Comrade.flux(bkgd)
+end
+
+function _gauss_bkgd_image(bkgd, grid, fwhm, fb)
+    mimg = intensitymap(modify(Gaussian(), Stretch(fwhm / fwhmfac)), grid)
     pmimg = baseimage(mimg)
     pf = sum(pmimg)
-    pmimg .= pmimg ./ pf * (1 - fb) .+ p.bkgd ./ sum(p.bkgd) * fb
+    pmimg .= pmimg ./ pf * (1 - fb) .+ bkgd ./ sum(bkgd) * fb
     return mimg
 end
 
-function genmeanprior(p::GaussBkgdMean)
-    f0 = p.fwhm0
-    return (
-        fwhm = VLBITruncated(VLBIGaussian(f0, 0.4 * f0); lower = 0.25 * p.beam, upper = 3.0 * f0),
-        fb = VLBITruncated(VLBIExponential(0.25); lower = 0.0, upper = 1.0),
-    )
+make_mean(p::GaussBkgdMean, grid, θ) = _gauss_bkgd_image(p.bkgd, grid, θ.fwhm, θ.fb)
+
+_bkgd_fraction_prior() = VLBITruncated(VLBIExponential(0.25); lower = 0.0, upper = 1.0)
+
+_core_fwhm_prior(fwhm0, beam) = VLBITruncated(VLBIGaussian(fwhm0, 0.4 * fwhm0); lower = 0.25 * beam, upper = 3.0 * fwhm0)
+
+genmeanprior(p::GaussBkgdMean) = (fwhm = _core_fwhm_prior(p.fwhm0, p.beam), fb = _bkgd_fraction_prior())
+
+# --- Gaussian of fixed FWHM blended with a disk background ------------------------------
+# `GaussBkgdMean` with the core FWHM held at `fwhm` (radians); only the background fraction
+# is sampled, with the same prior.
+struct FixedGaussBkgdMean{M, T}
+    bkgd::M
+    fwhm::T
+    FixedGaussBkgdMean(grid::RectiGrid, fwhm) = (b = _disk_background(grid); new{typeof(b), typeof(fwhm)}(b, fwhm))
 end
+centerfix(::Type{<:FixedGaussBkgdMean}) = true
+
+make_mean(p::FixedGaussBkgdMean, grid, θ) = _gauss_bkgd_image(p.bkgd, grid, p.fwhm, θ.fb)
+
+genmeanprior(::FixedGaussBkgdMean) = (fb = _bkgd_fraction_prior(),)

@@ -19,13 +19,12 @@ noise_schedule = [0.05, 0.025, 0.0]
 nsample = 10000   # post-warmup samples to keep (drawn after `nadapt` warmup)
 nadapt = 10000
 step_size = 0.01
-target_accept = 0.9
+target_accept = 0.9   # AdvancedHMC only, like init_buffer and term_buffer
 init_buffer = 200
 term_buffer = 500
 # reactant-only knobs:
 max_tree_depth = 10
 chunk_size = 100
-base_window = 25
 
 # Metropolis–Hastings moves between the Reactant NUTS chunks, one [[sampler.moves]] table
 # per move kind: "flux_gain" (total flux against a common gain amplitude), "field_scale"

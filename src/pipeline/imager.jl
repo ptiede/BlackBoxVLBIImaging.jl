@@ -171,6 +171,19 @@ function _load_start(path)
     return x
 end
 
+# Whether a restart resumes the sampler at `out`: only a sampler that was started there, which
+# records its latent space in `transport.jls`. Samples without that record can be neither
+# resumed nor safely replaced.
+function _resume_sampler(out, restart)
+    restart || return false
+    isfile(joinpath(out, "transport.jls")) && return true
+    samples = joinpath(out, "samples")
+    isdir(samples) && !isempty(readdir(samples)) && error(
+        "cannot restart: $out holds samples but no transport.jls recording the latent space they were drawn in"
+    )
+    return false
+end
+
 function _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart, transport_method)
     integrator = Leapfrog(strategy.step_size)
     metric = DiagEuclideanMetric(dimension(tpost))
@@ -198,7 +211,7 @@ end
 # transform is supplied up front, since diagonal adaptation renormalizes the marginals the
 # transform deliberately set). Gauss–Newton refits need `curvature`, the function
 # `gauss_newton_curvature` builds.
-function _metric_adaptor(strategy::FittingStrategy, curvature = nothing; rows = nothing)
+function _metric_adaptor(strategy::FittingStrategy, curvature = nothing; rows = nothing, basis = nothing)
     sched = if strategy.precond_refit_schedule == "stan"
         :stan
     elseif strategy.precond_refit_schedule == "nutpie"
@@ -210,19 +223,44 @@ function _metric_adaptor(strategy::FittingStrategy, curvature = nothing; rows = 
     end
     isnothing(sched) && return strategy.adapt_mass_matrix ?
         Comrade.WelfordDiagonal() : Comrade.FixedMetric()
-    if strategy.precond_refit_kind == "gauss_newton"
+    if startswith(strategy.precond_refit_kind, "gauss_newton")
         isnothing(curvature) && throw(ArgumentError("Gauss–Newton refits need a curvature function"))
         k = strategy.precond_rank + strategy.precond_oversample
         return Comrade.GaussNewtonLowRank(
             curvature; rank = strategy.precond_rank, oversample = strategy.precond_oversample,
             probes_per_draw = strategy.precond_probes_per_draw == 0 ? k : strategy.precond_probes_per_draw,
-            threshold = strategy.precond_threshold, schedule = sched, rows
+            threshold = strategy.precond_threshold, schedule = sched, rows, basis,
+            residual_at = strategy.precond_residual_at,
+            residual_draws = strategy.precond_residual_draws,
+            residual_steps = strategy.precond_residual_steps,
+            residual_directions = strategy.precond_residual_directions,
+            residual_threshold = strategy.precond_residual_threshold,
+            rescale = strategy.precond_rescale ?
+                Comrade.NutpieDiagonal(; n0 = strategy.precond_rescale_n0, bound = strategy.precond_rescale_bound) :
+                nothing
         )
     end
     return Comrade.FisherLowRank(;
-        rank = strategy.precond_rank, schedule = sched, discard = strategy.precond_discard,
-        carry = Symbol(strategy.precond_refit_carry)
+        rank = strategy.precond_rank, schedule = sched,
+        _given(:discard, strategy.precond_discard)...,
+        carry = Symbol(strategy.precond_refit_carry), _given(:max_wide, strategy.precond_max_wide)...,
+        holdout = strategy.precond_rank_holdout, rank_tol = strategy.precond_rank_tol,
+        _given(:record_every, strategy.precond_record_every)...,
+        fixed = isempty(strategy.precond_fixed_directions) ? nothing : _fixed_directions(strategy),
+        stiff = strategy.precond_stiff_core ? Comrade.StiffCore() : nothing
     )
+end
+
+# A keyword argument when the config set it, so the callee's default applies otherwise.
+_given(key::Symbol, value) = isnothing(value) ? (;) : NamedTuple{(key,)}((value,))
+
+# The fixed directions and standard deviations stored for Fisher refits.
+function _fixed_directions(strategy::FittingStrategy)
+    path = strategy.precond_fixed_directions
+    f = deserialize(path)
+    (f isa NamedTuple && haskey(f, :directions) && haskey(f, :sd)) ||
+        error("precondition.fixed_directions $path must hold a NamedTuple (; directions, sd), got a $(typeof(f))")
+    return (f.directions, f.sd)
 end
 
 # A stored preconditioner to seed warmup from; it must act in the run's latent space.
@@ -269,6 +307,10 @@ function _depth_note(nuts_seconds, nsteps, tgrad; fresh::Bool = false, maxdepth 
         (capped ? ", at the depth cap $maxdepth" : "")
 end
 
+# Output redirected to a file is block-buffered; flushing after each chunk keeps a run's log
+# current with its progress.
+_flush_logs() = (flush(stdout); flush(stderr); nothing)
+
 function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, transport_method, tgrad = nothing)
     @info "Building Reactant device posterior for sampling"
     # Reuse the already-built posterior, just dropping the Enzyme AD mode: `prepare_device`
@@ -276,14 +318,16 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
     # its own gradients. This avoids rebuilding the instrument Jones matrices / FFT plans.
     post_cpu = @set post.admode = nothing
     rpost = Comrade.prepare_device(post_cpu, Comrade.ComradeBase.ReactantEx())
-    curvature = strategy.precond_refit_kind == "gauss_newton" ?
+    curvature = startswith(strategy.precond_refit_kind, "gauss_newton") ?
         gauss_newton_curvature(GaussNewtonKernels(post_cpu, rpost)) : nothing
+    basis = strategy.precond_refit_kind == "gauss_newton_support" ?
+        support_basis(post_cpu, strategy.precond_support_cut) : nothing
     rows = strategy.precond_refit_kind == "gauss_newton" ?
         gauss_newton_rows(post_cpu, strategy.precond_band_limit) : nothing
     isnothing(rows) || @info "Gauss–Newton directions on $(length(rows)) of " *
         "$(dimension(Comrade.transport_to(post_cpu, PT.StdNormal()))) latent coordinates " *
         "(sky-field modes up to $(strategy.precond_band_limit) × the longest baseline)"
-    adaptor = _metric_adaptor(strategy, curvature; rows)
+    adaptor = _metric_adaptor(strategy, curvature; rows, basis)
     moves = isempty(strategy.moves) ? nothing : build_moves(
         post_cpu, strategy.moves, xopt;
         space = latent_space(strategy), output = joinpath(mkpath(out), "moves.jls")
@@ -293,7 +337,8 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
     smplr = Comrade.ReactantNUTS(;
         n_adapts = strategy.nadapt, init_step_size = strategy.step_size,
         max_tree_depth = strategy.max_tree_depth,
-        metric_adaptor = adaptor
+        metric_adaptor = adaptor,
+        diagonal = strategy.diagonal == "nutpie" ? Comrade.NutpieDiagonal() : nothing
     )
 
     # `sample_checkpoint` sets the sampling DiskStore stride (= batch / checkpoint frequency,
@@ -313,12 +358,13 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
                 fresh = info.extras.fresh_kernel, maxdepth = strategy.max_tree_depth
             )
             @info "sampling batch $(info.round)/$(info.nrounds): n_divergences=$ndiv$note (checkpoint saved)"
+            _flush_logs()
             return (; info.round, n_divergences = ndiv)
         end
-        # Warmup now runs in chunks of the same `stride`, and its callback fires after EVERY
-        # chunk (not once, as with the old fused warmup): render the current draw so warmup
-        # progress is watchable, while Comrade checkpoints the adaptation state to disk each
-        # chunk (making warmup itself resumable via `restart`). The warmup `info` carries
+        # Warmup runs in chunks of the same `stride`, and its callback fires after every
+        # chunk: render the current draw so warmup progress is watchable, while Comrade
+        # checkpoints the sampler and adaptation state every `warmup_checkpoint` steps
+        # (making warmup itself resumable via `restart`). The warmup `info` carries
         # `step`/`total` (steps done / n_adapts) plus host-side `step_size`/`params` — NOT the
         # sampling `round`/`nrounds` fields.
         wcb = function (info)
@@ -330,6 +376,7 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
                 fresh = info.fresh_kernel, maxdepth = strategy.max_tree_depth
             )
             @info "warmup $(info.step)/$(info.total): step_size=$(info.step_size)$note (checkpoint saved)"
+            _flush_logs()
             return (; info.step, info.total, info.step_size)
         end
         # nutpie-style init: with in-run refits configured and no pilot transform, one
@@ -350,14 +397,16 @@ function _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, tra
         trace = sample(
             rpost, smplr, strategy.nsample;
             saveto = disk, initial_params = xopt, restart = restart, warmup_callback = wcb,
-            transport_method = transport_method, between_chunks = moves
+            transport_method = transport_method, between_chunks = moves,
+            _given(:checkpoint_every, strategy.warmup_checkpoint)...
         )
     else
         disk = DiskStore(mkpath(out), stride)
         trace = sample(
             rpost, smplr, strategy.nsample;
             saveto = disk, initial_params = xopt, restart = restart,
-            transport_method = transport_method, between_chunks = moves
+            transport_method = transport_method, between_chunks = moves,
+            _given(:checkpoint_every, strategy.warmup_checkpoint)...
         )
     end
     isnothing(moves) || foreach(move_summary(moves)) do m
@@ -414,8 +463,10 @@ save the optimal image + caltables, then sample the posterior (AdvancedHMC or Re
 NUTS per `strategy`) and write posterior FITS draws. Returns the path the run was written
 to.
 
-`restart=true` resumes from a previously serialized optimum at `outbase` instead of
-re-optimizing. It is a one-off run action (not part of `strategy`).
+`restart=true` loads the serialized optimum at `outbase` instead of re-optimizing. Sampling
+resumes from the checkpoint at `outbase` when one was started (it holds `transport.jls`, the
+latent space it runs in) and otherwise starts fresh from the optimum. It is a one-off run action
+(not part of `strategy`).
 """
 function comrade_imager(
         outbase::String, skym, intm, data...;
@@ -454,10 +505,11 @@ function comrade_imager(
     end
 
     # The preconditioner participates in every log-density evaluation, so it is fit
-    # before benchmarking. `sample` persists it to `<out>/transport.jls`; on restart the
-    # stored space wins, so refitting is skipped (a restart with a pilot configured
-    # would otherwise warn and be ignored).
-    transport_method = if restart
+    # before benchmarking. `sample` persists it to `<out>/transport.jls`; a restart that
+    # resumes the sampler reuses that space, so refitting is skipped (a resumed run with a
+    # pilot configured would otherwise warn and be ignored).
+    resume = _resume_sampler(out, restart)
+    transport_method = if resume
         nothing
     elseif !isempty(strategy.precond_seed_transport)
         isnothing(strategy.precond_pilot) ||
@@ -471,7 +523,7 @@ function comrade_imager(
         fit_preconditioner(
             strategy.precond_pilot, post;
             rank = strategy.precond_rank, nsamples = strategy.precond_nsamples,
-            discard = strategy.precond_discard, augment = strategy.precond_augment,
+            _given(:discard, strategy.precond_discard)..., augment = strategy.precond_augment,
             space = latent_space(strategy),
             # tune gradients on the same backend the run samples on
             grad_reactant = strategy.use_reactant
@@ -487,7 +539,8 @@ function comrade_imager(
 
     # ---- optimization / start / restart ----------------------------------------------
     if restart
-        @info "Restarting from $(out)_optimum_allres.jls"
+        @info "Restarting from $(out)_optimum_allres.jls" *
+            (resume ? "" : "; no sampler checkpoint at $out, so sampling starts fresh")
         xopt = deserialize(out * "_optimum_allres.jls")[:xopt]
     elseif !isnothing(strategy.start)
         startx = _load_start(strategy.start)
@@ -495,13 +548,13 @@ function comrade_imager(
         xopt = startx
         save_optimal(imgbase, post, xopt, gimg; label = "start")
         plot_residuals_png(imgbase * "_residuals_map.png", post, xopt)
-        write_caltables(caltabbase, xopt)
+        write_caltables(caltabbase, post, xopt)
         serialize(out * "_optimum_allres.jls", Dict(:xopt => xopt))
     else
         xopt = _optimize_tempered(imgbase, skym, intm, data, imgdata, strategy, opt, rng)
         save_optimal(imgbase, post, xopt, gimg; label = "optimal")
         plot_residuals_png(imgbase * "_residuals_final_map.png", post, xopt)
-        write_caltables(caltabbase, xopt)
+        write_caltables(caltabbase, post, xopt)
         serialize(out * "_optimum_allres.jls", Dict(:xopt => xopt))
     end
 
@@ -512,9 +565,9 @@ function comrade_imager(
     end
     check_start(post, latent_space(strategy), xopt)
     if strategy.use_reactant
-        trace, range = _sample_reactant(out, post, xopt, strategy, restart, gimg, imgbase, transport_method, tgrad)
+        trace, range = _sample_reactant(out, post, xopt, strategy, resume, gimg, imgbase, transport_method, tgrad)
     else
-        trace, range = _sample_ahmc(out, post, tpost, xopt, strategy, rng, restart, transport_method)
+        trace, range = _sample_ahmc(out, post, tpost, xopt, strategy, rng, resume, transport_method)
     end
 
     chain = load_samples(trace, range)

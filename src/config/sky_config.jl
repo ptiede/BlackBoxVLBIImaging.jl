@@ -131,13 +131,19 @@ end
 
 function _build_mean_model(meancfg::AbstractDict, g, beam)
     mtype = String(get(meancfg, "type", "Bkgd"))
+    fixed = Bool(get(meancfg, "fix_fwhm", false))
+    (fixed && mtype != "GaussBkgd") && error("mean.fix_fwhm applies to type = \"GaussBkgd\" only")
     if mtype == "GaussBkgd"
         fwhm0 = _mean_fwhm_rad(meancfg, beam, 50.0)
         # Lower bound of the core-size prior comes from the data beam itself, not the
         # (possibly rescaled) fwhm0; without data, fall back to fwhm0.
         beam0 = isnothing(beam) ? fwhm0 : beam
-        @info "Using a Gaussian background mean for the sky model (core FWHM prior centered at $(round(rad2μas(fwhm0), digits = 1)) μas, lower bound $(round(rad2μas(0.25 * beam0), digits = 1)) μas)"
-        return GaussBkgdMean(g, fwhm0, beam0)
+        if fixed
+            @info "Using a Gaussian background mean for the sky model (core FWHM fixed at $(round(rad2μas(fwhm0), digits = 2)) μas)"
+        else
+            @info "Using a Gaussian background mean for the sky model (core FWHM prior centered at $(round(rad2μas(fwhm0), digits = 1)) μas, lower bound $(round(rad2μas(0.25 * beam0), digits = 1)) μas)"
+        end
+        return fixed ? FixedGaussBkgdMean(g, fwhm0) : GaussBkgdMean(g, fwhm0, beam0)
     elseif mtype == "Bkgd"
         fwhm = _mean_fwhm_rad(meancfg, beam, 50.0)
         @info "Using a background mean for the sky model (Gaussian FWHM = $(round(rad2μas(fwhm), digits = 1)) μas)"
@@ -156,15 +162,21 @@ function _build_mean_model(meancfg::AbstractDict, g, beam)
         @info "Using a Lyapunov double-ring mean (JohnsonSU n=0) for the sky model"
         return LyapunovRingJSUMean()
     elseif mtype == "TBlob"
-        @info "Using a Student-t blob mean for the sky model"
-        return TBlobMean()
+        fwhm0 = _mean_fwhm_rad(meancfg, beam, 50.0)
+        beam0 = isnothing(beam) ? fwhm0 : beam
+        @info "Using a Student-t blob mean for the sky model (core FWHM prior centered at $(round(rad2μas(fwhm0), digits = 1)) μas, lower bound $(round(rad2μas(0.25 * beam0), digits = 1)) μas)"
+        return TBlobMean(fwhm0, beam0)
+    elseif mtype == "AnisotropicPowerLaw"
+        rcore = _mean_fwhm_rad(meancfg, beam, 20.0) / 2
+        @info "Using an anisotropic power-law mean for the sky model (core radius $(round(rad2μas(rcore), digits = 1)) μas)"
+        return AnisotropicPowerLawMean(g, rcore)
     elseif mtype == "JetGauss"
         fwhm = _mean_fwhm_rad(meancfg, beam, 30.0)
         @info "Using a jet+Gaussian mean for the sky model (Gaussian FWHM = $(round(rad2μas(fwhm), digits = 1)) μas)"
         mimg = intensitymap(modify(Gaussian(), Stretch(fwhm / fwhmfac)), g)
         return JetGauss(mimg ./ sum(mimg))
     else
-        error("unknown mean type '$mtype'. Allowed: GaussBkgd, Bkgd, Gauss, Ring, LyapunovRing, LyapunovRingJSU, TBlob, JetGauss")
+        error("unknown mean type '$mtype'. Allowed: GaussBkgd, Bkgd, Gauss, Ring, LyapunovRing, LyapunovRingJSU, TBlob, AnisotropicPowerLaw, JetGauss")
     end
 end
 
@@ -231,7 +243,7 @@ function build_sky_config(cfg::AbstractDict; beam = nothing)
         "[model]"
     )
     check_config_keys(
-        get(cfg, "mean", Dict{String, Any}()), ("type", "fwhm", "fwhm_beams"), "[mean]"
+        get(cfg, "mean", Dict{String, Any}()), ("type", "fwhm", "fwhm_beams", "fix_fwhm"), "[mean]"
     )
     check_config_keys(get(cfg, "flux", Dict{String, Any}()), ("ftot",), "[flux]")
 

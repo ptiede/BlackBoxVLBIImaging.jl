@@ -134,19 +134,30 @@ function save_optimal(out, post, xopt, gimg; label = "optimal")
 end
 
 """
-    write_caltables(out, xopt)
+    write_caltables(out, post, xopt)
 
 Write one CSV (and PNG via the plotting hook) calibration table per instrument quantity in
-`xopt.instrument`. No-op if `xopt` has no instrument component.
+`xopt.instrument`. With a self-calibrated station phase, a further table `selfcal_phase`
+holds the station phase itself: the self-calibration solution plus the fitted residual.
+No-op if `xopt` has no instrument component.
 """
-function write_caltables(out, xopt)
+function write_caltables(out, post, xopt)
     hasproperty(xopt, :instrument) || return nothing
     mkpath(dirname(out))
     for (ki, vi) in pairs(xopt.instrument)
-        gtp = Comrade.caltable(vi)
-        CSV.write(out * "_ctable_$(ki).csv", gtp)
-        plot_caltable_png(out * "_ctable_$(ki).png", gtp)
+        _write_caltable(out * "_ctable_$(ki)", Comrade.caltable(vi))
     end
+    J = Comrade.instrumentmodel(post)
+    if J isa Comrade.ObservedSelfCalInstrumentModel
+        φ = Comrade.selfcal_phase(post, xopt)
+        _write_caltable(out * "_ctable_selfcal_phase", Comrade.caltable(φ))
+    end
+    return nothing
+end
+
+function _write_caltable(base, gtp)
+    CSV.write(base * ".csv", gtp)
+    plot_caltable_png(base * ".png", gtp)
     return nothing
 end
 

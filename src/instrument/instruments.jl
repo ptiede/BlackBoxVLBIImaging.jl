@@ -238,6 +238,24 @@ end
     end
 end
 
+#     gain_selfcal(; priors)
+#
+# `gain_wrappedphase` without the feed-1 phase in the Jones matrix: with `selfcal = true` the
+# instrument model sets each station's feed-1 phase to its self-calibration solution plus the
+# sampled residual `selfcal_residual`.
+@instrument selfcal = true function gain_selfcal(; priors)
+    return @jones begin
+        lg1 ~ priors.lg1       # amplitude: single mean-reverting chain (μ = 0 ⇒ nominal gain)
+        lgratμ ~ priors.lgratμ # ratio amplitude: per-station mean (OU cannot fit its own)
+        lgrat ~ priors.lgrat   # ratio amplitude: residual about that mean
+        gpratμ ~ priors.gpratμ # ratio phase: per-station WRAPPED offset (arbitrary, on circle)
+        gprat ~ priors.gprat   # ratio phase: mean-reverting circular drift about it
+        g1 = complex(exp(lg1))
+        g2 = g1 * exp(complex((lgratμ + lgrat), (gpratμ + gprat)))
+        return JonesG((g1, g2))
+    end
+end
+
 #     gain_offsets(; priors)
 #
 # `gain_offsetphase` with the feed-1 amplitude split the same way as its phase:
@@ -378,6 +396,7 @@ const GAIN_SCHEMES = Dict{String, Any}(
     "gain_wrappedphase" => gain_wrappedphase,
     "gain_offsetphase" => gain_offsetphase,
     "gain_offsets" => gain_offsets,
+    "gain_selfcal" => gain_selfcal,
     "gain_centered" => gain_centered,
     "gain_hier" => gain_hier,
     "gain_noratio" => gain_noratio,

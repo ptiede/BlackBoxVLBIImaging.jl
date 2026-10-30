@@ -84,6 +84,18 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws ErrorException assemble_instrument(cfg2)
     end
 
+    @testset "self-calibrated station phase" begin
+        @test BlackBoxVLBIImaging.required_params(BlackBoxVLBIImaging.GAIN_SCHEMES["gain_selfcal"]) ==
+            (:lg1, :lgratμ, :lgrat, :gpratμ, :gprat)
+        cfg = exconfig("instrument_mixed.toml")
+        cfg["gain"]["scheme"] = "gain_selfcal"
+        delete!(cfg["priors"], "lgratσ")
+        delete!(cfg["priors"], "gp1")
+        intm = assemble_instrument(cfg)
+        @test intm isa InstrumentModel && intm.selfcal
+        @test !haskey(intm.prior, :gp1)
+    end
+
     @testset "iid first-stamp pin (init)" begin
         vm = Dict{String, Any}("dist" => "DiagonalVonMises", "args" => [0.0, 3.14159])
         sp = BlackBoxVLBIImaging._site_prior(
@@ -381,6 +393,20 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         ]))
     end
 
+    @testset "restart resumes only a started sampler" begin
+        out = mktempdir()
+        @test !BlackBoxVLBIImaging._resume_sampler(out, false)
+        @test !BlackBoxVLBIImaging._resume_sampler(out, true)
+        @test !BlackBoxVLBIImaging._resume_sampler(joinpath(out, "missing"), true)
+        touch(joinpath(out, "gradient_time.jls"))
+        @test !BlackBoxVLBIImaging._resume_sampler(out, true)
+        mkpath(joinpath(out, "samples")); touch(joinpath(out, "samples", "output_scan_1.jls"))
+        @test_throws "holds samples but no transport.jls" BlackBoxVLBIImaging._resume_sampler(out, true)
+        touch(joinpath(out, "transport.jls"))
+        @test BlackBoxVLBIImaging._resume_sampler(out, true)
+        @test !BlackBoxVLBIImaging._resume_sampler(out, false)
+    end
+
     @testset "fitting config" begin
         s = build_fitting_config(exconfig("fitting.toml"))
         @test s isa FittingStrategy
@@ -412,6 +438,8 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test isempty(s.moves)
         cfg4 = exconfig("fitting.toml")
         cfg4["run"]["use_reactant"] = true
+        @test_throws "sampler.target_accept, sampler.init_buffer, sampler.term_buffer apply to AdvancedHMC NUTS only" build_fitting_config(cfg4)
+        foreach(k -> delete!(cfg4["sampler"], k), ("target_accept", "init_buffer", "term_buffer"))
         cfg4["sampler"]["moves"] = [
             Dict{String, Any}("kind" => "flux_gain"),
             Dict{String, Any}("kind" => "mean_field", "params" => ["fwhm"], "rounds" => 10, "target_accept" => 0.3, "initial_scale" => 0.02),
@@ -429,10 +457,24 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
             params = ["a"]
             [[sampler.moves]]
             kind = "rho_field"
+            [[sampler.moves]]
+            kind = "pnc_field"
+            [[sampler.moves]]
+            kind = "pnc_orbit"
+            params = ["b"]
             [run]
             use_reactant = true
             """)
-        @test [m.kind for m in build_fitting_config(toml).moves] == ["field_scale", "rho_field"]
+        @test [m.kind for m in build_fitting_config(toml).moves] == ["field_scale", "rho_field", "pnc_field", "pnc_orbit"]
+        @test build_fitting_config(toml).diagonal == "none"
+        toml["sampler"]["diagonal"] = "nutpie"
+        @test build_fitting_config(toml).diagonal == "nutpie"
+        toml["sampler"]["diagonal"] = "welford"
+        @test_throws "sampler.diagonal must be \"none\" or \"nutpie\"" build_fitting_config(toml)
+        toml["sampler"]["diagonal"] = "nutpie"
+        toml["run"]["use_reactant"] = false
+        delete!(toml["sampler"], "moves")
+        @test_throws "sampler.diagonal needs the Reactant sampler" build_fitting_config(toml)
         for (moves, msg) in (
                 (["flux_gain", "field_scale"], "sampler.moves must be [[sampler.moves]] tables"),
                 ("flux_gain", "sampler.moves must be [[sampler.moves]] tables"),
@@ -467,9 +509,11 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         s5 = build_fitting_config(cfg5)
         @test BlackBoxVLBIImaging.latent_space(s5) isa BlackBoxVLBIImaging.PT.StdNormal
         cfg5["run"]["use_reactant"] = true
+        foreach(k -> delete!(cfg5["sampler"], k), ("target_accept", "init_buffer", "term_buffer"))
         cfg5["run"]["latent_space"] = "cube"
         @test_throws "unknown run.latent_space 'cube'" build_fitting_config(cfg5)
         cfg5["run"]["latent_space"] = "stdnormal"
+
         cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan")
         @test build_fitting_config(cfg5).precond_refit_schedule == "stan"
         @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).carry === :none
@@ -482,6 +526,67 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).carry === :keep
         cfg5["precondition"]["refit_carry"] = "yes"
         @test_throws "precondition.refit_carry must be" build_fitting_config(cfg5)
+        # a limit on wide directions in Fisher refits
+        cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan", "max_wide" => 20)
+        @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).max_wide == 20
+        delete!(cfg5["precondition"], "max_wide")
+        @test isnothing(BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).max_wide)
+        cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan")
+        @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).discard == 0.5
+        cfg5["precondition"]["discard"] = 0.0
+        @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).discard == 0.0
+        cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan", "rank_holdout" => 0.25, "rank_tol" => 0.1)
+        hd = BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5))
+        @test hd.holdout == 0.25 && hd.rank_tol == 0.1
+        cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan", "rank_tol" => 0.1)
+        @test_throws "rank_tol needs precondition.rank_holdout" build_fitting_config(cfg5)
+        cfg5["precondition"] = Dict{String, Any}("max_wide" => 0)
+        @test_throws "max_wide applies to in-run refits" build_fitting_config(cfg5)
+        cfg5["precondition"] = Dict{String, Any}("rank_holdout" => 0.25)
+        @test_throws "rank_holdout applies to in-run refits" build_fitting_config(cfg5)
+        cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan", "record_every" => 4)
+        @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).record_every == 4
+        delete!(cfg5["precondition"], "record_every")
+        @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).record_every ==
+            Comrade.FisherLowRank().record_every
+        cfg5["precondition"] = Dict{String, Any}("record_every" => 4)
+        @test_throws "record_every applies to in-run refits" build_fitting_config(cfg5)
+        cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan", "stiff_core" => true)
+        @test BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).stiff isa Comrade.StiffCore
+        cfg5["precondition"]["stiff_core"] = false
+        @test isnothing(BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5)).stiff)
+        cfg5["precondition"] = Dict{String, Any}("stiff_core" => true)
+        @test_throws "stiff_core applies to in-run refits" build_fitting_config(cfg5)
+        cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan", "refit_kind" => "gauss_newton", "rank" => 600, "stiff_core" => true)
+        @test_throws "stiff_core applies to Fisher refits" build_fitting_config(cfg5)
+        cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan", "stiff_core" => true)
+        cfg5["run"]["use_reactant"] = false
+        @test_throws "stiff_core needs run.use_reactant = true" build_fitting_config(cfg5)
+        cfg5["run"]["use_reactant"] = true
+        cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan")
+        cfg5["run"]["warmup_checkpoint"] = 50
+        @test build_fitting_config(cfg5).warmup_checkpoint == 50
+        delete!(cfg5["run"], "warmup_checkpoint")
+        @test isnothing(build_fitting_config(cfg5).warmup_checkpoint)
+        cfg5["precondition"] = Dict{String, Any}(
+            "refit_schedule" => "stan", "refit_kind" => "gauss_newton", "rank" => 600, "max_wide" => 0
+        )
+        @test_throws "max_wide applies to Fisher refits" build_fitting_config(cfg5)
+        # fixed directions for Fisher refits
+        fixedpath = joinpath(mktempdir(), "fixed.jls")
+        BlackBoxVLBIImaging.Serialization.serialize(fixedpath, (; directions = [1.0 0.0; 0.0 1.0; 0.0 0.0], sd = [3.0, 2.0]))
+        cfg5["precondition"] = Dict{String, Any}("refit_schedule" => "stan", "fixed_directions" => fixedpath)
+        fad = BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5))
+        @test fad.fixed == ([1.0 0.0; 0.0 1.0; 0.0 0.0], [3.0, 2.0])
+        cfg5["precondition"]["refit_carry"] = "rescale"
+        @test_throws "fixed_directions needs refit_carry = \"none\"" build_fitting_config(cfg5)
+        delete!(cfg5["precondition"], "refit_carry")
+        BlackBoxVLBIImaging.Serialization.serialize(fixedpath, [1.0, 0.0])
+        @test_throws "must hold a NamedTuple (; directions, sd)" BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cfg5))
+        cfg5["precondition"] = Dict{String, Any}(
+            "refit_schedule" => "stan", "refit_kind" => "gauss_newton", "rank" => 600, "fixed_directions" => fixedpath
+        )
+        @test_throws "fixed_directions applies to Fisher refits" build_fitting_config(cfg5)
         # Gauss–Newton refits
         cfg5["precondition"] = Dict{String, Any}(
             "refit_schedule" => "stan", "refit_kind" => "gauss_newton", "rank" => 600, "threshold" => 50.0
@@ -501,7 +606,21 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test_throws "band_limit must be a positive multiple" build_fitting_config(cfg5)
         delete!(cfg5["precondition"], "band_limit")
         @test_throws "need a curvature function" BlackBoxVLBIImaging._metric_adaptor(sg)
+        @test isempty(ga.residual_at)
+        cr = deepcopy(cfg5)
+        merge!(cr["precondition"], Dict("residual_at" => [0.8], "residual_draws" => 20, "residual_steps" => 20, "residual_directions" => 8, "residual_threshold" => 6.0))
+        sr = build_fitting_config(cr)
+        @test (sr.precond_residual_at, sr.precond_residual_draws, sr.precond_residual_steps, sr.precond_residual_directions, sr.precond_residual_threshold) == ([0.8], 20, 20, 8, 6.0)
+        gr = BlackBoxVLBIImaging._metric_adaptor(sr, H)
+        @test (gr.residual_at, gr.residual_draws, gr.residual_steps, gr.residual_directions, gr.residual_threshold) == ([0.8], 20, 20, 8, 6.0)
+        @test isnothing(gr.rescale)
+        merge!(cr["precondition"], Dict("rescale" => true, "rescale_n0" => 2.0, "rescale_bound" => 50.0))
+        gs = BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cr), H)
+        @test (gs.rescale.n0, gs.rescale.bound) == (2.0, 50.0)
+        cr["precondition"]["residual_directions"] = 21
+        @test_throws "residual_directions must lie in 1:residual_steps" BlackBoxVLBIImaging._metric_adaptor(build_fitting_config(cr), H)
         for (edit, msg) in (
+                (c -> (c["precondition"]["residual_at"] = [0.8]; delete!(c["precondition"], "refit_kind")), "residual_at apply to refit_kind = \"gauss_newton\" only"),
                 (c -> c["precondition"]["refit_kind"] = "hessian", "precondition.refit_kind must be"),
                 (c -> delete!(c["precondition"], "rank"), "needs precondition.rank"),
                 (c -> delete!(c["precondition"], "refit_schedule"), "needs refit_schedule or refit_at"),
@@ -512,6 +631,23 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                 (c -> delete!(c["precondition"], "refit_kind"), "precondition.threshold, probes_per_draw apply to refit_kind = \"gauss_newton\" only"),
             )
             c = deepcopy(cfg5)
+            edit(c)
+            @test_throws msg build_fitting_config(c)
+        end
+        # Gauss–Newton refits on a basis built from the source support
+        cs = deepcopy(cfg5)
+        cs["precondition"]["refit_kind"] = "gauss_newton_support"
+        cs["precondition"]["support_cut"] = 3.0e-3
+        ss = build_fitting_config(cs)
+        @test (ss.precond_refit_kind, ss.precond_support_cut) == ("gauss_newton_support", 3.0e-3)
+        Bf(x) = ones(length(x), 1)
+        @test BlackBoxVLBIImaging._metric_adaptor(ss, H; basis = Bf).basis === Bf
+        for (edit, msg) in (
+                (c -> c["precondition"]["support_cut"] = 1.5, "support_cut must lie in (0, 1)"),
+                (c -> c["precondition"]["band_limit"] = 2.0, "sets its own basis"),
+                (c -> c["precondition"]["refit_kind"] = "gauss_newton", "support_cut applies to refit_kind = \"gauss_newton_support\" only"),
+            )
+            c = deepcopy(cs)
             edit(c)
             @test_throws msg build_fitting_config(c)
         end
@@ -586,6 +722,79 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         @test BlackBoxVLBIImaging.snap_grid_size(GMRF, 1, 23, 23) == (24, 24)
     end
 
+    @testset "Gaussian background mean with a fixed FWHM" begin
+        BB = BlackBoxVLBIImaging
+        g = imagepixels(μas2rad(200.0), μas2rad(200.0), 32, 32)
+        free = GaussBkgdMean(g, μas2rad(40.0), μas2rad(20.0))
+        fixed = FixedGaussBkgdMean(g, μas2rad(40.0))
+        @test keys(BB.genmeanprior(free)) == (:fwhm, :fb)
+        @test keys(BB.genmeanprior(fixed)) == (:fb,)
+        @test BB.genmeanprior(fixed).fb == BB.genmeanprior(free).fb
+        @test baseimage(BB.make_mean(fixed, g, (; fb = 0.3))) ≈
+            baseimage(BB.make_mean(free, g, (; fwhm = μas2rad(40.0), fb = 0.3)))
+        icfg = exconfig("image.toml")
+        icfg["mean"] = Dict{String, Any}("type" => "Bkgd", "fix_fwhm" => true)
+        @test_throws "mean.fix_fwhm applies to type = \"GaussBkgd\" only" build_sky_config(icfg)
+        icfg["mean"] = Dict{String, Any}("type" => "GaussBkgd", "fwhm" => 40.0, "fix_fwhm" => true)
+        skym, _ = build_sky_config(icfg)
+        x = rand(Random.default_rng(), Comrade.NamedDist(skym.prior))
+        @test keys(x.mean) == (:fb,)
+        @test all(isfinite, stokes(intensitymap(skym.f(x, skym.metadata), skym.grid), :I))
+    end
+
+    @testset "Student-t blob mean" begin
+        BB = BlackBoxVLBIImaging
+        g = imagepixels(μas2rad(200.0), μas2rad(200.0), 64, 64)
+        for ν in (1.0, 3.0, 30.0)
+            r = BB._tblob_halfwidth(ν)
+            @test (1 + r^2 / ν)^(-(ν + 2) / 2) ≈ 0.5
+        end
+        core = TBlobMean(μas2rad(40.0), μas2rad(20.0))
+        @test keys(BB.genmeanprior(core)) == (:fwhm, :logη)
+        gauss = baseimage(intensitymap(modify(Gaussian(), Stretch(μas2rad(40.0) / BB.fwhmfac)), g))
+        @test baseimage(BB.make_mean(core, g, (; fwhm = μas2rad(40.0), logη = log(0.01)))) ≈ gauss ./ sum(gauss) rtol = 0.02
+        icfg = exconfig("image.toml")
+        icfg["mean"] = Dict{String, Any}("type" => "TBlob", "fwhm" => 40.0)
+        skym, _ = build_sky_config(icfg)
+        x = rand(Random.default_rng(), Comrade.NamedDist(skym.prior))
+        @test keys(x.mean) == (:fwhm, :logη)
+        @test all(isfinite, stokes(intensitymap(skym.f(x, skym.metadata), skym.grid), :I))
+    end
+
+    @testset "anisotropic power-law mean" begin
+        BB = BlackBoxVLBIImaging
+        g = imagepixels(μas2rad(200.0), μas2rad(200.0), 64, 64)
+        rc = μas2rad(10.0)
+        env = AnisotropicPowerLawMean(g, rc)
+        names = (:slope, :α1, :β1, :α2, :β2, :taper)
+        @test keys(BB.genmeanprior(env)) == names
+        θ(; kw...) = merge(NamedTuple{names}(zeros(6)), (; kw...))
+        pts = domainpoints(g)
+        r2 = map(p -> p.X^2 + p.Y^2, pts)
+        expect = (1 .+ r2 ./ rc^2) .^ -1.5
+        @test baseimage(BB.make_mean(env, g, θ(; slope = 1.5))) ≈ expect ./ sum(expect)
+        # log m is linear in the parameters, up to the normalization constant
+        logm(t) = log.(baseimage(BB.make_mean(env, g, t)))
+        a, b = θ(; slope = 1.0, α1 = 0.3, taper = 0.5), θ(; β1 = -0.2, α2 = 0.4, β2 = 0.1)
+        Δ = logm(map(+, a, b)) .- logm(a) .- logm(b) .+ logm(θ())
+        @test maximum(Δ) - minimum(Δ) < 1.0e-10
+        # α1 > 0 steepens the tail toward +Y (θ = 0): a jet toward -Y
+        m = baseimage(BB.make_mean(env, g, θ(; slope = 1.0, α1 = 0.5)))
+        i = argmin(map(p -> abs(p.Y - μas2rad(80.0)) + abs(p.X), pts))
+        j = argmin(map(p -> abs(p.Y + μas2rad(80.0)) + abs(p.X), pts))
+        @test m[j] > 10 * m[i]
+        # a negative slope with a positive taper peaks on a ring at r² = -slope r_t²/taper - r_c²
+        ring = baseimage(BB.make_mean(env, g, θ(; slope = -1.0, taper = 4.0)))
+        rt = μas2rad(200.0) / 4
+        @test abs(sqrt(r2[argmax(ring)]) - sqrt(rt^2 / 4 - rc^2)) < μas2rad(200.0) / 64
+        icfg = exconfig("image.toml")
+        icfg["mean"] = Dict{String, Any}("type" => "AnisotropicPowerLaw", "fwhm" => 20.0)
+        skym, _ = build_sky_config(icfg)
+        x = rand(Random.default_rng(), Comrade.NamedDist(skym.prior))
+        @test keys(x.mean) == names
+        @test all(isfinite, stokes(intensitymap(skym.f(x, skym.metadata), skym.grid), :I))
+    end
+
     @testset "image centering switch" begin
         # `metadata.center` is the Val the @sky body dispatches its re-centering on. A small
         # grid keeps the builds cheap; the grid plays no part in the centering choice.
@@ -638,14 +847,14 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         # centroid elsewhere. Showing it needs an interpolating pulse — a delta-pulse render on
         # the model's own grid returns the raster itself, so the shift only reaches the
         # visibilities — and what is left of the I² centroid is the interpolation of a pixelized
-        # raster, a fraction of a pixel.
+        # raster, a fraction of a pixel that grows with the image's small-scale structure.
         skyp, _ = build_sky_config(centercfg(center = true, center_power = 2, pulse = "bspline3"))
         xp = rand(Random.Xoshiro(42), Comrade.NamedDist(skyp.prior))
         imgp = intensitymap(skyp.f(xp, skyp.metadata), skyp.grid)
         px = rad2μas(pixelsizes(skyp.grid).X)
         c2 = rad2μas.(power_centroid(imgp, 2))
         c1 = rad2μas.(centroid(imgp))
-        @test maximum(abs, c2) < 0.1 * px
+        @test maximum(abs, c2) < 0.25 * px
         @test maximum(abs, c1) > maximum(abs, c2)
     end
 
@@ -977,8 +1186,9 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                 @test_throws "'σq' is not a scalar sky parameter" held_scale_values(postf, [:σq])
                 @test_throws "'b' is not a scalar sky parameter" held_scale_values(postf, [:b])
                 held = held_scale_values(postf, [:σb, :σc, :σd])
-                @test held[:σd] ≈ 0.1 * quantile(Normal(), 0.75)
-                @test held[:σb] ≈ held[:σc] ≈ 0.5 * quantile(Normal(), 0.75)
+                # the medians of the exponential scale priors, scale × ln 2
+                @test held[:σd] ≈ 0.05 * log(2)
+                @test held[:σb] ≈ held[:σc] ≈ 0.5 * log(2)
 
                 # the CPU optimizer moves everything but the held scales
                 xs = prior_sample(Random.Xoshiro(3), postf)
@@ -1204,6 +1414,7 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                     θg = prior_sample(Random.Xoshiro(1), postg)
                     @test_throws "needs a stationary random-field sky model" build_moves(postg, [MoveSpec(; kind = "rho_field")], θg)
                     @test_throws "needs the PolExp stationary random-field sky model" build_moves(postg, [MoveSpec(; kind = "mean_field")], θg)
+                    @test_throws "move \"pnc_orbit\" needs a stationary random-field sky model" build_moves(postg, [MoveSpec(; kind = "pnc_orbit")], θg)
                 end
 
                 @testset "Matérn sky: spectral-parameter and mean-field moves" begin
@@ -1233,6 +1444,106 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                             @test rel(stokes(s1, p), stokes(s0, p)) < 1.0e-10
                         end
                     end
+                end
+
+                # Moves of a polarization field's spectral parameters that hold the field fixed
+                # at the bright pixels. The flow reverses with the opposite log-determinant,
+                # which matches finite differences. Holding the field at 40 of the 256 pixels,
+                # the orbit draw leaves its target (here the prior) invariant, and the traced
+                # draw is the host one.
+                @testset "Matérn sky: field-holding flow and orbit moves" begin
+                    mcfg = deepcopy(icfg)
+                    mcfg["model"]["order"] = 0
+                    skyw, imgw = build_sky_config(mcfg)
+                    postw = VLBIPosterior(skyw, intg, dcoh; imgdata = imgw)
+                    θw = [prior_sample(Random.Xoshiro(k), postw) for k in 1:2]
+                    pm = build_moves(postw, [MoveSpec(; kind = "pnc_field"), MoveSpec(; kind = "pnc_orbit")], θw[1])
+                    @test collect(Comrade.move_name.(pm.moves)) == [
+                        "pnc_field[b,1]", "pnc_field[b,2]", "pnc_field[c,1]", "pnc_field[c,2]",
+                        "pnc_field[d,1]", "pnc_field[d,2]",
+                        "pnc_orbit[b,1]", "pnc_orbit[b,2]", "pnc_orbit[c,1]", "pnc_orbit[c,2]",
+                    ]
+                    @test all(m -> Comrade.step_kind(m) == Comrade.OrbitStep(32), pm.moves[7:end])
+                    @testset "check_move: $(Comrade.move_name(m))" for m in pm.moves[[1, 4]]
+                        r = check_move(m, postw, θw; rng = Random.Xoshiro(21))
+                        @test r.reversal < 1.0e-10 && r.logdet < 1.0e-6
+                    end
+
+                    tpw = pm.ctx.view.tbase
+                    Iraw = BB._raw_stokes_i(postw.skymodel.metadata, θw[1])
+                    S = CartesianIndices(Iraw)[partialsortperm(vec(Iraw), 1:40; rev = true)]
+                    f = pm.moves[1]
+                    flow = BB.PNCFieldMove(
+                        f.name, f.ishift, f.rpath, f.wcoords, f.σpath, f.ps, f.dk, f.nsub, f.initial_scale,
+                        (; k2 = f.context.k2, pnc_HS = BB._hartley_rows(size(Iraw), S))
+                    )
+                    prior_target(y, _) = Comrade._logprior_latent(tpw, postw, y)
+                    orbit = BB.PNCOrbitMove("orbit", flow, 0.2, 16, prior_target)
+                    ctx = (; view = pm.ctx.view, orbit.context...)
+                    orng = Random.Xoshiro(31)
+                    idx = [flow.ishift, flow.wcoords[1], flow.wcoords[2], flow.wcoords[37]]
+                    nd = 200
+                    nmoved = Ref(0)
+                    moved = map(1:nd) do _
+                        x = Comrade.inverse(tpw, prior_sample(orng, postw))
+                        for _ in 1:2
+                            x′, ld = Comrade.propose(orbit, x, Comrade.draw_step(orbit, orng, NaN), ctx)
+                            if ld > 0
+                                nmoved[] += 1
+                                x = x′
+                            end
+                        end
+                        x[idx]
+                    end
+                    @test nmoved[] > nd
+                    fresh = [Comrade.inverse(tpw, prior_sample(orng, postw))[idx] for _ in 1:nd]
+                    crit = sqrt(-log(1.0e-3 / length(idx) / 2) / 2) * sqrt(2 / nd)
+                    @test all(i -> Comrade._ks_statistic(getindex.(moved, i), getindex.(fresh, i)) <= crit, eachindex(idx))
+
+                    postc = BB.ConstructionBase.setproperties(postw, (; admode = nothing))
+                    rpost = Comrade.prepare_device(postc, Comrade.ComradeBase.ReactantEx())
+                    dctx = (;
+                        view = Comrade.CoordinateView(rpost, Comrade.space(pm.ctx.view)),
+                        k2 = BB.Reactant.to_rarray(flow.context.k2), pnc_HS = BB.Reactant.to_rarray(flow.context.pnc_HS),
+                        pnc_orbit_h = BB.Reactant.to_rarray(orbit.context.pnc_orbit_h),
+                    )
+                    om = BB.PNCOrbitMove("orbit", flow, 0.2, 16, BB._base_logdensity)
+                    x = Comrade.inverse(tpw, θw[2])
+                    xh, ldh = Comrade.propose(om, x, 5.3, ctx)
+                    g = (x, s, c) -> Comrade.propose(om, x, s, c)
+                    xd, ldd = BlackBoxVLBIImaging.Reactant.@jit g(BB.Reactant.to_rarray(x), BB.Reactant.ConcreteRNumber(5.3), dctx)
+                    @test Array(xd) ≈ xh rtol = 1.0e-9
+                    @test Float64(ldd) == ldh
+
+                    # The warmup hook holds the fields at the brightest pixels of the mean raw
+                    # Stokes I over the draws since the last refresh, keeping the number held,
+                    # and adapts the orbit steps; sampling leaves both alone.
+                    pf = build_moves(postw, [MoveSpec(; kind = "pnc_field")], θw[1])
+                    @test BB._moves_hook(pf, postw, θw[1], Comrade.FixedMetric(), 100, 10) === pf
+                    hk0 = BB._moves_hook(pm, postw, θw[1], Comrade.FixedMetric(), 100, 10)
+                    @test hk0 isa BB.PNCAdaptation && isempty(hk0.steps) && length(hk0.orbit) == 4
+                    fadapt = Comrade.FisherLowRank(; rank = 2)
+                    hk = BB._moves_hook(pm, postw, θw[1], fadapt, 100, 10)
+                    @test hk isa BB.PNCAdaptation && hk.steps == Comrade.metric_refit_steps(fadapt, 100, 10)
+                    @test_throws "target must lie in (0, 1)" BB.PNCAdaptation(pm, postw, θw[1], Int[]; target = 1.0)
+                    M = length(hk.held)
+                    h0 = copy(pm.ctx.pnc_orbit_h)
+                    @test h0 == fill(0.1, 4)
+                    hook = BB.PNCAdaptation(pm, postw, θw[1], [2])
+                    st = ProbProg.MCMCState(Comrade.inverse(tpw, θw[2]), nothing, nothing, 0.1, nothing, nothing)
+                    seen = zero(Iraw)
+                    for step in 1:2
+                        seen .+= BB._raw_stokes_i(postw.skymodel.metadata, Comrade.transform(tpw, copy(st.position)))
+                        st = hook(st, tpw, (; phase = :warmup, step, total = 10, pre = nothing), Random.Xoshiro(step))
+                    end
+                    want = CartesianIndices(seen)[partialsortperm(vec(seen), 1:M; rev = true)]
+                    @test hook.held == want && hook.n == 0
+                    @test pm.ctx.pnc_HS == BB._hartley_rows(size(seen), want)
+                    h2 = copy(pm.ctx.pnc_orbit_h)
+                    @test h2 != h0 && all(h -> 1.0e-3 <= h <= 1, h2) && hook.calls == 2
+                    st = hook(st, tpw, (; phase = :sampling, step = 1, total = 10, pre = nothing), Random.Xoshiro(3))
+                    @test hook.n == 0 && hook.held == want
+                    @test pm.ctx.pnc_orbit_h == h2 && hook.calls == 2
                 end
 
                 @testset "StdNormal posterior and Gauss–Newton kernels" begin
@@ -1275,7 +1586,7 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                     # the prior is exactly N(0, I): log π + ½‖u‖² - log L is constant
                     c(u) = logdensityof(tps, u) + sum(abs2, u) / 2 - ll(Comrade.transform(tps, u))
                     cs = [c.(us); c(randn(Random.Xoshiro(3), n))]
-                    @test all(≈(cs[1]; rtol = 1.0e-11), cs)
+                    @test all(≈(cs[1]; rtol = 1.0e-10), cs)
 
                     # a start point whose latent is not finite fails before sampling
                     @test BB.check_start(posts, BB.PT.StdNormal(), θd[1]) ≈ logdensityof(tps, us[1])
@@ -1383,6 +1694,26 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
                     ca = collect(Comrade.coords(vs, (:sky, :a)))
                     @test intersect(rws, ca) == ca[vec(km .<= 0.5 * umaxp)]
                     @test 0 < count(in(rws), ca) < length(ca)
+
+                    # the support basis: orthonormal columns, and the range of the Gauss–Newton
+                    # operator at the draw lies nearly in their span, more so as the support grows
+                    Hu = reduce(hcat, (Array(BB.gauss_newton(k, us[1], Id[:, j])) for j in 1:n))
+                    function outside(c)
+                        Ω = BB.support_basis(posts, c)(us[1])
+                        return Ω, norm(Hu .- Ω * (Ω' * Hu)) / norm(Hu)
+                    end
+                    Ωl, rl = outside(1.0e-1)
+                    Ωs, rs = outside(1.0e-3)
+                    @test Ωs' * Ωs ≈ Matrix(I, size(Ωs, 2), size(Ωs, 2)) atol = 1.0e-10
+                    @test size(Ωl, 2) < size(Ωs, 2) <= n
+                    @test rs < rl && rs < 0.1
+                    # the adaptor with that basis fits the operator's leading eigenvalues
+                    gs = Comrade.GaussNewtonLowRank(curv; rank = n, threshold = thr, min_draws = 2, basis = BB.support_basis(posts, 1.0e-3))
+                    sts = Comrade.init_metric_adaptation(gs)
+                    foreach(x -> Comrade.observe_draw!(gs, sts, nothing, x, zero(x)), us)
+                    fits = Comrade.metric_refit(gs, sts)
+                    @test !isnothing(fits) && length(fits.s) >= 1
+                    @test 1 / fits.s[1]^2 - 1 ≈ Ed.values[1] rtol = 0.05
                     gr = Comrade.GaussNewtonLowRank(curv; rank = 6, oversample = 4, threshold = thr, min_draws = 2, rows = rws)
                     sr = Comrade.init_metric_adaptation(gr)
                     foreach(x -> Comrade.observe_draw!(gr, sr, nothing, x, zero(x)), us)

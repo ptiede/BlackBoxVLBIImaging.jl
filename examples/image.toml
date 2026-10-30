@@ -72,10 +72,12 @@ beamsize_beams = 1.0   # correlation length in beams (× the data beam; default 
 #   "Ring"      – double-power-law ring, radius & in/out slopes fit      (no seed needed)
 #   "LyapunovRing"    – n=0 (double power law) + demagnified n=1 photon ring        (no seed needed)
 #   "LyapunovRingJSU" – as LyapunovRing, with a radially skewed JohnsonSU n=0 ring  (no seed needed)
-#   "TBlob"     – Student-t blob, FWHM & shape fit                       (no seed needed)
+#   "TBlob"     – Student-t blob, FWHM & tail fit (prior centered on seed: fwhm / fwhm_beams)
+#   "AnisotropicPowerLaw" – power-law core and tail whose slope varies with angle (jet, elongated or
+#                           ring-like envelopes), every parameter linear in log m (core diameter: fwhm / fwhm_beams)
 #   "JetGauss"  – core image + a jet Gaussian               (seed: fwhm / fwhm_beams)
 type = "Bkgd"
-# Seed-Gaussian size for Bkgd / JetGauss / GaussBkgd — from the beam by default (× fwhm_beams), or set an
+# Seed size for Bkgd / JetGauss / GaussBkgd / TBlob / AnisotropicPowerLaw — from the beam by default (× fwhm_beams), or set an
 # absolute fwhm (μas) to override:
 fwhm_beams = 1.0
 # fwhm = 50.0    # μas (overrides fwhm_beams)

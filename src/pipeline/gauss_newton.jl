@@ -329,3 +329,57 @@ function gauss_newton_rows(post::VLBIPosterior, band::Real)
     isempty(drop) && return nothing
     return setdiff(1:n, drop)
 end
+
+"""
+    support_basis(post::VLBIPosterior, cut) -> Function
+
+The probe basis `x -> Ω` of a `"gauss_newton_support"` refit, for the PolExp stationary
+random-field sky. The image depends on a field's white coefficients through the pixelwise
+intensity, so the Gauss–Newton curvature in those coefficients has its range in the field
+perturbations at the pixels where the source is bright. At the StdNormal latent point `x`,
+`S` is the set of raw-raster pixels whose Stokes I (`m e^{δa} cosh|p|`, before the pulse
+and the re-centering shift) exceeds `cut` × its peak; `Ω` holds, for each field, an
+orthonormal basis of the coefficient vectors that perturb the field at one pixel of `S`
+(`e^{la} ⊙ H eₚ / √N`, with `la` the field's log amplitude at `x`), and a unit vector for
+every other latent coordinate.
+"""
+function support_basis(post::VLBIPosterior, cut::Real)
+    md = _sky_metadata(post)
+    post.skymodel.f === _polexp_srf_sky ||
+        error("support_basis needs the PolExp stationary random-field sky model (polrep = \"PolExp\", order ≤ 0)")
+    view = Comrade.CoordinateView(post, PT.StdNormal())
+    n = dimension(view.tbase)
+    plan = md.base.plan
+    k2, dk = _plan_wavenumbers(plan)
+    k2 = collect(k2)
+    fields = (:a, :b, :c, :d)
+    fcoords = map(X -> Comrade.coords(view, _white_field(view, X)), fields)
+    rest = setdiff(1:n, reduce(vcat, fcoords))
+    return function (x)
+        θ = Comrade.transform(view.tbase, x)
+        δ = map(fields) do X
+            ρ = getproperty(θ.sky, Symbol(:ρ, X))
+            return getproperty(θ.sky, Symbol(:σ, X)) .*
+                genfield(StationaryRandomField(field_spectrum(md.base.ps, ρ), plan), getproperty(θ.sky, X))
+        end
+        m = parent(parent(baseimage(make_mean(md.meanmodel, md.grid, θ.sky.mean))))
+        Ipix = m .* exp.(δ[1]) .* cosh.(sqrt.(δ[2] .^ 2 .+ δ[3] .^ 2 .+ δ[4] .^ 2))
+        S = findall(>(cut * maximum(Ipix)), vec(Ipix))
+        Ω = zeros(n, length(fields) * length(S) + length(rest))
+        for (b, X) in enumerate(fields)
+            la = _log_amplitude(md.base.ps, Float64.(getproperty(θ.sky, Symbol(:ρ, X))), k2, dk)
+            C = zeros(length(la), length(S))
+            for (j, p) in enumerate(S)
+                e = zeros(size(la))
+                e[p] = 1.0
+                C[:, j] = vec(exp.(la) .* _hartley(e)) ./ sqrt(length(la))
+            end
+            Ω[fcoords[b], ((b - 1) * length(S) + 1):(b * length(S))] = _orthonormal(C)
+        end
+        for (j, i) in enumerate(rest)
+            Ω[i, length(fields) * length(S) + j] = 1.0
+        end
+        return Ω
+    end
+end
+
