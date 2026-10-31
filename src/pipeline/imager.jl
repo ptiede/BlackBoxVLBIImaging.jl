@@ -162,6 +162,7 @@ end
 # from which the LAST stored draw is used: a posterior sample lies in the typical set,
 # which a high-dimensional MAP does not.
 function _load_start(path)
+    isfile(joinpath(path, "chain_1", "parameters.jls")) && return _last_draws(path)
     if isdir(path)
         ntot = deserialize(joinpath(path, "parameters.jls")).params.nsamples
         return only(Comrade.postsamples(load_samples(path, ntot:ntot)))
@@ -169,6 +170,14 @@ function _load_start(path)
     x = deserialize(path)
     x isa AbstractDict && return x[:xopt]
     return x
+end
+
+# The last draw of each chain `path/chain_k` of an MCLMC run, in chain order.
+function _last_draws(path)
+    return map(_mclmc_chain_dirs(path)) do dir
+        ntot = deserialize(joinpath(dir, "parameters.jls")).params.nsamples
+        only(Comrade.postsamples(load_samples(dir, ntot:ntot)))
+    end
 end
 
 # Whether a restart resumes the sampler at `out`: only a sampler that was started there, which
@@ -538,14 +547,23 @@ function comrade_imager(
     opt = _select_optimizer(strategy)
 
     # ---- optimization / start / restart ----------------------------------------------
+    starts = nothing
     if restart
         @info "Restarting from $(out)_optimum_allres.jls" *
             (resume ? "" : "; no sampler checkpoint at $out, so sampling starts fresh")
         xopt = deserialize(out * "_optimum_allres.jls")[:xopt]
     elseif !isnothing(strategy.start)
-        startx = _load_start(strategy.start)
-        @info "Starting from $(strategy.start); logdensity = $(logdensityof(post, startx))"
-        xopt = startx
+        loaded = _load_start(strategy.start)
+        if loaded isa AbstractVector
+            strategy.algorithm == "mclmc" || error(
+                "run.start $(strategy.start) is an MCLMC run, whose chains start only sampler.algorithm = \"mclmc\""
+            )
+            starts, xopt = loaded, first(loaded)
+        else
+            xopt = loaded
+        end
+        @info "Starting from $(strategy.start); logdensity = " *
+            join(string.(logdensityof.(Ref(post), something(starts, [xopt]))), ", ")
         save_optimal(imgbase, post, xopt, gimg; label = "start")
         plot_residuals_png(imgbase * "_residuals_map.png", post, xopt)
         write_caltables(caltabbase, post, xopt)
@@ -562,10 +580,11 @@ function comrade_imager(
     if strategy.latent_space == "stdnormal"
         xopt, nsheet = unwrap_phase_chains(post, xopt)
         nsheet > 0 && @info "Re-wrapped $nsheet phase-chain step(s) of the start point to their shortest form"
+        isnothing(starts) || (starts = [first(unwrap_phase_chains(post, s)) for s in starts])
     end
-    check_start(post, latent_space(strategy), xopt)
+    foreach(x -> check_start(post, latent_space(strategy), x), something(starts, [xopt]))
     chain = if strategy.algorithm == "mclmc"
-        sample_mclmc(out, post, xopt, strategy, rng)
+        sample_mclmc(out, post, xopt, strategy, rng; starts)
     elseif strategy.use_reactant
         load_samples(_sample_reactant(out, post, xopt, strategy, resume, gimg, imgbase, transport_method, tgrad)...)
     else

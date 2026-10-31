@@ -4,7 +4,7 @@ const MCLMC_MOVE_BLOCKS = 50
 const MCLMC_START_JITTER = 0.001
 const MCLMC_DRAWS_PER_FILE = 10
 const MCLMC_CHECK_BLOCKS = 10
-const MCLMC_RECORD_SPACING = 0.1
+const MCLMC_RETURNED_DRAWS = 500
 
 """
     LatentTarget(tpost, dim)
@@ -45,22 +45,23 @@ end
 collect_device_garbage(block) = block % 50 == 0 ? GC.gc() : (block % 5 == 0 && GC.gc(false))
 
 """
-    sample_mclmc(out, post, xopt, strategy, rng) -> Comrade.PosteriorSamples
+    sample_mclmc(out, post, xopt, strategy, rng; starts=nothing) -> Comrade.PosteriorSamples
 
 `strategy.chains` chains of KineticSamplers MCLMC on `post` in the StdNormal latent space,
 compiled with Reactant, started at `xopt` jittered by `$(MCLMC_START_JITTER)` standard normals
-per latent coordinate. A `PooledAdaptation` of `strategy.nadapt` gradients per chain, in blocks
-of `strategy.chunk_size` steps, adapts one step size and one low-rank inverse mass with stiff
-directions for all chains, from records stored every $(MCLMC_RECORD_SPACING) √d of dynamics
-time; its history and parameters go to `out/mclmc_warmup.jls`. Then
+per latent coordinate, or chain `k` at `starts[k]` when `starts` is given. A
+`PooledAdaptation` of `strategy.nadapt` gradients per chain, in blocks of `strategy.chunk_size`
+steps, adapts one step size and one low-rank inverse mass with stiff directions for all
+chains, without step halving; its history and parameters go to `out/mclmc_warmup.jls`. Then
 $(MCLMC_CHECK_BLOCKS) blocks at the sampling parameters, whose energy statistics are logged per
 chain, must pass `KineticSamplers.check_energy`. Sampling then keeps the last position of each
 of `strategy.nsample` blocks per chain, chain `k` written as a Comrade sample directory
 `out/chain_k`. The moves of `strategy` run on every chain every $(MCLMC_MOVE_BLOCKS) blocks of
 the warmup's adaptation phase and of sampling; a chain that moved restarts with a fresh
-velocity. Returns the draws of all chains.
+velocity. Returns about $(MCLMC_RETURNED_DRAWS) draws, evenly thinned from each chain; the
+chains on disk keep every draw (see [`load_mclmc_chains`](@ref)).
 """
-function sample_mclmc(out, post, xopt, strategy::FittingStrategy, rng)
+function sample_mclmc(out, post, xopt, strategy::FittingStrategy, rng; starts = nothing)
     K = strategy.chains
     chain_dirs = [joinpath(out, "chain_$k") for k in 1:K]
     existing = filter(ispath, chain_dirs)
@@ -76,15 +77,21 @@ function sample_mclmc(out, post, xopt, strategy::FittingStrategy, rng)
     d = dimension(tb)
     target = KineticSamplers.Target(LatentTarget(tpost, d); backend = ADTypes.AutoReactant())
     alg = KineticSamplers.MCLMC(; strategy.max_step_halvings)
+    # Halving would let stored positions reach regions whose curvature caps the adapted step.
+    warmup_alg = KineticSamplers.MCLMC(; max_step_halvings = 0)
     nadapt, block = strategy.nadapt, strategy.chunk_size
     mass = KineticSamplers.HistoryMassAdaptation(
         nadapt; max_rank = 100, max_wide = 80, stiff = KineticSamplers.StiffDirections(),
         vecs_eltype = Float32
     )
-    adapt = KineticSamplers.PooledAdaptation(
-        nadapt; mass, block, record_length = MCLMC_RECORD_SPACING * sqrt(d)
-    )
-    Θ = Comrade.inverse(tb, xopt) .+ MCLMC_START_JITTER .* randn(rng, d, K)
+    adapt = KineticSamplers.PooledAdaptation(nadapt; mass, block)
+    Θ = if isnothing(starts)
+        Comrade.inverse(tb, xopt) .+ MCLMC_START_JITTER .* randn(rng, d, K)
+    else
+        length(starts) == K ||
+            error("$(length(starts)) starting points for sampler.chains = $K chains")
+        reduce(hcat, [Comrade.inverse(tb, s) for s in starts])
+    end
     host_rngs(n) = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:n]
     restart_rngs = host_rngs(K)
 
@@ -104,7 +111,10 @@ function sample_mclmc(out, post, xopt, strategy::FittingStrategy, rng)
             end
         end
         GC.gc()
-        return moved ? KineticSamplers.init_chains(alg, target, Θh; rngs = restart_rngs) : chains
+        moved || return chains
+        return KineticSamplers.init_chains(
+            phase === :warmup ? warmup_alg : alg, target, Θh; rngs = restart_rngs
+        )
     end
 
     @info "MCLMC: $K chains on $d latent coordinates, warmup $nadapt gradients per chain in " *
@@ -123,7 +133,7 @@ function sample_mclmc(out, post, xopt, strategy::FittingStrategy, rng)
         return chains
     end
     chains, params, history = KineticSamplers.warmup(
-        host_rngs(K), adapt, alg, target, Θ; between_blocks, check = false
+        host_rngs(K), adapt, warmup_alg, target, Θ; between_blocks, check = false
     )
     _log_mclmc_warmup(params, history, d, time() - t0)
     serialize(joinpath(out, "mclmc_warmup.jls"), (; history, params = _host_params(params)))
@@ -173,12 +183,31 @@ function sample_mclmc(out, post, xopt, strategy::FittingStrategy, rng)
         @info "move $(m.name): warmup $(m.warmup.accepted)/$(m.warmup.proposed), " *
             "sampling $(m.sampling.accepted)/$(m.sampling.proposed) accepted" * _scale_text(m.τ)
     end
-    per_chain = [Comrade.load_samples(dir) for dir in chain_dirs]
+    stride = max(1, strategy.nsample ÷ cld(MCLMC_RETURNED_DRAWS, K))
+    return load_mclmc_chains(out, 1:stride:strategy.nsample)
+end
+
+"""
+    load_mclmc_chains(out, nsamples=:) -> Comrade.PosteriorSamples
+
+The draws of the chains `out/chain_1`, `out/chain_2`, … of an MCLMC run (see
+[`sample_mclmc`](@ref)), concatenated in chain order, with `nsamples` selecting draws of each
+chain.
+"""
+function load_mclmc_chains(out, nsamples = Base.Colon())
+    per_chain = [Comrade.load_samples(dir, nsamples) for dir in _mclmc_chain_dirs(out)]
     return Comrade.PosteriorSamples(
         reduce(vcat, Comrade.postsamples.(per_chain)),
         reduce(vcat, Comrade.samplerstats.(per_chain));
-        metadata = Dict(:sampler => :MCLMC, :chains => K)
+        metadata = Dict(:sampler => :MCLMC, :chains => length(per_chain))
     )
+end
+
+function _mclmc_chain_dirs(out)
+    names = filter(n -> occursin(r"^chain_\d+$", n), readdir(out))
+    isempty(names) && error("no MCLMC chains (chain_1, chain_2, …) in $out")
+    sort!(names; by = n -> parse(Int, n[7:end]))
+    return [joinpath(out, n) for n in names]
 end
 
 # Runs MCLMC_CHECK_BLOCKS blocks and applies KineticSamplers' end-of-warmup energy check to them,

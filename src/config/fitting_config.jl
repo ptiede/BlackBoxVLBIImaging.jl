@@ -190,7 +190,9 @@ warmup's gradients per chain (default 150 000), `nsample` the draws kept per cha
 1000), one per `chunk_size` steps,
 and `max_step_halvings` (default 3) the halvings of a step whose energy error is too large;
 the NUTS settings (`step_size`, `max_tree_depth`, `adapt_mass_matrix`, `diagonal`,
-`[precondition]`, run checkpoints) are errors with it.
+`[precondition]`, run checkpoints) are errors with it. `run.start` may also name the run base
+of an MCLMC run (the directory holding its `chain_k`), whose chains' last draws start the
+chains one to one.
 
 `[optimizer] fix_scales` lists scalar sky parameters (e.g. `["σb", "σc", "σd"]`) that every
 optimization stage holds at the median of their prior; the other parameters are optimized
