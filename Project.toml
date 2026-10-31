@@ -43,10 +43,10 @@ VLBIImagePriors = "b1ba175b-8447-452c-b961-7db2d6f7a029"
 VLBISkyModels = "d6343c73-7174-4e0f-bb64-562643efbeca"
 
 [sources]
-Comrade = {url = "https://github.com/ptiede/Comrade.jl", rev = "ptiede-statespaceint"}
-KineticSamplers = {url = "https://github.com/ptiede/KineticSamplers.jl"}
-ProbabilityTransports = {url = "https://github.com/ptiede/ProbabilityTransports.jl", rev = "ptiede-monotone-pushforward-cdf"}
-VLBISkyModels = {url = "https://github.com/EHTJulia/VLBISkyModels.jl", rev = "ptiede-apl-nufft-fits"}
+Comrade = {rev = "ptiede-statespaceint", url = "https://github.com/ptiede/Comrade.jl"}
+KineticSamplers = {rev = "main", url = "https://github.com/ptiede/KineticSamplers.jl"}
+ProbabilityTransports = {rev = "ptiede-monotone-pushforward-cdf", url = "https://github.com/ptiede/ProbabilityTransports.jl"}
+VLBISkyModels = {rev = "ptiede-apl-nufft-fits", url = "https://github.com/EHTJulia/VLBISkyModels.jl"}
 
 [compat]
 ADTypes = "1.19"
