@@ -1,8 +1,10 @@
 # KineticSamplers MCLMC chains in the StdNormal latent space.
 
 const MCLMC_MOVE_BLOCKS = 50
-const MCLMC_START_JITTER = 0.01
+const MCLMC_START_JITTER = 0.001
 const MCLMC_DRAWS_PER_FILE = 10
+const MCLMC_CHECK_BLOCKS = 10
+const MCLMC_RECORD_SPACING = 0.1
 
 """
     LatentTarget(tpost, dim)
@@ -49,11 +51,14 @@ collect_device_garbage(block) = block % 50 == 0 ? GC.gc() : (block % 5 == 0 && G
 compiled with Reactant, started at `xopt` jittered by `$(MCLMC_START_JITTER)` standard normals
 per latent coordinate. A `PooledAdaptation` of `strategy.nadapt` gradients per chain, in blocks
 of `strategy.chunk_size` steps, adapts one step size and one low-rank inverse mass with stiff
-directions for all chains. Sampling then keeps the last position of each of `strategy.nsample`
-blocks per chain, chain `k` written as a Comrade sample directory `out/chain_k`. The moves of
-`strategy` run on every chain every $(MCLMC_MOVE_BLOCKS) blocks of the warmup's adaptation
-phase and of sampling; a chain that moved restarts with a fresh velocity. Returns the draws of
-all chains.
+directions for all chains, from records stored every $(MCLMC_RECORD_SPACING) √d of dynamics
+time; its history and parameters go to `out/mclmc_warmup.jls`. Then
+$(MCLMC_CHECK_BLOCKS) blocks at the sampling parameters, whose energy statistics are logged per
+chain, must pass `KineticSamplers.check_energy`. Sampling then keeps the last position of each
+of `strategy.nsample` blocks per chain, chain `k` written as a Comrade sample directory
+`out/chain_k`. The moves of `strategy` run on every chain every $(MCLMC_MOVE_BLOCKS) blocks of
+the warmup's adaptation phase and of sampling; a chain that moved restarts with a fresh
+velocity. Returns the draws of all chains.
 """
 function sample_mclmc(out, post, xopt, strategy::FittingStrategy, rng)
     K = strategy.chains
@@ -76,7 +81,9 @@ function sample_mclmc(out, post, xopt, strategy::FittingStrategy, rng)
         nadapt; max_rank = 100, max_wide = 80, stiff = KineticSamplers.StiffDirections(),
         vecs_eltype = Float32
     )
-    adapt = KineticSamplers.PooledAdaptation(nadapt; mass, block)
+    adapt = KineticSamplers.PooledAdaptation(
+        nadapt; mass, block, record_length = MCLMC_RECORD_SPACING * sqrt(d)
+    )
     Θ = Comrade.inverse(tb, xopt) .+ MCLMC_START_JITTER .* randn(rng, d, K)
     host_rngs(n) = [Random.Xoshiro(rand(rng, UInt64)) for _ in 1:n]
     restart_rngs = host_rngs(K)
@@ -116,17 +123,17 @@ function sample_mclmc(out, post, xopt, strategy::FittingStrategy, rng)
         return chains
     end
     chains, params, history = KineticSamplers.warmup(
-        host_rngs(K), adapt, alg, target, Θ; between_blocks
+        host_rngs(K), adapt, alg, target, Θ; between_blocks, check = false
     )
     _log_mclmc_warmup(params, history, d, time() - t0)
     serialize(joinpath(out, "mclmc_warmup.jls"), (; history, params = _host_params(params)))
 
     params = Reactant.to_rarray(params; track_numbers = Number)
     rngs = KineticSamplers.backend_rngs(ADTypes.AutoReactant(), host_rngs(K))
+    chains, trace = check_mclmc(target, rngs, alg, params, chains, block, d)
     recorder = KineticSamplers.NoPositions()
     writers = [MCLMCDrawWriter(dir) for dir in chain_dirs]
     divergent, halved = zeros(Int, K), zeros(Int, K)
-    trace = nothing
     t0 = time()
     for b in 1:strategy.nsample
         tb0 = time()
@@ -172,6 +179,35 @@ function sample_mclmc(out, post, xopt, strategy::FittingStrategy, rng)
         reduce(vcat, Comrade.samplerstats.(per_chain));
         metadata = Dict(:sampler => :MCLMC, :chains => K)
     )
+end
+
+# Runs MCLMC_CHECK_BLOCKS blocks and applies KineticSamplers' end-of-warmup energy check to them,
+# logging each chain's statistics first.
+function check_mclmc(target, rngs, alg, params, chains, block, d)
+    recorder = KineticSamplers.NoPositions()
+    trace = nothing
+    energies = NamedTuple[]
+    for _ in 1:MCLMC_CHECK_BLOCKS
+        chains, trace = KineticSamplers.run_block(
+            target, rngs, alg, params, chains, trace, block, recorder
+        )
+        push!(
+            energies, (;
+                energy_error = Array(trace.energy_error), diverged = Array(trace.diverged),
+                step_halvings = Array(trace.step_halvings),
+            )
+        )
+    end
+    for k in axes(first(energies).energy_error, 2)
+        chain_k = [map(a -> a[:, k:k], e) for e in energies]
+        st = KineticSamplers.energy_statistics(chain_k, d)
+        @info @sprintf(
+            "MCLMC check, chain %d: halved %.3g, divergent %.3g, energy error variance per dimension %.3g",
+            k, st.halved, st.divergent, st.energy_var
+        )
+    end
+    KineticSamplers.check_energy(energies, d)
+    return chains, trace
 end
 
 _host_params(params) = (;

@@ -520,6 +520,9 @@ exconfig(f) = TOML.parsefile(joinpath(EXDIR, f))
         mc["sampler"]["algorithm"] = "mclmc"
         smc = build_fitting_config(mc)
         @test (smc.algorithm, smc.chains, smc.max_step_halvings) == ("mclmc", 4, 3)
+        mcd = deepcopy(mc)
+        foreach(k -> delete!(mcd["sampler"], k), ("nadapt", "nsample"))
+        @test (build_fitting_config(mcd).nadapt, build_fitting_config(mcd).nsample) == (150_000, 1_000)
         mc["sampler"]["chains"] = 2
         mc["sampler"]["max_step_halvings"] = 0
         @test (build_fitting_config(mc).chains, build_fitting_config(mc).max_step_halvings) == (2, 0)

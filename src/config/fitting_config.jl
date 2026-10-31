@@ -186,7 +186,8 @@ Parse a fitting-strategy TOML into a [`FittingStrategy`](@ref). Sections: `[opti
 (AdvancedHMC NUTS vs Reactant NUTS) follows `run.use_reactant`, or `"mclmc"`, which runs
 `sampler.chains` chains of KineticSamplers MCLMC (see [`sample_mclmc`](@ref)) and needs
 `run.use_reactant = true` and `run.latent_space = "stdnormal"`. For MCLMC, `nadapt` is the
-warmup's gradients per chain, `nsample` the draws kept per chain, one per `chunk_size` steps,
+warmup's gradients per chain (default 150 000), `nsample` the draws kept per chain (default
+1000), one per `chunk_size` steps,
 and `max_step_halvings` (default 3) the halvings of a step whose energy error is too large;
 the NUTS settings (`step_size`, `max_tree_depth`, `adapt_mass_matrix`, `diagonal`,
 `[precondition]`, run checkpoints) are errors with it.
@@ -425,8 +426,8 @@ function build_fitting_config(cfg::AbstractDict)
         eta = Float64(get(opt, "eta", 0.001)),
         fix_scales = Symbol.(fix_scales),
         noise_schedule = Float64.(get(temp, "noise_schedule", [0.05, 0.025, 0.0])),
-        nsample = Int(get(samp, "nsample", 10_000)),
-        nadapt = Int(get(samp, "nadapt", 5_000)),
+        nsample = Int(get(samp, "nsample", algorithm == "mclmc" ? 1_000 : 10_000)),
+        nadapt = Int(get(samp, "nadapt", algorithm == "mclmc" ? 150_000 : 5_000)),
         step_size = Float64(get(samp, "step_size", 0.01)),
         target_accept = Float64(get(samp, "target_accept", 0.9)),
         init_buffer = Int(get(samp, "init_buffer", 200)),
